@@ -169,11 +169,11 @@ class Settings:
     )
     scoring_engine_candidate_multiplier: float = env_float(
         "SCORING_ENGINE_CANDIDATE_MULT",
-        env_float("MARSHAL_CANDIDATE_MULT", 0.70),
+        env_float("MARSHAL_CANDIDATE_MULT", 0.50),
     )
     scoring_engine_proven_candidate_multiplier: float = env_float(
         "SCORING_ENGINE_PROVEN_CANDIDATE_MULT",
-        env_float("MARSHAL_PROVEN_CANDIDATE_MULT", 0.90),
+        env_float("MARSHAL_PROVEN_CANDIDATE_MULT", 0.70),
     )
     scoring_engine_core_multiplier: float = env_float(
         "SCORING_ENGINE_CORE_MULT",
@@ -189,11 +189,11 @@ class Settings:
     )
     scoring_engine_candidate_max_allocations: int = env_int(
         "SCORING_ENGINE_CANDIDATE_MAX_ALLOCATIONS",
-        env_int("MARSHAL_CANDIDATE_MAX_ALLOCATIONS", 2),
+        env_int("MARSHAL_CANDIDATE_MAX_ALLOCATIONS", 1),
     )
     scoring_engine_proven_candidate_max_allocations: int = env_int(
         "SCORING_ENGINE_PROVEN_CANDIDATE_MAX_ALLOCATIONS",
-        env_int("MARSHAL_PROVEN_CANDIDATE_MAX_ALLOCATIONS", 3),
+        env_int("MARSHAL_PROVEN_CANDIDATE_MAX_ALLOCATIONS", 2),
     )
 
     live: bool = env_bool("HL_LIVE", False)
