@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+
+# Runtime data, logs, and paper/live state
+MockingBot_Data/
+MockingBot_Data_CodeX/
+MockingBot_Elite_Data/
+*.sqlite3
+*.sqlite3-*
+*.log
+
+# Local credentials and environment files
+.env
+*.env
+*.execution.txt
+*.execution.txt.txt
+*.Hyper.txt
+
+# Historical local backups
+*.bak
+*.pre_*
+
