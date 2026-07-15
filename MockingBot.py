@@ -2083,6 +2083,27 @@ class HyperliquidAdapter(PlatformAdapter):
             return None
         return result
 
+    @staticmethod
+    def _entry_position_delta(
+        before: Position | None, after: Position | None, side: str
+    ) -> tuple[float, float | None, str]:
+        if after is None:
+            return 0.0, None, "position unchanged"
+        if after.side != side:
+            return 0.0, None, f"confirmed side={after.side} expected={side}"
+        if before is None:
+            return after.size, after.entry_price, "new position measured"
+        if before.side != side:
+            return 0.0, None, f"pre-order side={before.side} expected={side}"
+        delta = after.size - before.size
+        if delta <= 0:
+            return 0.0, None, f"position did not increase ({before.size:g}->{after.size:g})"
+        fill_price = after.entry_price
+        weighted_delta = after.entry_price * after.size - before.entry_price * before.size
+        if weighted_delta > 0:
+            fill_price = weighted_delta / delta
+        return delta, fill_price, f"position increase measured ({before.size:g}->{after.size:g})"
+
     def open_position(
         self, coin: str, side: str, notional_usd: float, price: float,
         leverage: int, requested_leverage: int | None = None,
@@ -2152,6 +2173,23 @@ class HyperliquidAdapter(PlatformAdapter):
             self.store.log_execution(coin, side, "OPEN", result, leverage, requested_leverage)
             return result
 
+        pre_state_available, before = self._confirmed_position(coin)
+        if not pre_state_available:
+            detail = "pre-order position state unavailable; no order submitted"
+            self.store.quarantine_coin(coin, "pre-order state unavailable", detail)
+            return reject(detail, requested_size=size, status="state_unavailable")
+        if (existing_leverage is None) != (before is None):
+            detail = (
+                f"local_open={existing_leverage is not None} "
+                f"live_open={before is not None}; no order submitted"
+            )
+            self.store.quarantine_coin(coin, "pre-order position mismatch", detail)
+            return reject(detail, requested_size=size, status="state_mismatch")
+        if before is not None and before.side != side:
+            detail = f"pre-order live side={before.side} expected={side}; no order submitted"
+            self.store.quarantine_coin(coin, "pre-order side mismatch", detail)
+            return reject(detail, requested_size=size, status="state_mismatch")
+
         try:
             if existing_leverage is None:
                 self._exchange.update_leverage(leverage, coin, is_cross=True)  # type: ignore[union-attr]
@@ -2160,10 +2198,8 @@ class HyperliquidAdapter(PlatformAdapter):
             )
             execution = self._parse_execution_result(result, size)
             state_available, confirmed = self._confirmed_position(coin)
-            if not state_available or confirmed is None or confirmed.side != side or confirmed.size <= 0:
-                detail = "position state unavailable" if not state_available else (
-                    "position not confirmed" if confirmed is None else f"confirmed side={confirmed.side} size={confirmed.size}"
-                )
+            if not state_available:
+                detail = "post-order position state unavailable"
                 execution = ExecutionResult(
                     execution.accepted, size, execution.filled_size,
                     execution.avg_fill_price, execution.order_id, execution.status,
@@ -2171,31 +2207,49 @@ class HyperliquidAdapter(PlatformAdapter):
                 )
                 self.store.quarantine_coin(coin, "entry confirmation mismatch", detail)
             else:
-                confirmed_fill_size = confirmed.size
-                confirmed_fill_price = confirmed.entry_price
-                if existing_leverage is not None:
-                    confirmed_fill_size = execution.filled_size
-                    confirmed_fill_price = execution.avg_fill_price or price
-                    if confirmed_fill_size <= 0:
-                        local_size = sum(
-                            float(row["cost_basis"])
-                            * float(row["leverage"])
-                            / float(row["entry_price"])
-                            for row in self.store.open_position_slices(coin)
-                            if float(row["entry_price"]) > 0
-                        )
-                        confirmed_fill_size = max(0.0, confirmed.size - local_size)
-                execution = ExecutionResult(
-                    True, size, confirmed_fill_size, confirmed_fill_price,
-                    execution.order_id, execution.status, True, "live position confirmed",
-                )
-                self.store.clear_coin_quarantine(coin)
+                fill_size, fill_price, detail = self._entry_position_delta(before, confirmed, side)
+                tolerance = 10 ** (-decimals) / 2
+                if fill_size > tolerance:
+                    execution = ExecutionResult(
+                        True, size, fill_size, fill_price or execution.avg_fill_price or price,
+                        execution.order_id,
+                        execution.status if execution.accepted else "recovered",
+                        True, detail,
+                    )
+                    self.store.clear_coin_quarantine(coin)
+                elif execution.accepted:
+                    execution = ExecutionResult(
+                        True, size, execution.filled_size, execution.avg_fill_price,
+                        execution.order_id, execution.status, False, detail,
+                    )
+                    self.store.quarantine_coin(coin, "entry confirmation mismatch", detail)
             self.store.log_execution(coin, side, "OPEN", execution, leverage, requested_leverage)
             return execution
         except Exception as exc:
             self.store.log_api_failure(self.name, "open_position", coin, str(exc))
-            print(f"[LIVE] ENTRY failed {coin} {side}: {exc}")
-            result = ExecutionResult(False, size, status="exception", detail=str(exc))
+            state_available, confirmed = self._confirmed_position(coin)
+            if not state_available:
+                detail = f"ambiguous submission after error: {exc}; position state unavailable"
+                self.store.quarantine_coin(coin, "ambiguous entry state", detail)
+                result = ExecutionResult(False, size, status="ambiguous", detail=detail)
+            else:
+                fill_size, fill_price, delta_detail = self._entry_position_delta(before, confirmed, side)
+                tolerance = 10 ** (-decimals) / 2
+                if fill_size > tolerance:
+                    detail = f"recovered after submission error: {exc}; {delta_detail}"
+                    result = ExecutionResult(
+                        True, size, fill_size, fill_price or price,
+                        status="recovered", confirmed=True, detail=detail,
+                    )
+                    self.store.clear_coin_quarantine(coin)
+                elif confirmed is not None and confirmed.side != side:
+                    detail = f"ambiguous submission after error: {exc}; {delta_detail}"
+                    self.store.quarantine_coin(coin, "ambiguous entry mismatch", detail)
+                    result = ExecutionResult(False, size, status="ambiguous", detail=detail)
+                else:
+                    detail = f"submission failed with no position change: {exc}"
+                    result = ExecutionResult(False, size, status="exception", detail=detail)
+            print(f"[LIVE] ENTRY {coin} {side}: {result.detail}")
             self.store.log_execution(coin, side, "OPEN", result, leverage, requested_leverage)
             return result
 

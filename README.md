@@ -84,3 +84,7 @@ position leverage are both retained in the execution audit.
 Before submission, live orders are checked against Hyperliquid's per-asset
 maximum leverage and size precision. Notional is checked again after size
 rounding; predictable rejections are audited without quarantining the coin.
+Live entries also snapshot the coin position before submission. If an order
+response is lost, a measured position increase is recovered as the fill; an
+unchanged position is a clean failure, while unverifiable state quarantines only
+that coin. Ambiguous entries are never automatically resubmitted.

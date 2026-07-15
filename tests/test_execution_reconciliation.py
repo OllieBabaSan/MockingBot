@@ -26,10 +26,11 @@ class ExecutionReconciliationTests(unittest.TestCase):
     def test_authoritative_position_supplies_actual_fill(self) -> None:
         unclear = {"status": "ok", "response": {"data": {"statuses": [{}]}}}
         self.adapter._exchange = FakeExchange([unclear])
-        self.adapter._confirmed_position = lambda _coin: (
-            True,
-            core.Position("BTC", "LONG", 0.12, 101.0),
-        )
+        states = iter([
+            (True, None),
+            (True, core.Position("BTC", "LONG", 0.12, 101.0)),
+        ])
+        self.adapter._confirmed_position = lambda _coin: next(states)
         result = self.adapter.open_position("BTC", "LONG", 12.0, 100.0, 3)
         self.assertTrue(result)
         self.assertEqual(result.filled_size, 0.12)
@@ -38,7 +39,8 @@ class ExecutionReconciliationTests(unittest.TestCase):
 
     def test_unconfirmed_entry_quarantines_only_that_coin(self) -> None:
         self.adapter._exchange = FakeExchange([fill_response()])
-        self.adapter._confirmed_position = lambda _coin: (False, None)
+        states = iter([(True, None), (False, None)])
+        self.adapter._confirmed_position = lambda _coin: next(states)
         result = self.adapter.open_position("ETH", "LONG", 12.0, 100.0, 3)
         self.assertFalse(result)
         self.assertEqual(self.store.coin_quarantine("ETH")["reason"], "entry confirmation mismatch")
@@ -53,10 +55,11 @@ class ExecutionReconciliationTests(unittest.TestCase):
         paper.open("wallet-a", "BTC", "LONG", 100.0, 10.0, leverage=3)
         exchange = FakeExchange([fill_response()])
         self.adapter._exchange = exchange
-        self.adapter._confirmed_position = lambda _coin: (
-            True,
-            core.Position("BTC", "LONG", 0.42, 100.0),
-        )
+        states = iter([
+            (True, core.Position("BTC", "LONG", 0.30, 100.0)),
+            (True, core.Position("BTC", "LONG", 0.42, 100.0)),
+        ])
+        self.adapter._confirmed_position = lambda _coin: next(states)
 
         result = self.adapter.open_position("BTC", "LONG", 12.0, 100.0, 3, 5)
 
@@ -95,6 +98,47 @@ class ExecutionReconciliationTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(audit["exchange_status"], "rejected")
         self.assertIn("rounded notional", audit["detail"])
+
+    def test_lost_response_recovers_measured_fill_without_resubmission(self) -> None:
+        exchange = FakeExchange([])
+        self.adapter._exchange = exchange
+        states = iter([
+            (True, None),
+            (True, core.Position("BTC", "LONG", 0.12, 101.0)),
+        ])
+        self.adapter._confirmed_position = lambda _coin: next(states)
+
+        result = self.adapter.open_position("BTC", "LONG", 12.0, 100.0, 3)
+
+        self.assertTrue(result)
+        self.assertEqual(result.status, "recovered")
+        self.assertEqual(result.filled_size, 0.12)
+        self.assertEqual(exchange.opens, 1)
+        self.assertIsNone(self.store.coin_quarantine("BTC"))
+
+    def test_failed_submission_with_no_position_change_is_clean_failure(self) -> None:
+        exchange = FakeExchange([])
+        self.adapter._exchange = exchange
+        self.adapter._confirmed_position = lambda _coin: (True, None)
+
+        result = self.adapter.open_position("BTC", "LONG", 12.0, 100.0, 3)
+
+        self.assertFalse(result)
+        self.assertIn("no position change", result.detail)
+        self.assertEqual(exchange.opens, 1)
+        self.assertIsNone(self.store.coin_quarantine("BTC"))
+
+    def test_lost_response_with_unavailable_state_quarantines_coin(self) -> None:
+        exchange = FakeExchange([])
+        self.adapter._exchange = exchange
+        states = iter([(True, None), (False, None)])
+        self.adapter._confirmed_position = lambda _coin: next(states)
+
+        result = self.adapter.open_position("BTC", "LONG", 12.0, 100.0, 3)
+
+        self.assertFalse(result)
+        self.assertEqual(result.status, "ambiguous")
+        self.assertEqual(self.store.coin_quarantine("BTC")["reason"], "ambiguous entry state")
 
     def test_residual_close_retries_once_and_confirms_flat(self) -> None:
         exchange = FakeExchange(
