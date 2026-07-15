@@ -198,8 +198,8 @@ class Settings:
 
     live: bool = env_bool("HL_LIVE", False)
     wind_down: bool = env_bool("WIND_DOWN", False)
-    max_drawdown_pct: float = env_float("MAX_DRAWDOWN_PCT", 0.30)
-    warning_drawdown_pct: float = env_float("WARNING_DRAWDOWN_PCT", 0.10)
+    max_drawdown_pct: float = env_float("MAX_DRAWDOWN_PCT", 0.25)
+    warning_drawdown_pct: float = env_float("WARNING_DRAWDOWN_PCT", 0.15)
     min_loss_pct_to_pause: float = env_float("MIN_LOSS_PCT_TO_PAUSE", 1.0)
     pause_recent_exits: int = env_int("PAUSE_RECENT_EXITS", 3)
     pause_loss_count: int = env_int("PAUSE_LOSS_COUNT", 2)
@@ -1194,7 +1194,7 @@ class PlatformAdapter(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def account_value(self) -> float:
+    def account_value(self) -> float | None:
         raise NotImplementedError
 
     @abstractmethod
@@ -1416,13 +1416,15 @@ class HyperliquidAdapter(PlatformAdapter):
         )
         return state or {}
 
-    def account_value(self) -> float:
+    def account_value(self) -> float | None:
         state = self._user_state()
+        if not state:
+            return None
         try:
             value = float(state.get("marginSummary", {}).get("accountValue") or 0)
-            return value if value > 0 else self.settings.hl_account_fallback
+            return value if value > 0 else None
         except Exception:
-            return self.settings.hl_account_fallback
+            return None
 
     def live_positions(self) -> dict[str, Position] | None:
         state = self._user_state()
@@ -1671,11 +1673,52 @@ class RiskManager:
         self.settings = settings
         self.store = store
         self.notifier = notifier
+        self._warning_active = False
+        self._live_equity_unavailable = False
 
-    def session_start_value(self, portfolio: PaperPortfolio, platform: PlatformAdapter) -> float:
+    def session_start_value(self, portfolio: PaperPortfolio, platform: PlatformAdapter) -> float | None:
+        if self.settings.live:
+            stored = self.store.get_json("live_risk_baseline", {})
+            if (
+                stored.get("wallet") == self.settings.hl_wallet_address
+                and float(stored.get("start_value", 0) or 0) > 0
+            ):
+                return float(stored["start_value"])
+
+            start = platform.account_value()
+            if start is None:
+                return None
+            self.store.set_json(
+                "live_risk_baseline",
+                {
+                    "started": utc_now(),
+                    "wallet": self.settings.hl_wallet_address,
+                    "start_value": start,
+                },
+            )
+            return start
+
         start = portfolio.value(platform.mid_price)
         self.store.set_json("session", {"started": utc_now(), "paper_start": start})
         return start
+
+    def current_value(self, portfolio: PaperPortfolio, platform: PlatformAdapter) -> float | None:
+        if self.settings.live:
+            return platform.account_value()
+        return portfolio.value(platform.mid_price)
+
+    def live_equity_available(self, available: bool) -> None:
+        if not self.settings.live:
+            return
+        if not available and not self._live_equity_unavailable:
+            msg = "[LIVE-RISK] Account equity unavailable; blocking new entries until it recovers."
+            print(msg)
+            self.notifier.send(msg)
+        elif available and self._live_equity_unavailable:
+            msg = "[LIVE-RISK] Account equity feed recovered."
+            print(msg)
+            self.notifier.send(msg)
+        self._live_equity_unavailable = not available
 
     def is_wind_down(self) -> bool:
         return self.settings.wind_down or self.settings.circuit_breaker_file.exists()
@@ -1684,6 +1727,21 @@ class RiskManager:
         if start_value <= 0:
             return 0.0
         return max(0.0, (start_value - current_value) / start_value)
+
+    def check_warning(self, drawdown: float) -> None:
+        warning = drawdown >= self.settings.warning_drawdown_pct
+        if warning and not self._warning_active:
+            msg = (
+                f"[RISK-WARNING] Drawdown {drawdown:.1%} reached warning level "
+                f"{self.settings.warning_drawdown_pct:.0%}; trading continues."
+            )
+            print(msg)
+            self.notifier.send(msg)
+        elif not warning and self._warning_active:
+            msg = f"[RISK] Drawdown recovered below {self.settings.warning_drawdown_pct:.0%}."
+            print(msg)
+            self.notifier.send(msg)
+        self._warning_active = warning
 
     def effective_loss_pct(self, drawdown: float) -> float:
         if drawdown >= self.settings.warning_drawdown_pct:
@@ -1702,7 +1760,11 @@ class RiskManager:
         self.settings.data_dir.mkdir(parents=True, exist_ok=True)
         payload = {
             "tripped_at": utc_now(),
-            "reason": "paper drawdown",
+            "reason": "live account drawdown" if self.settings.live else "paper drawdown",
+            "mode": "live" if self.settings.live else "paper",
+            "wallet": self.settings.hl_wallet_address if self.settings.live else "",
+            "start_value": round(start_value, 2),
+            "current_value": round(current_value, 2),
             "drawdown_pct": round(dd * 100, 2),
             "clear": f"Delete {self.settings.circuit_breaker_file} to allow new entries.",
         }
@@ -2429,10 +2491,23 @@ class CopyTradingBot:
         while self.running:
             cycle_start = unix_now()
             paper_value = self.paper.value(self.platform.mid_price)
-            dd = self.risk.drawdown(session_start, paper_value)
+            risk_value = self.risk.current_value(self.paper, self.platform)
+            if session_start is None and risk_value is not None:
+                session_start = self.risk.session_start_value(self.paper, self.platform)
+            equity_available = session_start is not None and risk_value is not None
+            self.risk.live_equity_available(equity_available)
+            dd = self.risk.drawdown(session_start, risk_value) if equity_available else 0.0
+            self.risk.check_warning(dd)
             loss_threshold = self.risk.effective_loss_pct(dd)
             pause_hours = self.risk.effective_pause_hours(dd)
-            wind_down = self.risk.is_wind_down() or self.risk.check_circuit_breaker(session_start, paper_value)
+            breaker_tripped = (
+                self.risk.check_circuit_breaker(session_start, risk_value)
+                if equity_available
+                else False
+            )
+            wind_down = self.risk.is_wind_down() or breaker_tripped or (
+                self.settings.live and not equity_available
+            )
 
             roster_check_interval = (
                 self.settings.roster_refresh_batch_seconds
@@ -2469,7 +2544,8 @@ class CopyTradingBot:
                     self._handle_exit(event, loss_threshold)
 
             tag = f" dd={dd:.1%}" if dd >= 0.01 else ""
-            print(f"[{time.strftime('%H:%M:%S')}] wallets={len(scan_wallets)} roster={len(wallets)} events={len(events)} paper=${paper_value:,.2f}{tag}")
+            live_tag = f" live=${risk_value:,.2f}" if self.settings.live and risk_value is not None else ""
+            print(f"[{time.strftime('%H:%M:%S')}] wallets={len(scan_wallets)} roster={len(wallets)} events={len(events)} paper=${paper_value:,.2f}{live_tag}{tag}")
             self._sleep_remaining(cycle_start)
 
     def _effective_wallets(self, roster_wallets: list[str]) -> list[str]:
