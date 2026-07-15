@@ -61,6 +61,8 @@ the network, submit orders, or print credential values.
 
 - Use credentials for the intended small live-test account only.
 - Confirm no duplicate main bot process is running.
+- Startup enforces a per-data-directory instance lock; stale locks are recovered
+  automatically after an interrupted process.
 - Confirm `HL_LIVE=true` only when ready to place live orders.
 - The live default is four concurrent coin positions (`MAX_POSITIONS=4`).
 - Candidate, proven Candidate, Core, and Elite allocations all start at 3x.

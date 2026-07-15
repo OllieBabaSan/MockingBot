@@ -394,16 +394,17 @@ def main(argv: list[str]) -> int:
         print_status(settings)
         return 0
 
-    log_handle, original_stdout, original_stderr = core.enable_monitor_log(settings)
-    bot = EliteBot(settings)
-    try:
-        bot.run_forever()
-    finally:
-        sys.stdout.flush()
-        sys.stderr.flush()
-        sys.stdout = original_stdout
-        sys.stderr = original_stderr
-        log_handle.close()
+    with core.InstanceLock(settings):
+        log_handle, original_stdout, original_stderr = core.enable_monitor_log(settings)
+        try:
+            bot = EliteBot(settings)
+            bot.run_forever()
+        finally:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+            log_handle.close()
     return 0
 
 

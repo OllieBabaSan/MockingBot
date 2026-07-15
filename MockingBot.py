@@ -38,6 +38,7 @@ import sqlite3
 import sys
 import time
 import traceback
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -381,6 +382,96 @@ def validate_settings(settings: Settings) -> None:
         errors.append("live database must be distinct from the paper scoring database")
     if errors:
         raise ValueError("Invalid MockingBot configuration: " + "; ".join(errors))
+
+
+class InstanceLock:
+    """Atomic per-data-directory guard against duplicate trading processes."""
+
+    def __init__(self, settings: Settings):
+        self.path = settings.data_dir / "mockingbot.instance.lock"
+        self.mode = "live" if settings.live else "paper"
+        self.wallet = settings.hl_wallet_address
+        self.token = uuid.uuid4().hex
+        self.acquired = False
+
+    @staticmethod
+    def _process_alive(pid: int) -> bool:
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+
+    def _existing_owner(self) -> dict[str, Any]:
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            return payload if isinstance(payload, dict) else {}
+        except (OSError, ValueError, TypeError):
+            return {}
+
+    def acquire(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "pid": os.getpid(),
+            "mode": self.mode,
+            "wallet": self.wallet,
+            "started_at": utc_now(),
+            "token": self.token,
+        }
+        for _attempt in range(3):
+            try:
+                with self.path.open("x", encoding="utf-8") as handle:
+                    json.dump(payload, handle, sort_keys=True)
+                self.acquired = True
+                return
+            except FileExistsError:
+                owner = self._existing_owner()
+                owner_pid = int(owner.get("pid", 0) or 0)
+                if self._process_alive(owner_pid):
+                    owner_mode = str(owner.get("mode", "unknown"))
+                    started = str(owner.get("started_at", "unknown"))
+                    raise RuntimeError(
+                        "MockingBot startup blocked: another "
+                        f"{owner_mode} bot instance owns {self.path} "
+                        f"(PID {owner_pid}, started {started})"
+                    )
+                if not owner:
+                    try:
+                        age_seconds = time.time() - self.path.stat().st_mtime
+                    except FileNotFoundError:
+                        continue
+                    if age_seconds < 5:
+                        time.sleep(0.05)
+                        continue
+                try:
+                    self.path.unlink()
+                except FileNotFoundError:
+                    pass
+        raise RuntimeError(f"MockingBot startup blocked: unable to acquire {self.path}")
+
+    def release(self) -> None:
+        if not self.acquired:
+            return
+        owner = self._existing_owner()
+        if owner.get("token") == self.token:
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                pass
+        self.acquired = False
+
+    def __enter__(self) -> "InstanceLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        self.release()
 
 
 class TeeStream:
@@ -3540,16 +3631,17 @@ def main(argv: list[str]) -> int:
         output = Path(argv[2]) if len(argv) > 2 else settings.data_dir / "signals.csv"
         export_signals_csv(settings, output)
         return 0
-    log_handle, original_stdout, original_stderr = enable_monitor_log(settings)
-    bot = CopyTradingBot(settings)
-    try:
-        bot.run_forever()
-    finally:
-        sys.stdout.flush()
-        sys.stderr.flush()
-        sys.stdout = original_stdout
-        sys.stderr = original_stderr
-        log_handle.close()
+    with InstanceLock(settings):
+        log_handle, original_stdout, original_stderr = enable_monitor_log(settings)
+        try:
+            bot = CopyTradingBot(settings)
+            bot.run_forever()
+        finally:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+            log_handle.close()
     return 0
 
 
