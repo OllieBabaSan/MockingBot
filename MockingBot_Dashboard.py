@@ -57,8 +57,9 @@ def short_wallet(wallet: str | None) -> str:
 
 def connect() -> sqlite3.Connection:
     uri = f"file:{DB_PATH.as_posix()}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True, timeout=2.0)
+    conn = sqlite3.connect(uri, uri=True, timeout=10.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 10000")
     return conn
 
 

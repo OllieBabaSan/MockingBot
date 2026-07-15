@@ -36,8 +36,9 @@ def read_audit(path: Path, since: datetime) -> list[dict[str, Any]]:
     if not path.exists():
         raise FileNotFoundError(path)
     uri = f"file:{path.resolve().as_posix()}?mode=ro"
-    with sqlite3.connect(uri, uri=True, timeout=5.0) as conn:
+    with sqlite3.connect(uri, uri=True, timeout=10.0) as conn:
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 10000")
         exists = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='decision_audit'"
         ).fetchone()

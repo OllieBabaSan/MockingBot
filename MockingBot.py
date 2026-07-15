@@ -407,12 +407,68 @@ class TradeDecision:
 # ---------------------------------------------------------------------------
 
 
+class ResilientConnection(sqlite3.Connection):
+    """SQLite connection with bounded retry for transient lock contention."""
+
+    lock_retry_attempts = 7
+    lock_retry_initial_seconds = 0.05
+
+    @staticmethod
+    def _is_busy(exc: sqlite3.OperationalError) -> bool:
+        message = str(exc).lower()
+        return "database is locked" in message or "database is busy" in message
+
+    def _retry(self, operation: Callable[[], Any]) -> Any:
+        delay = self.lock_retry_initial_seconds
+        for attempt in range(self.lock_retry_attempts):
+            try:
+                return operation()
+            except sqlite3.OperationalError as exc:
+                if not self._is_busy(exc) or attempt + 1 >= self.lock_retry_attempts:
+                    raise
+                if attempt == 0:
+                    print("[DB] SQLite busy; retrying transaction")
+                time.sleep(delay)
+                delay = min(delay * 2, 1.0)
+        raise RuntimeError("unreachable SQLite retry state")
+
+    def execute(self, sql: str, parameters: Any = (), /) -> sqlite3.Cursor:
+        return self._retry(lambda: super(ResilientConnection, self).execute(sql, parameters))
+
+    def executemany(self, sql: str, seq_of_parameters: Any, /) -> sqlite3.Cursor:
+        parameters = list(seq_of_parameters)
+        return self._retry(
+            lambda: super(ResilientConnection, self).executemany(sql, parameters)
+        )
+
+    def executescript(self, sql_script: str, /) -> sqlite3.Cursor:
+        return self._retry(lambda: super(ResilientConnection, self).executescript(sql_script))
+
+    def commit(self) -> None:
+        self._retry(lambda: super(ResilientConnection, self).commit())
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback_value: Any) -> bool:
+        if exc_type is None:
+            self.commit()
+        else:
+            self.rollback()
+        return False
+
+
 class Store:
     def __init__(self, db_path: Path):
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(db_path))
+        self.conn = sqlite3.connect(
+            str(db_path),
+            timeout=30.0,
+            factory=ResilientConnection,
+            check_same_thread=False,
+        )
         self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA busy_timeout = 30000")
+        self.conn.execute("PRAGMA journal_mode = WAL")
+        self.conn.execute("PRAGMA synchronous = NORMAL")
         self.init_schema()
 
     def init_schema(self) -> None:
