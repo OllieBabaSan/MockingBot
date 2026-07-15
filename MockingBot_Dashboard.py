@@ -284,7 +284,8 @@ def dashboard_data() -> dict[str, Any]:
                 (SELECT COUNT(*) FROM paused_wallets) AS paused,
                 (SELECT COUNT(*) FROM signals) AS signals,
                 (SELECT COUNT(*) FROM signals WHERE signal = 'EXIT' AND action = 'EXECUTED') AS exits,
-                (SELECT COUNT(*) FROM api_failures) AS api_failures
+                (SELECT COUNT(*) FROM api_failures) AS api_failures,
+                (SELECT COUNT(*) FROM reconciliation_quarantine) AS quarantined
             """
         ).fetchone()
 
@@ -559,6 +560,7 @@ HTML = r"""<!doctype html>
         ["Positions", String(data.positions.length), ""],
         ["Open PnL", fmtMoney(data.open_pnl), clsNum(data.open_pnl)],
         ["Closed Trades", String(c.exits ?? 0), ""],
+        ["Quarantined", String(c.quarantined ?? 0), (c.quarantined ?? 0) > 0 ? "bad" : ""],
       ];
       document.getElementById("stats").innerHTML = cards.map(([label, value, klass]) => `<div class="stat"><div class="label">${label}</div><div class="value ${klass}">${value}</div></div>`).join("");
 

@@ -402,6 +402,21 @@ class TradeDecision:
     reason: str = ""
 
 
+@dataclass(frozen=True)
+class ExecutionResult:
+    accepted: bool
+    requested_size: float = 0.0
+    filled_size: float = 0.0
+    avg_fill_price: float | None = None
+    order_id: str | None = None
+    status: str = ""
+    confirmed: bool = False
+    detail: str = ""
+
+    def __bool__(self) -> bool:
+        return self.accepted and self.confirmed
+
+
 # ---------------------------------------------------------------------------
 # Durable state and audit log
 # ---------------------------------------------------------------------------
@@ -658,6 +673,29 @@ class Store:
 
             CREATE INDEX IF NOT EXISTS idx_decision_audit_match
             ON decision_audit(wallet, coin, side, signal, ts);
+
+            CREATE TABLE IF NOT EXISTS execution_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                coin TEXT NOT NULL,
+                side TEXT,
+                operation TEXT NOT NULL,
+                requested_size REAL,
+                filled_size REAL,
+                avg_fill_price REAL,
+                order_id TEXT,
+                exchange_status TEXT,
+                confirmed INTEGER NOT NULL,
+                detail TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS reconciliation_quarantine (
+                coin TEXT PRIMARY KEY,
+                reason TEXT NOT NULL,
+                details TEXT,
+                quarantined_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             """
         )
         self.conn.commit()
@@ -1091,6 +1129,60 @@ class Store:
         )
         self.conn.commit()
 
+    def log_execution(
+        self,
+        coin: str,
+        side: str | None,
+        operation: str,
+        result: ExecutionResult,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO execution_audit(
+                ts, coin, side, operation, requested_size, filled_size,
+                avg_fill_price, order_id, exchange_status, confirmed, detail
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                utc_now(), coin, side, operation, result.requested_size,
+                result.filled_size, result.avg_fill_price, result.order_id,
+                result.status, 1 if result.confirmed else 0, result.detail,
+            ),
+        )
+        self.conn.commit()
+
+    def quarantine_coin(self, coin: str, reason: str, details: str = "") -> None:
+        existing = self.coin_quarantine(coin)
+        now = utc_now()
+        self.conn.execute(
+            """
+            INSERT INTO reconciliation_quarantine(coin, reason, details, quarantined_at, updated_at)
+            VALUES(?, ?, ?, ?, ?)
+            ON CONFLICT(coin) DO UPDATE SET
+                reason = excluded.reason,
+                details = excluded.details,
+                updated_at = excluded.updated_at
+            """,
+            (coin, reason, details[:500], now, now),
+        )
+        self.conn.commit()
+        if existing is None or existing["reason"] != reason or existing["details"] != details[:500]:
+            print(f"[QUARANTINE] {coin}: {reason}; remaining book continues")
+
+    def clear_coin_quarantine(self, coin: str) -> None:
+        self.conn.execute("DELETE FROM reconciliation_quarantine WHERE coin = ?", (coin,))
+        self.conn.commit()
+
+    def coin_quarantine(self, coin: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM reconciliation_quarantine WHERE coin = ?", (coin,)
+        ).fetchone()
+
+    def quarantined_coins(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM reconciliation_quarantine ORDER BY updated_at DESC"
+        ).fetchall()
+
     def log_token_risk_event(
         self,
         coin: str,
@@ -1502,11 +1594,11 @@ class PlatformAdapter(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def open_position(self, coin: str, side: str, notional_usd: float, price: float) -> bool:
+    def open_position(self, coin: str, side: str, notional_usd: float, price: float) -> ExecutionResult:
         raise NotImplementedError
 
     @abstractmethod
-    def close_position(self, coin: str) -> bool:
+    def close_position(self, coin: str) -> ExecutionResult:
         raise NotImplementedError
 
 
@@ -1792,9 +1884,9 @@ class HyperliquidAdapter(PlatformAdapter):
             return None
         return result
 
-    def open_position(self, coin: str, side: str, notional_usd: float, price: float) -> bool:
+    def open_position(self, coin: str, side: str, notional_usd: float, price: float) -> ExecutionResult:
         if notional_usd < self.settings.min_order_notional or price <= 0:
-            return False
+            return ExecutionResult(False, status="rejected", detail="below minimum or invalid price")
 
         if self.settings.live:
             try:
@@ -1802,56 +1894,155 @@ class HyperliquidAdapter(PlatformAdapter):
             except Exception as exc:
                 self.store.log_api_failure(self.name, "init_sdk", coin, str(exc))
                 print(f"[LIVE] ENTRY failed {coin} {side}: {exc}")
-                return False
+                return ExecutionResult(False, status="init_failed", detail=str(exc))
 
         decimals = self._sz_decimals.get(coin, 4)
         size = round(notional_usd / price, decimals)
         if size <= 0:
-            return False
+            return ExecutionResult(False, status="rejected", detail="rounded size is zero")
 
         if not self.settings.live:
             print(f"[DRY] ENTRY {coin} {side} size={size} notional~${notional_usd:.2f}")
-            return True
+            result = ExecutionResult(True, size, size, price, status="paper", confirmed=True)
+            self.store.log_execution(coin, side, "OPEN", result)
+            return result
 
         try:
             self._exchange.update_leverage(self.settings.leverage, coin, is_cross=True)  # type: ignore[union-attr]
             result = self._exchange.market_open(  # type: ignore[union-attr]
                 coin, side == "LONG", size, slippage=self.settings.slippage
             )
-            return self._accepted(result)
+            execution = self._parse_execution_result(result, size)
+            state_available, confirmed = self._confirmed_position(coin)
+            if not state_available or confirmed is None or confirmed.side != side or confirmed.size <= 0:
+                detail = "position state unavailable" if not state_available else (
+                    "position not confirmed" if confirmed is None else f"confirmed side={confirmed.side} size={confirmed.size}"
+                )
+                execution = ExecutionResult(
+                    execution.accepted, size, execution.filled_size,
+                    execution.avg_fill_price, execution.order_id, execution.status,
+                    False, detail,
+                )
+                self.store.quarantine_coin(coin, "entry confirmation mismatch", detail)
+            else:
+                execution = ExecutionResult(
+                    True, size, confirmed.size, confirmed.entry_price,
+                    execution.order_id, execution.status, True, "live position confirmed",
+                )
+                self.store.clear_coin_quarantine(coin)
+            self.store.log_execution(coin, side, "OPEN", execution)
+            return execution
         except Exception as exc:
             self.store.log_api_failure(self.name, "open_position", coin, str(exc))
             print(f"[LIVE] ENTRY failed {coin} {side}: {exc}")
-            return False
+            result = ExecutionResult(False, size, status="exception", detail=str(exc))
+            self.store.log_execution(coin, side, "OPEN", result)
+            return result
 
-    def close_position(self, coin: str) -> bool:
+    def close_position(self, coin: str) -> ExecutionResult:
         if not self.settings.live:
             print(f"[DRY] EXIT {coin}")
-            return True
+            result = ExecutionResult(True, status="paper", confirmed=True)
+            self.store.log_execution(coin, None, "CLOSE", result)
+            return result
         try:
             self._init_sdk()
+            state_available, before = self._confirmed_position(coin)
+            if not state_available:
+                result = ExecutionResult(False, status="state_unavailable", detail="pre-close position state unavailable")
+                self.store.quarantine_coin(coin, "close state unavailable", result.detail)
+                self.store.log_execution(coin, None, "CLOSE", result)
+                return result
+            if before is None:
+                result = ExecutionResult(
+                    True,
+                    status="already_flat",
+                    confirmed=True,
+                    detail="exchange already flat; local state may be cleared",
+                )
+                self.store.clear_coin_quarantine(coin)
+                self.store.log_execution(coin, None, "CLOSE", result)
+                return result
+            requested_size = before.size if before else 0.0
             result = self._exchange.market_close(coin, slippage=self.settings.slippage)  # type: ignore[union-attr]
-            return self._accepted(result)
+            execution = self._parse_execution_result(result, requested_size)
+            state_available, remaining = self._confirmed_position(coin)
+            if state_available and remaining is not None and remaining.size > 0:
+                retry = self._exchange.market_close(coin, slippage=self.settings.slippage)  # type: ignore[union-attr]
+                retry_execution = self._parse_execution_result(retry, remaining.size)
+                state_available, remaining = self._confirmed_position(coin)
+                if retry_execution.filled_size:
+                    execution = ExecutionResult(
+                        execution.accepted or retry_execution.accepted,
+                        requested_size,
+                        execution.filled_size + retry_execution.filled_size,
+                        retry_execution.avg_fill_price or execution.avg_fill_price,
+                        retry_execution.order_id or execution.order_id,
+                        retry_execution.status or execution.status,
+                        False,
+                        "residual close retried",
+                    )
+            flat = state_available and (remaining is None or remaining.size <= 0)
+            execution = ExecutionResult(
+                flat or execution.accepted, requested_size, execution.filled_size,
+                execution.avg_fill_price, execution.order_id, execution.status,
+                flat,
+                "live position flat" if flat else (
+                    "post-close position state unavailable" if not state_available else f"residual size={remaining.size}"
+                ),
+            )
+            if flat:
+                self.store.clear_coin_quarantine(coin)
+            else:
+                self.store.quarantine_coin(coin, "residual live position", execution.detail)
+            self.store.log_execution(coin, before.side if before else None, "CLOSE", execution)
+            return execution
         except Exception as exc:
             self.store.log_api_failure(self.name, "close_position", coin, str(exc))
             print(f"[LIVE] EXIT failed {coin}: {exc}")
-            return False
+            result = ExecutionResult(False, status="exception", detail=str(exc))
+            self.store.quarantine_coin(coin, "close exception", str(exc))
+            self.store.log_execution(coin, None, "CLOSE", result)
+            return result
+
+    def _confirmed_position(self, coin: str, attempts: int = 3) -> tuple[bool, Position | None]:
+        for attempt in range(attempts):
+            positions = self.live_positions()
+            if positions is not None:
+                position = positions.get(coin)
+                if position is not None or attempt + 1 >= attempts:
+                    return True, position
+            if attempt + 1 < attempts:
+                time.sleep(0.5)
+        return False, None
 
     @staticmethod
-    def _accepted(result: Any) -> bool:
+    def _parse_execution_result(result: Any, requested_size: float) -> ExecutionResult:
         if not isinstance(result, dict) or result.get("status") != "ok":
-            return False
+            return ExecutionResult(False, requested_size, status="rejected", detail=str(result)[:500])
         statuses = result.get("response", {}).get("data", {}).get("statuses", [])
-        if not statuses:
-            return False
-        if not isinstance(statuses[0], dict):
-            return False
-        if "error" in statuses[0]:
-            return False
-        if not statuses[0]:
-            return False
-        return any(key in statuses[0] for key in ("filled", "resting", "filledWith"))
-
+        status = statuses[0] if statuses else None
+        if not isinstance(status, dict) or "error" in status:
+            detail = str(status.get("error", status) if isinstance(status, dict) else status)
+            return ExecutionResult(False, requested_size, status="error", detail=detail[:500])
+        filled = status.get("filled") or status.get("filledWith")
+        if not isinstance(filled, dict):
+            return ExecutionResult(False, requested_size, status="unfilled", detail=str(status)[:500])
+        try:
+            filled_size = float(filled.get("totalSz") or filled.get("sz") or 0)
+            avg_price = float(filled.get("avgPx") or filled.get("px") or 0) or None
+        except (TypeError, ValueError):
+            return ExecutionResult(False, requested_size, status="invalid_fill", detail=str(filled)[:500])
+        order_id = filled.get("oid")
+        return ExecutionResult(
+            filled_size > 0,
+            requested_size,
+            filled_size,
+            avg_price,
+            None if order_id is None else str(order_id),
+            "filled" if filled_size > 0 else "unfilled",
+            False,
+        )
 
 # ---------------------------------------------------------------------------
 # Portfolio and risk
@@ -2129,6 +2320,9 @@ class RiskManager:
     ) -> TradeDecision:
         if wind_down:
             return TradeDecision("SKIP", "wind-down")
+        quarantine = self.store.coin_quarantine(coin)
+        if quarantine is not None:
+            return TradeDecision("SKIP", f"coin quarantined: {quarantine['reason']}")
         existing = paper.position(coin)
         if existing is not None and existing["side"] != side:
             return TradeDecision("SKIP", "opposite side already held")
@@ -2936,12 +3130,13 @@ class CopyTradingBot:
                 continue
 
             live_held: set[str] | None = set()
-            if self.settings.live and events:
+            if self.settings.live:
                 live_positions = self.platform.live_positions()
                 if live_positions is None:
                     print("[LIVE] Unable to read live positions; blocking ENTRY signals this cycle")
                     live_held = None
                 else:
+                    self._reconcile_live_book(live_positions)
                     live_held = set(live_positions.keys())
             for event in events:
                 if event.kind in {"ENTRY", "ADD"}:
@@ -2963,6 +3158,51 @@ class CopyTradingBot:
                 wallets.append(wallet)
                 seen.add(wallet)
         return wallets
+
+    def _reconcile_live_book(self, live_positions: dict[str, Position]) -> None:
+        local_positions = self.paper.positions()
+        quarantined = {str(row["coin"]) for row in self.store.quarantined_coins()}
+        for coin in sorted(set(local_positions) | set(live_positions) | quarantined):
+            local = local_positions.get(coin)
+            live = live_positions.get(coin)
+            if local is None and live is None:
+                self.store.clear_coin_quarantine(coin)
+                continue
+            if local is None and live is not None:
+                self.store.quarantine_coin(
+                    coin, "unowned live position", f"side={live.side} size={live.size}"
+                )
+                continue
+            if local is not None and live is None:
+                self.store.quarantine_coin(coin, "local position missing live", "exchange is flat")
+                continue
+            if local is None or live is None:
+                continue
+            if str(local["side"]) != live.side:
+                self.store.quarantine_coin(
+                    coin,
+                    "live side mismatch",
+                    f"local={local['side']} live={live.side}",
+                )
+                continue
+            expected_size = sum(
+                float(row["cost_basis"]) * self.settings.leverage / float(row["entry_price"])
+                for row in self.store.open_position_slices(coin)
+                if float(row["entry_price"]) > 0
+            )
+            if isinstance(self.platform, HyperliquidAdapter):
+                rounding_tolerance = 10 ** (-self.platform._sz_decimals.get(coin, 4)) * 2
+            else:
+                rounding_tolerance = 0.0
+            tolerance = max(expected_size * 0.05, rounding_tolerance)
+            if expected_size > 0 and abs(live.size - expected_size) > tolerance:
+                self.store.quarantine_coin(
+                    coin,
+                    "live size mismatch",
+                    f"local={expected_size:.10g} live={live.size:.10g}",
+                )
+                continue
+            self.store.clear_coin_quarantine(coin)
 
     def _handle_entry(self, event: CopyEvent, wind_down: bool, live_held: set[str] | None) -> None:
         self.token_risk.observe(event)
@@ -3013,14 +3253,25 @@ class CopyTradingBot:
             return
 
         notional = cost * self.settings.leverage
-        ok = self.platform.open_position(event.coin, event.side, notional, price)
-        if not ok:
+        execution = self.platform.open_position(event.coin, event.side, notional, price)
+        if not execution:
             signal_id = self.store.log_signal(event.wallet, event.coin, event.side, event.kind, price, "SKIPPED", "live open failed")
             self.scoring_engine.observe_signal(event, signal_id, "SKIPPED", "live open failed", price)
             print(f"[SKIP] {event.kind} {event.coin} {event.side}: live open failed")
             return
 
-        opened_cost = self.paper.open(event.wallet, event.coin, event.side, price, cost, allow_same_wallet_add=is_add)
+        actual_price = execution.avg_fill_price or price
+        actual_cost = cost
+        if self.settings.live and execution.filled_size > 0 and actual_price > 0:
+            actual_cost = execution.filled_size * actual_price / self.settings.leverage
+        opened_cost = self.paper.open(
+            event.wallet,
+            event.coin,
+            event.side,
+            actual_price,
+            actual_cost,
+            allow_same_wallet_add=is_add,
+        )
         if opened_cost is None:
             signal_id = self.store.log_signal(event.wallet, event.coin, event.side, event.kind, price, "SKIPPED", "paper commit failed")
             self.scoring_engine.observe_signal(event, signal_id, "SKIPPED", "paper commit failed", price)
@@ -3130,6 +3381,7 @@ def print_status(settings: Settings) -> None:
     print(f"Database: {settings.db_path}")
     print(f"Roster:   {len(store.roster())} wallet(s)")
     print(f"Paused:   {len(store.paused_wallets())} wallet(s)")
+    print(f"Quarantine: {len(store.quarantined_coins())} coin(s)")
     acct = paper.account()
     print(f"Cash:     ${float(acct['cash']):,.2f}")
     print(f"Realized: ${float(acct.get('realized_pnl', 0)):,.2f}")
