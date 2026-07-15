@@ -1,5 +1,5 @@
 """
-Read-only local dashboard for MockingBot paper testing.
+Read-only local dashboard for a MockingBot paper or live instance.
 
 Usage:
   python .\\MockingBot_Dashboard.py
@@ -14,19 +14,24 @@ import json
 import os
 import sqlite3
 import time
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 
 ROOT = Path(__file__).resolve().parent
-DATA_DIR = Path(os.getenv("MOCKINGBOT_DATA_DIR", str(ROOT / "MockingBot_Data")))
+MODE = os.getenv("MOCKINGBOT_DASHBOARD_MODE", "paper").strip().lower()
+if MODE not in {"paper", "live"}:
+    raise SystemExit("MOCKINGBOT_DASHBOARD_MODE must be 'paper' or 'live'")
+DEFAULT_DATA_DIR = ROOT / ("MockingBot_Main_Live_Test_Data" if MODE == "live" else "MockingBot_Data")
+DATA_DIR = Path(os.getenv("MOCKINGBOT_DATA_DIR", str(DEFAULT_DATA_DIR)))
 DB_PATH = DATA_DIR / "mockingbot_codex.sqlite3"
 HEADER_IMAGE_PATH = Path(os.getenv("MOCKINGBOT_HEADER_IMAGE", r"C:\Users\user\Desktop\Header_cr.png"))
 HOST = os.getenv("MOCKINGBOT_DASHBOARD_HOST", "127.0.0.1")
-PORT = int(os.getenv("MOCKINGBOT_DASHBOARD_PORT", "8765"))
+PORT = int(os.getenv("MOCKINGBOT_DASHBOARD_PORT", "8766" if MODE == "live" else "8765"))
 HL_INFO_URL = os.getenv("HL_INFO_URL", "https://api.hyperliquid.xyz/info")
 LEVERAGE = float(os.getenv("HL_LEVERAGE", "3"))
 PRICE_CACHE_SECONDS = int(os.getenv("MOCKINGBOT_DASHBOARD_PRICE_CACHE_SECS", "15"))
@@ -34,6 +39,9 @@ PRICE_CACHE_SECONDS = int(os.getenv("MOCKINGBOT_DASHBOARD_PRICE_CACHE_SECS", "15
 _PRICE_CACHE: dict[str, float] = {}
 _PRICE_CACHE_TS = 0.0
 _PRICE_CACHE_ERROR = ""
+_ACCOUNT_VALUE_CACHE: float | None = None
+_ACCOUNT_VALUE_CACHE_TS = 0.0
+_ACCOUNT_VALUE_CACHE_ERROR = ""
 
 
 def money(value: float | None) -> str:
@@ -55,12 +63,16 @@ def short_wallet(wallet: str | None) -> str:
     return f"{wallet[:8]}...{wallet[-4:]}" if len(wallet) > 14 else wallet
 
 
-def connect() -> sqlite3.Connection:
+@contextmanager
+def connect() -> Iterator[sqlite3.Connection]:
     uri = f"file:{DB_PATH.as_posix()}?mode=ro"
     conn = sqlite3.connect(uri, uri=True, timeout=10.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 10000")
-    return conn
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 def get_json(conn: sqlite3.Connection, key: str, default: Any) -> Any:
@@ -114,6 +126,37 @@ def live_prices() -> tuple[dict[str, float], str]:
     except Exception as exc:
         _PRICE_CACHE_ERROR = str(exc)
     return _PRICE_CACHE, "cached-live" if _PRICE_CACHE else "stored"
+
+
+def live_account_value(wallet: str) -> tuple[float | None, str]:
+    global _ACCOUNT_VALUE_CACHE, _ACCOUNT_VALUE_CACHE_TS, _ACCOUNT_VALUE_CACHE_ERROR
+    if not wallet:
+        return None, "missing-wallet"
+    now = time.time()
+    if _ACCOUNT_VALUE_CACHE is not None and now - _ACCOUNT_VALUE_CACHE_TS < PRICE_CACHE_SECONDS:
+        return _ACCOUNT_VALUE_CACHE, "live"
+    payload = json.dumps({"type": "clearinghouseState", "user": wallet}).encode("utf-8")
+    request = Request(
+        HL_INFO_URL,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=6) as response:
+            body = json.loads(response.read().decode("utf-8"))
+        value = float(body.get("marginSummary", {}).get("accountValue") or 0)
+        if value >= 0:
+            _ACCOUNT_VALUE_CACHE = value
+            _ACCOUNT_VALUE_CACHE_TS = now
+            _ACCOUNT_VALUE_CACHE_ERROR = ""
+            return value, "live"
+    except Exception as exc:
+        _ACCOUNT_VALUE_CACHE_ERROR = str(exc)
+    return (
+        _ACCOUNT_VALUE_CACHE,
+        "cached-live" if _ACCOUNT_VALUE_CACHE is not None else "local-estimate",
+    )
 
 
 def wallet_statuses(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
@@ -261,7 +304,18 @@ def dashboard_data() -> dict[str, Any]:
 
     with connect() as conn:
         acct = get_json(conn, "paper_account", {"cash": 0.0, "realized_pnl": 0.0})
-        baseline = float(get_json(conn, "session_baseline", 10000.0) or 10000.0)
+        identity = get_json(conn, "live_account_identity", {}) if MODE == "live" else {}
+        if MODE == "live":
+            risk_baseline = get_json(conn, "live_risk_baseline", {})
+            baseline = float(
+                risk_baseline.get("start_value")
+                or identity.get("initial_account_value")
+                or acct.get("cash")
+                or 0.0
+            )
+        else:
+            session = get_json(conn, "session", {})
+            baseline = float(session.get("paper_start") or 10_000.0)
         stored_prices = latest_prices(conn)
         live_price_map, price_source = live_prices()
         prices = dict(stored_prices)
@@ -274,7 +328,12 @@ def dashboard_data() -> dict[str, Any]:
         open_pnl = sum(float(a["pnl_usd"] or 0.0) for a in allocations) if open_pnl_known else None
         cash = float(acct.get("cash", 0.0))
         realized = float(acct.get("realized_pnl", 0.0))
-        estimated_value = cash + open_cost + (open_pnl or 0.0)
+        local_estimate = cash + open_cost + (open_pnl or 0.0)
+        account_wallet = str(identity.get("wallet", ""))
+        live_value, equity_source = (
+            live_account_value(account_wallet) if MODE == "live" else (None, "paper-ledger")
+        )
+        estimated_value = live_value if live_value is not None else local_estimate
         drawdown = ((baseline - estimated_value) / baseline * 100.0) if baseline else 0.0
 
         counts = conn.execute(
@@ -338,9 +397,33 @@ def dashboard_data() -> dict[str, Any]:
             """,
             8,
         )
+        quarantines = recent_rows(
+            conn,
+            """
+            SELECT coin, reason, details, quarantined_at, updated_at
+            FROM reconciliation_quarantine
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            20,
+        )
+        recent_executions = recent_rows(
+            conn,
+            """
+            SELECT ts, coin, side, operation, requested_size, filled_size,
+                   avg_fill_price, order_id, exchange_status, confirmed, detail
+            FROM execution_audit
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            20,
+        )
 
         return {
             "ok": True,
+            "mode": MODE,
+            "instance_label": "LIVE" if MODE == "live" else "PAPER",
+            "account_wallet": short_wallet(account_wallet),
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "db_path": str(DB_PATH),
             "price_source": price_source,
@@ -350,6 +433,9 @@ def dashboard_data() -> dict[str, Any]:
             "open_cost": open_cost,
             "open_pnl": open_pnl,
             "estimated_value": estimated_value,
+            "local_estimate": local_estimate,
+            "equity_source": equity_source,
+            "equity_error": _ACCOUNT_VALUE_CACHE_ERROR if MODE == "live" else "",
             "drawdown_pct": max(0.0, drawdown),
             "baseline": baseline,
             "counts": dict(counts) if counts else {},
@@ -358,6 +444,8 @@ def dashboard_data() -> dict[str, Any]:
             "recent_closes": recent_closes,
             "recent_failures": recent_failures,
             "token_risk_alerts": token_risk_alerts,
+            "quarantines": quarantines,
+            "recent_executions": recent_executions,
         }
 
 
@@ -407,6 +495,17 @@ HTML = r"""<!doctype html>
       object-fit: contain;
     }
     .updated { color: var(--muted); font-size: .78rem; }
+    .mode-badge {
+      display: inline-block;
+      border: 1px solid var(--accent);
+      border-radius: 999px;
+      padding: 4px 12px;
+      color: var(--accent);
+      font-size: .78rem;
+      font-weight: 900;
+      letter-spacing: .12em;
+    }
+    .mode-badge.live { color: var(--bad); border-color: var(--bad); }
     main { max-width: 1040px; margin: 0 auto; padding: 12px; }
     .stats {
       display: grid;
@@ -499,6 +598,7 @@ HTML = r"""<!doctype html>
   <header>
     <div class="brand">
       <img src="/header.png" alt="MockingBot">
+      <div class="mode-badge" id="mode-badge">...</div>
       <div class="updated" id="updated">Loading...</div>
     </div>
   </header>
@@ -508,6 +608,10 @@ HTML = r"""<!doctype html>
       <h2>Token Risk Alerts</h2>
       <div class="table-wrap"><table id="token-risk"></table></div>
     </section>
+    <section class="alert-panel" id="quarantine-section" hidden>
+      <h2>Quarantined Coins</h2>
+      <div class="table-wrap"><table id="quarantines"></table></div>
+    </section>
     <section>
       <h2>Open Positions</h2>
       <div class="table-wrap"><table id="positions"></table></div>
@@ -515,6 +619,10 @@ HTML = r"""<!doctype html>
     <section>
       <h2>Recent Closes</h2>
       <div class="table-wrap"><table id="closes"></table></div>
+    </section>
+    <section>
+      <h2>Execution Confirmations</h2>
+      <div class="table-wrap"><table id="executions"></table></div>
     </section>
     <section class="api-panel">
       <details>
@@ -551,7 +659,12 @@ HTML = r"""<!doctype html>
         : data.price_source === "cached-live"
           ? "cached mids"
           : "stored prices";
-      document.getElementById("updated").textContent = `Updated ${data.generated_at} | read-only | ${priceLabel}`;
+      const badge = document.getElementById("mode-badge");
+      badge.textContent = data.instance_label;
+      badge.className = `mode-badge ${data.mode === "live" ? "live" : "paper"}`;
+      const accountLabel = data.account_wallet ? ` | account ${data.account_wallet}` : "";
+      document.title = `MockingBot ${data.instance_label} Dashboard`;
+      document.getElementById("updated").textContent = `Updated ${data.generated_at} | read-only | ${priceLabel}${accountLabel}`;
       const c = data.counts || {};
       const cards = [
         ["Est. Value", fmtMoney(data.estimated_value), clsNum(data.estimated_value - data.baseline)],
@@ -577,6 +690,18 @@ HTML = r"""<!doctype html>
           </tr>`), "No token risk alerts.");
       }
 
+      const quarantineSection = document.getElementById("quarantine-section");
+      const quarantines = data.quarantines || [];
+      quarantineSection.hidden = quarantines.length === 0;
+      if (quarantines.length) {
+        table(document.getElementById("quarantines"), ["Coin", "Reason", "Details", "Since", "Updated"],
+          quarantines.map(q => `<tr>
+            <td><strong>${esc(q.coin)}</strong></td><td class="bad">${esc(q.reason)}</td>
+            <td class="warn">${esc(q.details || "")}</td>
+            <td class="muted">${esc(q.quarantined_at || "")}</td><td class="muted">${esc(q.updated_at || "")}</td>
+          </tr>`), "No quarantined coins.");
+      }
+
       table(document.getElementById("positions"), ["Coin", "Side", "Alloc", "Cost", "Entry", "Last", "Open PnL", "Wallets", "Status"],
         data.positions.map(p => `<tr>
           <td><strong>${esc(p.coin)}</strong></td><td><span class="pill">${esc(p.side)}</span></td>
@@ -597,6 +722,17 @@ HTML = r"""<!doctype html>
           <td>${fmtMoney(s.cost_basis)}</td>
           <td class="${clsNum(s.paper_gain)}">${fmtMoney(s.paper_gain)} <span class="muted">${fmtPct(s.pnl_pct)}</span></td>
         </tr>`), "No executed closes yet.");
+
+      table(document.getElementById("executions"), ["Time", "Coin", "Op", "Requested", "Filled", "Avg Fill", "Order", "Confirmed", "Detail"],
+        (data.recent_executions || []).map(x => `<tr>
+          <td class="muted">${esc((x.ts || "").slice(5, 19))}</td><td><strong>${esc(x.coin)}</strong></td>
+          <td>${esc(x.operation)}</td><td>${Number(x.requested_size || 0).toLocaleString()}</td>
+          <td>${Number(x.filled_size || 0).toLocaleString()}</td>
+          <td>${x.avg_fill_price ? Number(x.avg_fill_price).toLocaleString(undefined, {maximumFractionDigits: 6}) : "n/a"}</td>
+          <td class="muted">${esc(x.order_id || "")}</td>
+          <td class="${x.confirmed ? "good" : "bad"}">${x.confirmed ? "yes" : "no"}</td>
+          <td class="muted">${esc(x.detail || x.exchange_status || "")}</td>
+        </tr>`), "No execution records yet.");
 
       const failures = document.getElementById("failures");
       if (!data.recent_failures.length) {
@@ -657,7 +793,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> int:
     server = ThreadingHTTPServer((HOST, PORT), Handler)
-    print(f"MockingBot dashboard running at http://{HOST}:{PORT}")
+    print(f"MockingBot {MODE.upper()} dashboard running at http://{HOST}:{PORT}")
     print(f"Database: {DB_PATH}")
     try:
         server.serve_forever()

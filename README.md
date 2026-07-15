@@ -14,10 +14,13 @@ Default state lives in `MockingBot_Data/`.
 ## Dashboard
 
 ```powershell
-python .\MockingBot_Dashboard.py
+.\Start-MockingBot_Paper_Dashboard.ps1
+.\Start-MockingBot_Live_Dashboard.ps1
 ```
 
-Open `http://127.0.0.1:8765`.
+Open the paper dashboard at `http://127.0.0.1:8765` and the live dashboard at
+`http://127.0.0.1:8766`. Each process is read-only and connects only to its
+own instance database.
 
 ## Elite Comparison Bot
 
