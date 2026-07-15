@@ -43,6 +43,17 @@ python .\MockingBot_Compare.py
 Append-only parity reports are written to
 `MockingBot_Comparison_Data/parity.jsonl`.
 
+## Tests
+
+Run the offline safety and regression suite before live restarts or releases:
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+The tests use temporary databases and fake exchange responses. They do not use
+the network, submit orders, or print credential values.
+
 ## Live Test Checklist
 
 - Use credentials for the intended small live-test account only.

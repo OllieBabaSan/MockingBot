@@ -1,0 +1,1 @@
+"""MockingBot regression tests."""
