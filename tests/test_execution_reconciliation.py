@@ -167,6 +167,90 @@ class ExecutionReconciliationTests(unittest.TestCase):
         self.assertEqual(result.status, "already_flat")
         self.assertEqual(exchange.closes, 0)
 
+    def test_lost_close_response_recovers_when_exchange_is_flat(self) -> None:
+        exchange = FakeExchange([])
+        self.adapter._exchange = exchange
+        states = iter([
+            (True, core.Position("BTC", "LONG", 0.10, 100)),
+            (True, None),
+        ])
+        self.adapter._confirmed_position = lambda _coin: next(states)
+
+        result = self.adapter.close_position("BTC")
+
+        self.assertTrue(result)
+        self.assertEqual(result.status, "recovered")
+        self.assertTrue(result.confirmed)
+        self.assertEqual(exchange.closes, 1)
+        self.assertIsNone(self.store.coin_quarantine("BTC"))
+
+    def test_lost_close_response_with_no_change_is_clean_failure(self) -> None:
+        exchange = FakeExchange([])
+        self.adapter._exchange = exchange
+        position = core.Position("BTC", "LONG", 0.10, 100)
+        self.adapter._confirmed_position = lambda _coin: (True, position)
+
+        result = self.adapter.close_position("BTC")
+
+        self.assertFalse(result)
+        self.assertIn("no position change", result.detail)
+        self.assertEqual(exchange.closes, 1)
+        self.assertIsNone(self.store.coin_quarantine("BTC"))
+
+    def test_lost_close_response_retries_measured_residual_once(self) -> None:
+        exchange = FakeExchange([])
+        self.adapter._exchange = exchange
+        states = iter([
+            (True, core.Position("BTC", "LONG", 0.10, 100)),
+            (True, core.Position("BTC", "LONG", 0.04, 100)),
+            (True, None),
+        ])
+        self.adapter._confirmed_position = lambda _coin: next(states)
+
+        result = self.adapter.close_position("BTC")
+
+        self.assertTrue(result)
+        self.assertEqual(result.status, "recovered")
+        self.assertEqual(exchange.closes, 2)
+        self.assertIsNone(self.store.coin_quarantine("BTC"))
+
+    def test_lost_close_response_with_unavailable_state_quarantines_coin(self) -> None:
+        exchange = FakeExchange([])
+        self.adapter._exchange = exchange
+        states = iter([
+            (True, core.Position("BTC", "LONG", 0.10, 100)),
+            (False, None),
+        ])
+        self.adapter._confirmed_position = lambda _coin: next(states)
+
+        result = self.adapter.close_position("BTC")
+
+        self.assertFalse(result)
+        self.assertEqual(result.status, "ambiguous")
+        self.assertEqual(
+            self.store.coin_quarantine("BTC")["reason"], "ambiguous close state"
+        )
+
+    def test_unresolved_normal_close_residual_is_not_reported_successful(self) -> None:
+        exchange = FakeExchange(
+            [fill_response("0.06", "99", 8), fill_response("0.01", "98", 9)]
+        )
+        self.adapter._exchange = exchange
+        states = iter([
+            (True, core.Position("BTC", "LONG", 0.10, 100)),
+            (True, core.Position("BTC", "LONG", 0.04, 100)),
+            (True, core.Position("BTC", "LONG", 0.03, 100)),
+        ])
+        self.adapter._confirmed_position = lambda _coin: next(states)
+
+        result = self.adapter.close_position("BTC")
+
+        self.assertFalse(result)
+        self.assertFalse(result.confirmed)
+        self.assertEqual(
+            self.store.coin_quarantine("BTC")["reason"], "residual live position"
+        )
+
     def test_book_reconciliation_clears_safe_hold_and_keeps_unowned_hold(self) -> None:
         paper = core.PaperPortfolio(self.settings, self.store)
         paper.open("wallet", "BTC", "LONG", 100.0, 10.0)

@@ -88,3 +88,7 @@ Live entries also snapshot the coin position before submission. If an order
 response is lost, a measured position increase is recovered as the fill; an
 unchanged position is a clean failure, while unverifiable state quarantines only
 that coin. Ambiguous entries are never automatically resubmitted.
+Close responses receive the same state-based recovery. Verified flatness is
+required before the local allocation is cleared; a measured partial close gets
+one residual-close attempt, and unresolved residuals remain tracked and
+quarantined.

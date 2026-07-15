@@ -1830,6 +1830,8 @@ class HyperliquidAdapter(PlatformAdapter):
         if not self.settings.hl_api_key:
             raise RuntimeError("Live startup blocked: HL_API_KEY is missing")
 
+        before: Position | None = None
+        requested_size = 0.0
         try:
             import eth_account
         except ImportError as exc:
@@ -2277,7 +2279,7 @@ class HyperliquidAdapter(PlatformAdapter):
                 self.store.clear_coin_quarantine(coin)
                 self.store.log_execution(coin, None, "CLOSE", result)
                 return result
-            requested_size = before.size if before else 0.0
+            requested_size = before.size
             result = self._exchange.market_close(coin, slippage=self.settings.slippage)  # type: ignore[union-attr]
             execution = self._parse_execution_result(result, requested_size)
             state_available, remaining = self._confirmed_position(coin)
@@ -2298,7 +2300,7 @@ class HyperliquidAdapter(PlatformAdapter):
                     )
             flat = state_available and (remaining is None or remaining.size <= 0)
             execution = ExecutionResult(
-                flat or execution.accepted, requested_size, execution.filled_size,
+                flat, requested_size, execution.filled_size,
                 execution.avg_fill_price, execution.order_id, execution.status,
                 flat,
                 "live position flat" if flat else (
@@ -2313,10 +2315,86 @@ class HyperliquidAdapter(PlatformAdapter):
             return execution
         except Exception as exc:
             self.store.log_api_failure(self.name, "close_position", coin, str(exc))
-            print(f"[LIVE] EXIT failed {coin}: {exc}")
-            result = ExecutionResult(False, status="exception", detail=str(exc))
-            self.store.quarantine_coin(coin, "close exception", str(exc))
-            self.store.log_execution(coin, None, "CLOSE", result)
+            if before is None:
+                detail = f"close failed before position snapshot: {exc}"
+                result = ExecutionResult(False, status="exception", detail=detail)
+                self.store.quarantine_coin(coin, "close exception", detail)
+                self.store.log_execution(coin, None, "CLOSE", result)
+                print(f"[LIVE] EXIT failed {coin}: {detail}")
+                return result
+
+            state_available, remaining = self._confirmed_position(coin)
+            if not state_available:
+                detail = f"ambiguous close after error: {exc}; position state unavailable"
+                result = ExecutionResult(
+                    False, requested_size, status="ambiguous", detail=detail
+                )
+                self.store.quarantine_coin(coin, "ambiguous close state", detail)
+            elif remaining is None or remaining.size <= 0:
+                detail = f"close recovered after response error: {exc}; exchange is flat"
+                result = ExecutionResult(
+                    True, requested_size, requested_size,
+                    status="recovered", confirmed=True, detail=detail,
+                )
+                self.store.clear_coin_quarantine(coin)
+            elif remaining.side != before.side or remaining.size > before.size:
+                detail = (
+                    f"ambiguous close after error: {exc}; before={before.side} "
+                    f"{before.size:g}, after={remaining.side} {remaining.size:g}"
+                )
+                result = ExecutionResult(
+                    False, requested_size, status="ambiguous", detail=detail
+                )
+                self.store.quarantine_coin(coin, "ambiguous close mismatch", detail)
+            elif remaining.size < before.size:
+                measured_closed = before.size - remaining.size
+                retry_error = ""
+                try:
+                    self._exchange.market_close(  # type: ignore[union-attr]
+                        coin, slippage=self.settings.slippage
+                    )
+                except Exception as retry_exc:
+                    retry_error = str(retry_exc)
+                    self.store.log_api_failure(
+                        self.name, "close_position_residual", coin, retry_error
+                    )
+                final_available, final_remaining = self._confirmed_position(coin)
+                flat = final_available and (
+                    final_remaining is None or final_remaining.size <= 0
+                )
+                if flat:
+                    detail = (
+                        f"partial close measured ({before.size:g}->{remaining.size:g}); "
+                        "confirmed residual retry left exchange flat"
+                    )
+                    if retry_error:
+                        detail += f" after lost retry response: {retry_error}"
+                    result = ExecutionResult(
+                        True, requested_size, requested_size,
+                        status="recovered", confirmed=True, detail=detail,
+                    )
+                    self.store.clear_coin_quarantine(coin)
+                else:
+                    residual_detail = (
+                        "state unavailable" if not final_available else
+                        f"residual size={final_remaining.size if final_remaining else 0:g}"
+                    )
+                    detail = (
+                        f"partial close measured size={measured_closed:g}; "
+                        f"residual retry unresolved: {residual_detail}"
+                    )
+                    result = ExecutionResult(
+                        False, requested_size, measured_closed,
+                        status="partial", confirmed=False, detail=detail,
+                    )
+                    self.store.quarantine_coin(coin, "residual live position", detail)
+            else:
+                detail = f"close submission failed with no position change: {exc}"
+                result = ExecutionResult(
+                    False, requested_size, status="exception", detail=detail
+                )
+            print(f"[LIVE] EXIT {coin}: {result.detail}")
+            self.store.log_execution(coin, before.side, "CLOSE", result)
             return result
 
     def _confirmed_position(self, coin: str, attempts: int = 3) -> tuple[bool, Position | None]:
