@@ -29,6 +29,7 @@ Optional for live Hyperliquid execution:
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 import os
@@ -96,6 +97,49 @@ load_dotenv(ROOT / ".env.txt")
 load_dotenv(ROOT / ".env.execution.txt")
 
 
+def load_main_credentials(path: Path) -> dict[str, str]:
+    credentials = {"wallet": "", "api_wallet": "", "api_key": ""}
+    if not path.exists():
+        return credentials
+
+    aliases = {
+        "hl_wallet_address": "wallet",
+        "wallet": "wallet",
+        "address": "wallet",
+        "hl_api_wallet_address": "api_wallet",
+        "api_wallet": "api_wallet",
+        "api_wallet_address": "api_wallet",
+        "api wallet": "api_wallet",
+        "api wallet address": "api_wallet",
+        "hl_api_key": "api_key",
+        "api_key": "api_key",
+        "api key": "api_key",
+        "private_key": "api_key",
+        "private key": "api_key",
+    }
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        separator = "=" if "=" in line else (":" if ":" in line else "")
+        if not separator:
+            continue
+        key, value = line.split(separator, 1)
+        target = aliases.get(key.strip().lower())
+        if target:
+            credentials[target] = value.strip().strip('"').strip("'")
+    return credentials
+
+
+MAIN_CREDENTIALS_PATH = Path(
+    os.getenv(
+        "MOCKINGBOT_MAIN_CREDENTIALS_PATH",
+        str(ROOT / "MockingBot_Main_Live_Test.Hyper.txt"),
+    )
+).expanduser()
+MAIN_CREDENTIALS = load_main_credentials(MAIN_CREDENTIALS_PATH)
+
+
 def env_str(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
@@ -122,7 +166,26 @@ def env_bool(name: str, default: bool = False) -> bool:
 @dataclass(frozen=True)
 class Settings:
     platform: str = env_str("MOCKINGBOT_PLATFORM", "hyperliquid").lower()
-    data_dir: Path = Path(env_str("MOCKINGBOT_DATA_DIR", str(ROOT / "MockingBot_Data")))
+    data_dir: Path = Path(
+        env_str(
+            "MOCKINGBOT_DATA_DIR",
+            str(
+                ROOT
+                / (
+                    "MockingBot_Main_Live_Test_Data"
+                    if env_bool("HL_LIVE", False)
+                    else "MockingBot_Data"
+                )
+            ),
+        )
+    )
+    instance_id: str = env_str(
+        "MOCKINGBOT_INSTANCE_ID",
+        "live-main" if env_bool("HL_LIVE", False) else "paper-main",
+    )
+    scoring_seed_db_path: Path = Path(
+        env_str("MOCKINGBOT_SCORING_SEED_DB", str(ROOT / "MockingBot_Data" / "mockingbot_codex.sqlite3"))
+    )
 
     poll_seconds: int = env_int("POLL_INTERVAL_SECS", 30)
     wallet_poll_delay: float = env_float("WALLET_POLL_DELAY", 0.50)
@@ -207,8 +270,9 @@ class Settings:
     pause_emergency_loss_pct: float = env_float("PAUSE_EMERGENCY_LOSS_PCT", 5.0)
     max_position_days: int = env_int("MAX_POSITION_DAYS", 7)
 
-    hl_api_key: str = env_str("HL_API_KEY", "")
-    hl_wallet_address: str = env_str("HL_WALLET_ADDRESS", "")
+    hl_api_key: str = MAIN_CREDENTIALS["api_key"] or env_str("HL_API_KEY", "")
+    hl_wallet_address: str = MAIN_CREDENTIALS["wallet"] or env_str("HL_WALLET_ADDRESS", "")
+    hl_api_wallet_address: str = MAIN_CREDENTIALS["api_wallet"] or env_str("HL_API_WALLET_ADDRESS", "")
     hl_account_fallback: float = env_float("HL_ACCOUNT_USD", 0.0)
 
     notify_webhook_url: str = env_str("NOTIFY_WEBHOOK_URL", "")
@@ -224,6 +288,38 @@ class Settings:
     @property
     def monitor_log_path(self) -> Path:
         return Path(env_str("MOCKINGBOT_MONITOR_LOG", str(self.data_dir / "mockingbot_live.log")))
+
+
+CODE_FINGERPRINT = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
+
+
+def settings_fingerprint(settings: Settings) -> str:
+    values = {
+        "platform": settings.platform,
+        "poll_seconds": settings.poll_seconds,
+        "roster_size": settings.roster_size,
+        "max_follow": settings.max_follow,
+        "min_sample": settings.min_sample,
+        "min_win_rate": settings.min_win_rate,
+        "min_profit_factor": settings.min_profit_factor,
+        "leverage": settings.leverage,
+        "max_positions": settings.max_positions,
+        "max_slices_per_coin": settings.max_slices_per_coin,
+        "max_coin_cost_multiplier": settings.max_coin_cost_multiplier,
+        "max_allocations_per_wallet_coin_side": settings.max_allocations_per_wallet_coin_side,
+        "same_wallet_add_threshold_pct": settings.same_wallet_add_threshold_pct,
+        "scoring_engine_active": settings.scoring_engine_active,
+        "candidate_multiplier": settings.scoring_engine_candidate_multiplier,
+        "proven_candidate_multiplier": settings.scoring_engine_proven_candidate_multiplier,
+        "core_multiplier": settings.scoring_engine_core_multiplier,
+        "elite_multiplier": settings.scoring_engine_elite_multiplier,
+        "candidate_max_allocations": settings.scoring_engine_candidate_max_allocations,
+        "proven_candidate_max_allocations": settings.scoring_engine_proven_candidate_max_allocations,
+        "warning_drawdown_pct": settings.warning_drawdown_pct,
+        "max_drawdown_pct": settings.max_drawdown_pct,
+    }
+    encoded = json.dumps(values, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
 
 
 class TeeStream:
@@ -472,10 +568,116 @@ class Store:
                 close_signal_id INTEGER,
                 close_reason TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS scoring_seed_signals (
+                source_signal_id INTEGER PRIMARY KEY,
+                ts TEXT NOT NULL,
+                wallet TEXT NOT NULL,
+                signal TEXT NOT NULL,
+                paper_gain REAL,
+                pnl_pct REAL
+            );
+
+            CREATE TABLE IF NOT EXISTS decision_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                instance_id TEXT NOT NULL,
+                signal_id INTEGER,
+                wallet TEXT NOT NULL,
+                coin TEXT NOT NULL,
+                side TEXT NOT NULL,
+                signal TEXT NOT NULL,
+                action TEXT NOT NULL,
+                reason TEXT,
+                wallet_tier TEXT NOT NULL,
+                wallet_score REAL NOT NULL,
+                sample_size INTEGER NOT NULL,
+                observed_price REAL,
+                previous_size REAL,
+                current_size REAL,
+                config_fingerprint TEXT NOT NULL,
+                code_fingerprint TEXT NOT NULL,
+                scoring_seed_fingerprint TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_decision_audit_match
+            ON decision_audit(wallet, coin, side, signal, ts);
             """
         )
         self.conn.commit()
         self._migrate_legacy_paper_positions()
+
+    def bootstrap_scoring_history(self, source_path: Path) -> dict[str, Any]:
+        existing = self.get_json("scoring_bootstrap", {})
+        if existing:
+            return existing
+        if not source_path.exists() or source_path.resolve() == self.db_path.resolve():
+            raise RuntimeError(f"Scoring bootstrap database unavailable: {source_path}")
+
+        source = sqlite3.connect(f"file:{source_path.resolve().as_posix()}?mode=ro", uri=True)
+        source.row_factory = sqlite3.Row
+        try:
+            roster = source.execute(
+                "SELECT wallet, status, score, updated_at FROM roster"
+            ).fetchall()
+            metrics = source.execute(
+                "SELECT wallet, sample, win_rate, profit_factor, updated_at FROM roster_wallet_metrics"
+            ).fetchall()
+            signals = source.execute(
+                """
+                SELECT id, ts, wallet, signal, paper_gain, pnl_pct
+                FROM signals
+                WHERE action = 'EXECUTED'
+                  AND (
+                      signal IN ('ENTRY', 'ADD')
+                      OR (signal = 'EXIT' AND pnl_pct IS NOT NULL)
+                  )
+                ORDER BY id
+                """
+            ).fetchall()
+        finally:
+            source.close()
+
+        digest_rows = [tuple(row) for row in signals]
+        digest = hashlib.sha256(
+            json.dumps(digest_rows, separators=(",", ":"), default=str).encode("utf-8")
+        ).hexdigest()
+        metadata = {
+            "imported_at": utc_now(),
+            "source_path": str(source_path.resolve()),
+            "source_signal_count": len(signals),
+            "source_roster_count": len(roster),
+            "fingerprint": digest,
+        }
+        with self.conn:
+            self.conn.executemany(
+                "INSERT OR REPLACE INTO roster(wallet, status, score, updated_at) VALUES(?, ?, ?, ?)",
+                [tuple(row) for row in roster],
+            )
+            self.conn.executemany(
+                """
+                INSERT OR REPLACE INTO roster_wallet_metrics(
+                    wallet, sample, win_rate, profit_factor, updated_at
+                ) VALUES(?, ?, ?, ?, ?)
+                """,
+                [tuple(row) for row in metrics],
+            )
+            self.conn.executemany(
+                """
+                INSERT INTO scoring_seed_signals(
+                    source_signal_id, ts, wallet, signal, paper_gain, pnl_pct
+                ) VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                [tuple(row) for row in signals],
+            )
+            self.conn.execute(
+                "INSERT INTO kv(key, value) VALUES('scoring_bootstrap', ?)",
+                (json.dumps(metadata),),
+            )
+        return metadata
+
+    def scoring_seed_fingerprint(self) -> str:
+        return str(self.get_json("scoring_bootstrap", {}).get("fingerprint", ""))
 
     def _migrate_legacy_paper_positions(self) -> None:
         slice_count = self.conn.execute("SELECT COUNT(*) AS n FROM paper_position_slices").fetchone()["n"]
@@ -918,6 +1120,48 @@ class Store:
         )
         self.conn.commit()
 
+    def log_decision_audit(
+        self,
+        settings: Settings,
+        event: "CopyEvent",
+        signal_id: int | None,
+        actual_action: str,
+        actual_reason: str,
+        score: "ScoringEngineScore",
+        price: float | None,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO decision_audit(
+                ts, instance_id, signal_id, wallet, coin, side, signal, action, reason,
+                wallet_tier, wallet_score, sample_size, observed_price,
+                previous_size, current_size, config_fingerprint, code_fingerprint,
+                scoring_seed_fingerprint
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                utc_now(),
+                settings.instance_id,
+                signal_id,
+                event.wallet,
+                event.coin,
+                event.side,
+                event.kind,
+                actual_action,
+                actual_reason,
+                score.tier,
+                score.total_score,
+                score.sample_size,
+                price,
+                event.previous_size,
+                event.current_size,
+                settings_fingerprint(settings),
+                CODE_FINGERPRINT,
+                self.scoring_seed_fingerprint(),
+            ),
+        )
+        self.conn.commit()
+
     def open_scoring_engine_shadow_position(
         self,
         event: "CopyEvent",
@@ -1230,6 +1474,49 @@ class HyperliquidAdapter(PlatformAdapter):
             return r.json()
 
         return self.retry.request_json(operation, subject, call)
+
+    def validate_live_credentials(self) -> None:
+        if not self.settings.live:
+            return
+        if not self.settings.hl_wallet_address:
+            raise RuntimeError("Live startup blocked: HL_WALLET_ADDRESS is missing")
+        if not self.settings.hl_api_wallet_address:
+            raise RuntimeError("Live startup blocked: HL_API_WALLET_ADDRESS is missing")
+        if not self.settings.hl_api_key:
+            raise RuntimeError("Live startup blocked: HL_API_KEY is missing")
+
+        try:
+            import eth_account
+        except ImportError as exc:
+            raise RuntimeError("Live startup blocked: eth-account is not installed") from exc
+
+        try:
+            signer = eth_account.Account.from_key(self.settings.hl_api_key).address
+        except Exception as exc:
+            raise RuntimeError("Live startup blocked: HL_API_KEY is invalid") from exc
+        if signer.lower() != self.settings.hl_api_wallet_address.lower():
+            raise RuntimeError(
+                "Live startup blocked: API key does not derive the configured API wallet"
+            )
+
+        role = self._post_info(
+            {"type": "userRole", "user": signer},
+            "validate_live_credentials",
+            signer,
+        )
+        if not isinstance(role, dict) or role.get("role") != "agent":
+            raise RuntimeError("Live startup blocked: configured API wallet is not an active agent")
+        linked_user = role.get("data", {}).get("user")
+        if not isinstance(linked_user, str) or linked_user.lower() != self.settings.hl_wallet_address.lower():
+            raise RuntimeError(
+                "Live startup blocked: API wallet is not linked to the configured trading account"
+            )
+
+        wallet = self.settings.hl_wallet_address
+        print(
+            f"[LIVE] Credentials verified account={wallet[:8]}...{wallet[-4:]} "
+            f"agent={signer[:8]}...{signer[-4:]}"
+        )
 
     def candidate_wallets(self, limit: int) -> list[str]:
         wallets: list[str] = []
@@ -1880,37 +2167,44 @@ class ScoringEngine:
         rows = self.store.conn.execute(
             """
             SELECT paper_gain, pnl_pct
-            FROM signals
-            WHERE wallet = ?
-              AND signal = 'EXIT'
-              AND action = 'EXECUTED'
-              AND pnl_pct IS NOT NULL
-            ORDER BY id
+            FROM (
+                SELECT paper_gain, pnl_pct, 0 AS source_order, source_signal_id AS sort_id
+                FROM scoring_seed_signals
+                WHERE wallet = ? AND signal = 'EXIT' AND pnl_pct IS NOT NULL
+                UNION ALL
+                SELECT paper_gain, pnl_pct, 1 AS source_order, id AS sort_id
+                FROM signals
+                WHERE wallet = ?
+                  AND signal = 'EXIT'
+                  AND action = 'EXECUTED'
+                  AND pnl_pct IS NOT NULL
+            )
+            ORDER BY source_order, sort_id
             """,
-            (wallet,),
+            (wallet, wallet),
         ).fetchall()
         entry_count = int(
             self.store.conn.execute(
                 """
-                SELECT COUNT(*) AS n
-                FROM signals
-                WHERE wallet = ?
-                  AND signal = 'ENTRY'
-                  AND action = 'EXECUTED'
+                SELECT
+                    (SELECT COUNT(*) FROM scoring_seed_signals WHERE wallet = ? AND signal = 'ENTRY')
+                    +
+                    (SELECT COUNT(*) FROM signals
+                     WHERE wallet = ? AND signal = 'ENTRY' AND action = 'EXECUTED') AS n
                 """,
-                (wallet,),
+                (wallet, wallet),
             ).fetchone()["n"]
         )
         add_count = int(
             self.store.conn.execute(
                 """
-                SELECT COUNT(*) AS n
-                FROM signals
-                WHERE wallet = ?
-                  AND signal = 'ADD'
-                  AND action = 'EXECUTED'
+                SELECT
+                    (SELECT COUNT(*) FROM scoring_seed_signals WHERE wallet = ? AND signal = 'ADD')
+                    +
+                    (SELECT COUNT(*) FROM signals
+                     WHERE wallet = ? AND signal = 'ADD' AND action = 'EXECUTED') AS n
                 """,
-                (wallet,),
+                (wallet, wallet),
             ).fetchone()["n"]
         )
         entry_count += add_count
@@ -2164,6 +2458,15 @@ class ScoringEngine:
             recommendation,
             would_execute,
             reason,
+        )
+        self.store.log_decision_audit(
+            self.settings,
+            event,
+            signal_id,
+            actual_action,
+            actual_reason,
+            score,
+            price,
         )
         if event.kind == "ENTRY" and actual_action == "SKIPPED" and would_execute and price and price > 0:
             self.store.open_scoring_engine_shadow_position(event, price, signal_id, score)
@@ -2436,6 +2739,12 @@ class CopyTradingBot:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.store = Store(settings.db_path)
+        if settings.live:
+            bootstrap = self.store.bootstrap_scoring_history(settings.scoring_seed_db_path)
+            print(
+                f"[BOOTSTRAP] Loaded {bootstrap['source_signal_count']} scoring events "
+                f"from paper history fingerprint={bootstrap['fingerprint'][:12]}"
+            )
         self.notifier = Notifier(settings.notify_webhook_url)
         self.platform = self._build_platform()
         self.paper = PaperPortfolio(settings, self.store)
@@ -2462,6 +2771,9 @@ class CopyTradingBot:
 
         print("[BOOT] MockingBot starting")
         print(f"[BOOT] platform={self.platform.name} live={self.settings.live} db={self.settings.db_path}")
+        if self.settings.live and isinstance(self.platform, HyperliquidAdapter):
+            self.platform.validate_live_credentials()
+            self._validate_live_state()
         self.notifier.send("MockingBot started.")
 
         restart_count = 0
@@ -2481,6 +2793,44 @@ class CopyTradingBot:
                     time.sleep(1)
         self.notifier.send("MockingBot stopped.")
         print("[BOOT] Stopped")
+
+    def _validate_live_state(self) -> None:
+        identity = self.store.get_json("live_account_identity", {})
+        wallet = self.settings.hl_wallet_address
+        if identity:
+            if str(identity.get("wallet", "")).lower() != wallet.lower():
+                raise RuntimeError("Live startup blocked: database belongs to a different account")
+            return
+
+        if self.store.open_position_slices():
+            raise RuntimeError("Live startup blocked: new live database contains local open positions")
+        live_positions = self.platform.live_positions()
+        if live_positions is None:
+            raise RuntimeError("Live startup blocked: unable to verify initial live positions")
+        if live_positions:
+            raise RuntimeError(
+                "Live startup blocked: first run requires a flat Hyperliquid perpetuals account"
+            )
+        account_value = self.platform.account_value()
+        if account_value is None or account_value <= 0:
+            raise RuntimeError(
+                "Live startup blocked: perpetuals account equity is unavailable or zero"
+            )
+        self.store.save_paper_account({"cash": round(account_value, 2), "realized_pnl": 0.0})
+        self.store.set_json(
+            "live_account_identity",
+            {
+                "wallet": wallet,
+                "api_wallet": self.settings.hl_api_wallet_address,
+                "initialized_at": utc_now(),
+                "initial_account_value": round(account_value, 2),
+                "scoring_seed_fingerprint": self.store.scoring_seed_fingerprint(),
+            },
+        )
+        print(
+            f"[LIVE] Fresh isolated state verified; new signals only; "
+            f"allocation basis=${account_value:,.2f}"
+        )
 
     def _run_loop(self) -> None:
         wallets = self.roster.load_or_refresh(force=False)

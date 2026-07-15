@@ -5,6 +5,8 @@ __pycache__/
 MockingBot_Data/
 MockingBot_Data_CodeX/
 MockingBot_Elite_Data/
+MockingBot_Main_Live_Test_Data/
+MockingBot_Comparison_Data/
 *.sqlite3
 *.sqlite3-*
 *.log
@@ -19,4 +21,3 @@ MockingBot_Elite_Data/
 # Historical local backups
 *.bak
 *.pre_*
-

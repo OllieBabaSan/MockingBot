@@ -29,7 +29,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 CORE_PATH = ROOT / "MockingBot.py"
-ELITE_CREDENTIALS_PATH = Path(r"C:\Users\user\Documents\MockingBot_Elite.Hyper.txt")
+ELITE_CREDENTIALS_PATH = Path(r"C:\Users\user\Documents\Hyperliquid Credentials MockingBot_Elite.txt")
 
 
 def load_core() -> Any:
@@ -49,7 +49,7 @@ ELITE_RECENT_FILL_DAYS = 7
 
 
 def load_elite_credentials() -> dict[str, str]:
-    credentials = {"name": "", "wallet": "", "api_key": ""}
+    credentials = {"name": "", "wallet": "", "api_wallet": "", "api_key": ""}
     if not ELITE_CREDENTIALS_PATH.exists():
         return credentials
 
@@ -62,11 +62,17 @@ def load_elite_credentials() -> dict[str, str]:
             credentials["name"] = line.split(":", 1)[1].strip()
         elif lower.startswith("wallet:"):
             credentials["wallet"] = line.split(":", 1)[1].strip()
+        elif lower.startswith(("api wallet:", "api wallet address:")):
+            credentials["api_wallet"] = line.split(":", 1)[1].strip()
+        elif lower.startswith("api key:"):
+            credentials["api_key"] = line.split(":", 1)[1].strip()
         elif "=" in line:
             key, value = line.split("=", 1)
             normalized = key.strip().lower()
             if normalized in {"hl_wallet_address", "wallet", "address"}:
                 credentials["wallet"] = value.strip()
+            elif normalized in {"hl_api_wallet_address", "api_wallet", "api_wallet_address"}:
+                credentials["api_wallet"] = value.strip()
             elif normalized in {"hl_api_key", "api_key", "private_key"}:
                 credentials["api_key"] = value.strip()
         elif not credentials["api_key"]:
