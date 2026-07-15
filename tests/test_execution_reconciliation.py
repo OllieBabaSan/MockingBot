@@ -158,6 +158,35 @@ class ExecutionReconciliationTests(unittest.TestCase):
         self.assertEqual(exchange.closes, 2)
         self.assertTrue(result.confirmed)
 
+    def test_partial_close_reduces_only_requested_allocation(self) -> None:
+        exchange = FakeExchange([fill_response("0.20", "99", 8)])
+        self.adapter._exchange = exchange
+        states = iter([
+            (True, core.Position("BTC", "LONG", 0.50, 100)),
+            (True, core.Position("BTC", "LONG", 0.30, 100)),
+        ])
+        self.adapter._confirmed_position = lambda _coin: next(states)
+
+        result = self.adapter.close_position("BTC", 0.20)
+
+        self.assertTrue(result)
+        self.assertTrue(result.confirmed)
+        self.assertAlmostEqual(result.filled_size, 0.20)
+        self.assertEqual(exchange.close_sizes, [0.20])
+        self.assertIn("remaining=0.3", result.detail)
+
+    def test_wallet_allocation_size_excludes_other_wallets(self) -> None:
+        paper = core.PaperPortfolio(self.settings, self.store)
+        paper.open("wallet-a", "BTC", "LONG", 100, 10, leverage=3)
+        paper.open("wallet-b", "BTC", "LONG", 100, 20, leverage=3)
+
+        self.assertAlmostEqual(
+            paper.allocation_position_size("wallet-a", "BTC", "LONG"), 0.30
+        )
+        self.assertAlmostEqual(
+            paper.allocation_position_size("wallet-b", "BTC", "LONG"), 0.60
+        )
+
     def test_already_flat_close_self_heals(self) -> None:
         exchange = FakeExchange([])
         self.adapter._exchange = exchange

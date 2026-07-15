@@ -362,7 +362,10 @@ class EliteBot:
             print(f"[ELITE-EXIT] {event.coin} {event.side}: no price")
             return
 
-        if not self.platform.close_position(event.coin):
+        close_size = self.paper.allocation_position_size(
+            event.wallet, event.coin, event.side
+        )
+        if not self.platform.close_position(event.coin, close_size):
             self.store.log_signal(event.wallet, event.coin, event.side, "EXIT", price, "SKIPPED", "close failed")
             print(f"[ELITE-EXIT] {event.coin} {event.side}: close failed")
             return

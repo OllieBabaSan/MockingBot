@@ -1794,7 +1794,7 @@ class PlatformAdapter(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def close_position(self, coin: str) -> ExecutionResult:
+    def close_position(self, coin: str, size: float | None = None) -> ExecutionResult:
         raise NotImplementedError
 
 
@@ -2255,147 +2255,153 @@ class HyperliquidAdapter(PlatformAdapter):
             self.store.log_execution(coin, side, "OPEN", result, leverage, requested_leverage)
             return result
 
-    def close_position(self, coin: str) -> ExecutionResult:
+    def close_position(self, coin: str, size: float | None = None) -> ExecutionResult:
         if not self.settings.live:
-            print(f"[DRY] EXIT {coin}")
-            result = ExecutionResult(True, status="paper", confirmed=True)
+            result = ExecutionResult(
+                True, requested_size=float(size or 0), status="paper", confirmed=True
+            )
             self.store.log_execution(coin, None, "CLOSE", result)
             return result
         try:
             self._init_sdk()
             state_available, before = self._confirmed_position(coin)
-            if not state_available:
-                result = ExecutionResult(False, status="state_unavailable", detail="pre-close position state unavailable")
-                self.store.quarantine_coin(coin, "close state unavailable", result.detail)
-                self.store.log_execution(coin, None, "CLOSE", result)
-                return result
-            if before is None:
-                result = ExecutionResult(
-                    True,
-                    status="already_flat",
-                    confirmed=True,
-                    detail="exchange already flat; local state may be cleared",
-                )
-                self.store.clear_coin_quarantine(coin)
-                self.store.log_execution(coin, None, "CLOSE", result)
-                return result
-            requested_size = before.size
-            result = self._exchange.market_close(coin, slippage=self.settings.slippage)  # type: ignore[union-attr]
-            execution = self._parse_execution_result(result, requested_size)
-            state_available, remaining = self._confirmed_position(coin)
-            if state_available and remaining is not None and remaining.size > 0:
-                retry = self._exchange.market_close(coin, slippage=self.settings.slippage)  # type: ignore[union-attr]
-                retry_execution = self._parse_execution_result(retry, remaining.size)
-                state_available, remaining = self._confirmed_position(coin)
-                if retry_execution.filled_size:
-                    execution = ExecutionResult(
-                        execution.accepted or retry_execution.accepted,
-                        requested_size,
-                        execution.filled_size + retry_execution.filled_size,
-                        retry_execution.avg_fill_price or execution.avg_fill_price,
-                        retry_execution.order_id or execution.order_id,
-                        retry_execution.status or execution.status,
-                        False,
-                        "residual close retried",
-                    )
-            flat = state_available and (remaining is None or remaining.size <= 0)
-            execution = ExecutionResult(
-                flat, requested_size, execution.filled_size,
-                execution.avg_fill_price, execution.order_id, execution.status,
-                flat,
-                "live position flat" if flat else (
-                    "post-close position state unavailable" if not state_available else f"residual size={remaining.size}"
-                ),
-            )
-            if flat:
-                self.store.clear_coin_quarantine(coin)
-            else:
-                self.store.quarantine_coin(coin, "residual live position", execution.detail)
-            self.store.log_execution(coin, before.side if before else None, "CLOSE", execution)
-            return execution
         except Exception as exc:
             self.store.log_api_failure(self.name, "close_position", coin, str(exc))
-            if before is None:
-                detail = f"close failed before position snapshot: {exc}"
-                result = ExecutionResult(False, status="exception", detail=detail)
-                self.store.quarantine_coin(coin, "close exception", detail)
-                self.store.log_execution(coin, None, "CLOSE", result)
-                print(f"[LIVE] EXIT failed {coin}: {detail}")
-                return result
+            result = ExecutionResult(False, status="exception", detail=str(exc))
+            self.store.quarantine_coin(coin, "close exception", str(exc))
+            self.store.log_execution(coin, None, "CLOSE", result)
+            return result
+        if not state_available:
+            result = ExecutionResult(
+                False, status="state_unavailable", detail="pre-close position state unavailable"
+            )
+            self.store.quarantine_coin(coin, "close state unavailable", result.detail)
+            self.store.log_execution(coin, None, "CLOSE", result)
+            return result
+        if before is None:
+            result = ExecutionResult(
+                True, status="already_flat", confirmed=True,
+                detail="exchange already flat; local state may be cleared",
+            )
+            self.store.clear_coin_quarantine(coin)
+            self.store.log_execution(coin, None, "CLOSE", result)
+            return result
 
-            state_available, remaining = self._confirmed_position(coin)
-            if not state_available:
-                detail = f"ambiguous close after error: {exc}; position state unavailable"
-                result = ExecutionResult(
-                    False, requested_size, status="ambiguous", detail=detail
-                )
-                self.store.quarantine_coin(coin, "ambiguous close state", detail)
-            elif remaining is None or remaining.size <= 0:
-                detail = f"close recovered after response error: {exc}; exchange is flat"
-                result = ExecutionResult(
-                    True, requested_size, requested_size,
-                    status="recovered", confirmed=True, detail=detail,
-                )
-                self.store.clear_coin_quarantine(coin)
-            elif remaining.side != before.side or remaining.size > before.size:
-                detail = (
-                    f"ambiguous close after error: {exc}; before={before.side} "
-                    f"{before.size:g}, after={remaining.side} {remaining.size:g}"
-                )
-                result = ExecutionResult(
-                    False, requested_size, status="ambiguous", detail=detail
-                )
-                self.store.quarantine_coin(coin, "ambiguous close mismatch", detail)
-            elif remaining.size < before.size:
-                measured_closed = before.size - remaining.size
-                retry_error = ""
-                try:
-                    self._exchange.market_close(  # type: ignore[union-attr]
-                        coin, slippage=self.settings.slippage
-                    )
-                except Exception as retry_exc:
-                    retry_error = str(retry_exc)
-                    self.store.log_api_failure(
-                        self.name, "close_position_residual", coin, retry_error
-                    )
-                final_available, final_remaining = self._confirmed_position(coin)
-                flat = final_available and (
-                    final_remaining is None or final_remaining.size <= 0
-                )
-                if flat:
-                    detail = (
-                        f"partial close measured ({before.size:g}->{remaining.size:g}); "
-                        "confirmed residual retry left exchange flat"
-                    )
-                    if retry_error:
-                        detail += f" after lost retry response: {retry_error}"
-                    result = ExecutionResult(
-                        True, requested_size, requested_size,
-                        status="recovered", confirmed=True, detail=detail,
-                    )
-                    self.store.clear_coin_quarantine(coin)
-                else:
-                    residual_detail = (
-                        "state unavailable" if not final_available else
-                        f"residual size={final_remaining.size if final_remaining else 0:g}"
-                    )
-                    detail = (
-                        f"partial close measured size={measured_closed:g}; "
-                        f"residual retry unresolved: {residual_detail}"
-                    )
-                    result = ExecutionResult(
-                        False, requested_size, measured_closed,
-                        status="partial", confirmed=False, detail=detail,
-                    )
-                    self.store.quarantine_coin(coin, "residual live position", detail)
-            else:
-                detail = f"close submission failed with no position change: {exc}"
-                result = ExecutionResult(
-                    False, requested_size, status="exception", detail=detail
-                )
-            print(f"[LIVE] EXIT {coin}: {result.detail}")
+        decimals = self._sz_decimals.get(coin, 4)
+        tolerance = 10 ** (-decimals) * 1.5
+        requested_size = before.size if size is None else round(float(size), decimals)
+        requested_size = min(requested_size, before.size)
+        if requested_size <= 0:
+            result = ExecutionResult(
+                False, requested_size, status="rejected", detail="close size rounds to zero"
+            )
             self.store.log_execution(coin, before.side, "CLOSE", result)
             return result
+
+        def measure(remaining: Position | None) -> tuple[float, str]:
+            if remaining is None:
+                return before.size, "exchange is flat"
+            if remaining.side != before.side or remaining.size > before.size + tolerance:
+                return -1.0, (
+                    f"before={before.side} {before.size:g}, "
+                    f"after={remaining.side} {remaining.size:g}"
+                )
+            return max(0.0, before.size - remaining.size), f"remaining size={remaining.size:g}"
+
+        response_execution = ExecutionResult(False, requested_size, status="unsubmitted")
+        submission_error = ""
+        try:
+            response = self._exchange.market_close(  # type: ignore[union-attr]
+                coin, sz=requested_size, slippage=self.settings.slippage
+            )
+            response_execution = self._parse_execution_result(response, requested_size)
+        except Exception as exc:
+            submission_error = str(exc)
+            self.store.log_api_failure(self.name, "close_position", coin, submission_error)
+
+        state_available, remaining = self._confirmed_position(coin)
+        if not state_available:
+            detail = "post-close position state unavailable"
+            if submission_error:
+                detail = f"ambiguous close after error: {submission_error}; {detail}"
+            result = ExecutionResult(
+                False, requested_size, response_execution.filled_size,
+                response_execution.avg_fill_price, response_execution.order_id,
+                "ambiguous", False, detail,
+            )
+            self.store.quarantine_coin(coin, "ambiguous close state", detail)
+            self.store.log_execution(coin, before.side, "CLOSE", result)
+            return result
+
+        reduction, state_detail = measure(remaining)
+        if reduction < 0 or reduction > requested_size + tolerance:
+            detail = f"close reduction mismatch: requested={requested_size:g}; {state_detail}"
+            result = ExecutionResult(False, requested_size, status="mismatch", detail=detail)
+            self.store.quarantine_coin(coin, "close reduction mismatch", detail)
+            self.store.log_execution(coin, before.side, "CLOSE", result)
+            return result
+
+        if tolerance < reduction < requested_size - tolerance:
+            retry_size = round(requested_size - reduction, decimals)
+            retry_error = ""
+            try:
+                retry_response = self._exchange.market_close(  # type: ignore[union-attr]
+                    coin, sz=retry_size, slippage=self.settings.slippage
+                )
+                retry_execution = self._parse_execution_result(retry_response, retry_size)
+                if retry_execution.avg_fill_price:
+                    response_execution = retry_execution
+            except Exception as exc:
+                retry_error = str(exc)
+                self.store.log_api_failure(
+                    self.name, "close_position_residual", coin, retry_error
+                )
+            final_available, final_remaining = self._confirmed_position(coin)
+            if not final_available:
+                detail = "residual close state unavailable"
+                if retry_error:
+                    detail += f" after error: {retry_error}"
+                result = ExecutionResult(
+                    False, requested_size, reduction, status="partial", detail=detail
+                )
+                self.store.quarantine_coin(coin, "residual live position", detail)
+                self.store.log_execution(coin, before.side, "CLOSE", result)
+                return result
+            reduction, state_detail = measure(final_remaining)
+
+        success = abs(reduction - requested_size) <= tolerance
+        if success:
+            detail = (
+                f"verified reduction={reduction:g}; "
+                f"remaining={max(0.0, before.size - reduction):g}"
+            )
+            if submission_error:
+                detail = f"recovered after response error: {submission_error}; {detail}"
+            result = ExecutionResult(
+                True, requested_size, reduction,
+                response_execution.avg_fill_price, response_execution.order_id,
+                "recovered"
+                if submission_error or not response_execution.accepted
+                else response_execution.status,
+                True, detail,
+            )
+            if before.size - reduction <= tolerance:
+                self.store.clear_coin_quarantine(coin)
+        elif reduction <= tolerance and submission_error:
+            result = ExecutionResult(
+                False, requested_size, status="exception",
+                detail=f"close submission failed with no position change: {submission_error}",
+            )
+        else:
+            detail = f"requested reduction={requested_size:g}; measured={reduction:g}; {state_detail}"
+            result = ExecutionResult(
+                False, requested_size, max(0.0, reduction),
+                response_execution.avg_fill_price, response_execution.order_id,
+                "partial", False, detail,
+            )
+            self.store.quarantine_coin(coin, "residual live position", detail)
+        self.store.log_execution(coin, before.side, "CLOSE", result)
+        return result
 
     def _confirmed_position(self, coin: str, attempts: int = 3) -> tuple[bool, Position | None]:
         for attempt in range(attempts):
@@ -2473,6 +2479,17 @@ class PaperPortfolio:
 
     def allocation_count_for_wallet_coin_side(self, wallet: str, coin: str, side: str) -> int:
         return self.store.paper_position_slice_count(wallet, coin, side)
+
+    def allocation_position_size(self, wallet: str, coin: str, side: str) -> float:
+        return sum(
+            float(row["cost_basis"])
+            * float(row["leverage"])
+            / float(row["entry_price"])
+            for row in self.store.open_position_slices(coin)
+            if row["source_wallet"] == wallet
+            and row["side"] == side
+            and float(row["entry_price"]) > 0
+        )
 
     def held_coins(self) -> set[str]:
         return set(self.positions().keys())
@@ -3396,14 +3413,24 @@ class Reconciler:
             print(f"[RECONCILE] Close skipped {coin} {side}: no price")
             return
 
-        if not self.platform.close_position(coin):
+        close_size = self.paper.allocation_position_size(wallet, coin, side)
+        if not self.platform.close_position(coin, close_size):
             self.store.log_signal(wallet, coin, side, "EXIT", price, "SKIPPED", f"{reason}; live close failed")
             print(f"[RECONCILE] Close failed {coin} {side}: {reason}")
             return
 
-        gain, pnl_pct, _ = self.paper.close(wallet, coin, side, price)
-        self.store.log_signal(wallet, coin, side, "EXIT", price, "EXECUTED", reason, gain, pnl_pct)
-        self.risk.maybe_pause_wallet(wallet, coin, pnl_pct, loss_threshold)
+        total_gain = 0.0
+        last_pnl_pct: float | None = None
+        while self.paper.owns_position(wallet, coin, side):
+            gain, pnl_pct, _ = self.paper.close(wallet, coin, side, price)
+            if gain is None:
+                break
+            total_gain += gain
+            last_pnl_pct = pnl_pct
+            self.store.log_signal(
+                wallet, coin, side, "EXIT", price, "EXECUTED", reason, gain, pnl_pct
+            )
+        self.risk.maybe_pause_wallet(wallet, coin, last_pnl_pct, loss_threshold)
         print(f"[RECONCILE] Closed {coin} {side}: {reason}")
 
 
@@ -3728,7 +3755,7 @@ class CopyTradingBot:
             signal_id = self.store.log_signal(event.wallet, event.coin, event.side, event.kind, price, "SKIPPED", "paper commit failed")
             self.scoring_engine.observe_signal(event, signal_id, "SKIPPED", "paper commit failed", price)
             print(f"[WARN] {event.kind} {event.coin} {event.side}: live opened but paper commit failed")
-            if not self.platform.close_position(event.coin):
+            if not self.platform.close_position(event.coin, execution.filled_size):
                 recovery_id = self.store.log_signal(
                     event.wallet,
                     event.coin,
@@ -3782,7 +3809,10 @@ class CopyTradingBot:
             print(f"[EXIT] {event.coin} {side}: no price")
             return
 
-        if not self.platform.close_position(event.coin):
+        close_size = self.paper.allocation_position_size(
+            event.wallet, event.coin, event.side
+        )
+        if not self.platform.close_position(event.coin, close_size):
             signal_id = self.store.log_signal(event.wallet, event.coin, side, "EXIT", price, "SKIPPED", "live close failed")
             self.scoring_engine.observe_signal(event, signal_id, "SKIPPED", "live close failed", price)
             print(f"[EXIT] {event.coin} {side}: live close failed")

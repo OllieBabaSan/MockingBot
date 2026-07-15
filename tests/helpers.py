@@ -43,6 +43,7 @@ class FakeExchange:
         self.responses = list(responses)
         self.opens = 0
         self.closes = 0
+        self.close_sizes: list[float | None] = []
         self.leverages: list[int] = []
 
     def update_leverage(self, leverage: int, *_args: Any, **_kwargs: Any) -> None:
@@ -54,4 +55,5 @@ class FakeExchange:
 
     def market_close(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
         self.closes += 1
+        self.close_sizes.append(_kwargs.get("sz"))
         return self.responses.pop(0)

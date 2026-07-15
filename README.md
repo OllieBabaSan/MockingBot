@@ -92,3 +92,7 @@ Close responses receive the same state-based recovery. Verified flatness is
 required before the local allocation is cleared; a measured partial close gets
 one residual-close attempt, and unresolved residuals remain tracked and
 quarantined.
+When several wallets share a coin position, exits use Hyperliquid's reduce-only
+`market_close` size parameter for only the exiting wallet's reconstructed fill
+size. The measured reduction must match before that wallet's local slices are
+removed; unrelated wallet allocations remain open.
