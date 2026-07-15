@@ -315,7 +315,9 @@ class EliteBot:
             return
 
         notional = cost * self.settings.leverage
-        if not self.platform.open_position(event.coin, event.side, notional, price):
+        if not self.platform.open_position(
+            event.coin, event.side, notional, price, self.settings.leverage
+        ):
             self.store.log_signal(event.wallet, event.coin, event.side, "ENTRY", price, "SKIPPED", "open failed")
             print(f"[ELITE-SKIP] ENTRY {event.coin} {event.side}: open failed")
             return

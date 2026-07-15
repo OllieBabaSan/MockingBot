@@ -28,15 +28,16 @@ class ExecutionReconciliationTests(unittest.TestCase):
             True,
             core.Position("BTC", "LONG", 0.12, 101.0),
         )
-        result = self.adapter.open_position("BTC", "LONG", 12.0, 100.0)
+        result = self.adapter.open_position("BTC", "LONG", 12.0, 100.0, 3)
         self.assertTrue(result)
         self.assertEqual(result.filled_size, 0.12)
         self.assertEqual(result.avg_fill_price, 101.0)
+        self.assertEqual(self.adapter._exchange.leverages, [3])
 
     def test_unconfirmed_entry_quarantines_only_that_coin(self) -> None:
         self.adapter._exchange = FakeExchange([fill_response()])
         self.adapter._confirmed_position = lambda _coin: (False, None)
-        result = self.adapter.open_position("ETH", "LONG", 12.0, 100.0)
+        result = self.adapter.open_position("ETH", "LONG", 12.0, 100.0, 3)
         self.assertFalse(result)
         self.assertEqual(self.store.coin_quarantine("ETH")["reason"], "entry confirmation mismatch")
 

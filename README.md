@@ -62,5 +62,17 @@ the network, submit orders, or print credential values.
 - Use credentials for the intended small live-test account only.
 - Confirm no duplicate main bot process is running.
 - Confirm `HL_LIVE=true` only when ready to place live orders.
-- Use conservative sizing for the first live test.
+- The live default is four concurrent coin positions (`MAX_POSITIONS=4`).
+- Candidate, proven Candidate, Core, and Elite allocations all start at 3x.
+- `MAX_LEVERAGE_CAP=5` is a hard bot cap; tier settings cannot exceed it.
+- Slippage defaults to 1% (`SLIPPAGE=0.01`) and cannot exceed 2%.
+- Tier allocation multipliers remain independent of leverage and retain their
+  established settings.
 - Keep the Elite comparison bot credentials and data separate.
+
+Tier leverage can be adjusted later with
+`SCORING_ENGINE_DEFAULT_CANDIDATE_LEVERAGE`,
+`SCORING_ENGINE_CANDIDATE_LEVERAGE`,
+`SCORING_ENGINE_PROVEN_CANDIDATE_LEVERAGE`,
+`SCORING_ENGINE_CORE_LEVERAGE`, and `SCORING_ENGINE_ELITE_LEVERAGE`.
+Invalid values fail startup before the bot connects or submits an order.

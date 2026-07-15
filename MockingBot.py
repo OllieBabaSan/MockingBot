@@ -147,20 +147,24 @@ def env_str(name: str, default: str = "") -> str:
 def env_int(name: str, default: int) -> int:
     try:
         return int(env_str(name, str(default)))
-    except ValueError:
-        return default
+    except ValueError as exc:
+        raise ValueError(f"Invalid integer setting {name}") from exc
 
 
 def env_float(name: str, default: float) -> float:
     try:
         return float(env_str(name, str(default)))
-    except ValueError:
-        return default
+    except ValueError as exc:
+        raise ValueError(f"Invalid numeric setting {name}") from exc
 
 
 def env_bool(name: str, default: bool = False) -> bool:
     raw = env_str(name, "true" if default else "false").lower()
-    return raw in {"1", "true", "yes", "y", "on"}
+    if raw in {"1", "true", "yes", "y", "on"}:
+        return True
+    if raw in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"Invalid boolean setting {name}")
 
 
 @dataclass(frozen=True)
@@ -218,7 +222,13 @@ class Settings:
 
     paper_starting_cash: float = env_float("PAPER_STARTING_CASH", 10_000.0)
     leverage: int = env_int("HL_LEVERAGE", 3)
-    max_positions: int = env_int("MAX_POSITIONS", 10)
+    max_leverage_cap: int = env_int("MAX_LEVERAGE_CAP", 5)
+    scoring_engine_default_candidate_leverage: int = env_int("SCORING_ENGINE_DEFAULT_CANDIDATE_LEVERAGE", 3)
+    scoring_engine_candidate_leverage: int = env_int("SCORING_ENGINE_CANDIDATE_LEVERAGE", 3)
+    scoring_engine_proven_candidate_leverage: int = env_int("SCORING_ENGINE_PROVEN_CANDIDATE_LEVERAGE", 3)
+    scoring_engine_core_leverage: int = env_int("SCORING_ENGINE_CORE_LEVERAGE", 3)
+    scoring_engine_elite_leverage: int = env_int("SCORING_ENGINE_ELITE_LEVERAGE", 3)
+    max_positions: int = env_int("MAX_POSITIONS", 4 if env_bool("HL_LIVE", False) else 10)
     max_slices_per_coin: int = env_int("MAX_SLICES_PER_COIN", 5)
     max_coin_cost_multiplier: float = env_float("MAX_COIN_COST_MULT", 2.0)
     max_allocations_per_wallet_coin_side: int = env_int("MAX_ALLOCATIONS_PER_WALLET_COIN_SIDE", 2)
@@ -303,6 +313,12 @@ def settings_fingerprint(settings: Settings) -> str:
         "min_win_rate": settings.min_win_rate,
         "min_profit_factor": settings.min_profit_factor,
         "leverage": settings.leverage,
+        "max_leverage_cap": settings.max_leverage_cap,
+        "default_candidate_leverage": settings.scoring_engine_default_candidate_leverage,
+        "candidate_leverage": settings.scoring_engine_candidate_leverage,
+        "proven_candidate_leverage": settings.scoring_engine_proven_candidate_leverage,
+        "core_leverage": settings.scoring_engine_core_leverage,
+        "elite_leverage": settings.scoring_engine_elite_leverage,
         "max_positions": settings.max_positions,
         "max_slices_per_coin": settings.max_slices_per_coin,
         "max_coin_cost_multiplier": settings.max_coin_cost_multiplier,
@@ -320,6 +336,51 @@ def settings_fingerprint(settings: Settings) -> str:
     }
     encoded = json.dumps(values, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def validate_settings(settings: Settings) -> None:
+    errors: list[str] = []
+    if settings.max_positions <= 0:
+        errors.append("MAX_POSITIONS must be positive")
+    if settings.max_slices_per_coin <= 0:
+        errors.append("MAX_SLICES_PER_COIN must be positive")
+    if not 0.001 <= settings.slippage <= 0.02:
+        errors.append("SLIPPAGE must be between 0.001 (0.1%) and 0.02 (2%)")
+    if not 1 <= settings.max_leverage_cap <= 5:
+        errors.append("MAX_LEVERAGE_CAP must be between 1 and 5")
+    leverages = {
+        "default Candidate": settings.scoring_engine_default_candidate_leverage,
+        "Candidate": settings.scoring_engine_candidate_leverage,
+        "proven Candidate": settings.scoring_engine_proven_candidate_leverage,
+        "Core": settings.scoring_engine_core_leverage,
+        "Elite": settings.scoring_engine_elite_leverage,
+    }
+    for tier, leverage in leverages.items():
+        if not 1 <= leverage <= settings.max_leverage_cap:
+            errors.append(f"{tier} leverage must be between 1 and MAX_LEVERAGE_CAP")
+    if not 0 < settings.warning_drawdown_pct < settings.max_drawdown_pct < 1:
+        errors.append("drawdown settings must satisfy 0 < warning < maximum < 1")
+    if settings.poll_seconds <= 0 or settings.reconcile_seconds <= 0:
+        errors.append("poll and reconciliation intervals must be positive")
+    if settings.roster_refresh_seconds <= 0 or settings.roster_refresh_batch_seconds <= 0:
+        errors.append("roster refresh intervals must be positive")
+    if settings.min_order_notional <= 0 or settings.min_slot_usd <= 0:
+        errors.append("minimum order and slot values must be positive")
+    multipliers = (
+        settings.scoring_engine_default_candidate_multiplier,
+        settings.scoring_engine_candidate_multiplier,
+        settings.scoring_engine_proven_candidate_multiplier,
+        settings.scoring_engine_core_multiplier,
+        settings.scoring_engine_elite_multiplier,
+    )
+    if settings.scoring_engine_max_slot_multiplier <= 0:
+        errors.append("maximum slot multiplier must be positive")
+    if any(value < 0 or value > settings.scoring_engine_max_slot_multiplier for value in multipliers):
+        errors.append("tier allocation multipliers must be between 0 and the maximum slot multiplier")
+    if settings.live and settings.db_path.resolve() == settings.scoring_seed_db_path.resolve():
+        errors.append("live database must be distinct from the paper scoring database")
+    if errors:
+        raise ValueError("Invalid MockingBot configuration: " + "; ".join(errors))
 
 
 class TeeStream:
@@ -535,6 +596,7 @@ class Store:
                 source_wallet TEXT NOT NULL,
                 entry_price REAL NOT NULL,
                 cost_basis REAL NOT NULL,
+                leverage REAL NOT NULL DEFAULT 3,
                 opened_at TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'OPEN',
                 closed_at TEXT,
@@ -680,6 +742,7 @@ class Store:
                 coin TEXT NOT NULL,
                 side TEXT,
                 operation TEXT NOT NULL,
+                leverage REAL,
                 requested_size REAL,
                 filled_size REAL,
                 avg_fill_price REAL,
@@ -699,7 +762,15 @@ class Store:
             """
         )
         self.conn.commit()
+        self._ensure_column("paper_position_slices", "leverage", "REAL NOT NULL DEFAULT 3")
+        self._ensure_column("execution_audit", "leverage", "REAL")
         self._migrate_legacy_paper_positions()
+
+    def _ensure_column(self, table: str, column: str, declaration: str) -> None:
+        columns = {str(row["name"]) for row in self.conn.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+            self.conn.commit()
 
     def bootstrap_scoring_history(self, source_path: Path) -> dict[str, Any]:
         existing = self.get_json("scoring_bootstrap", {})
@@ -989,14 +1060,22 @@ class Store:
         return int(row["n"] if row else 0)
 
     def insert_paper_position_slice(
-        self, coin: str, side: str, entry_price: float, cost_basis: float, source_wallet: str
+        self,
+        coin: str,
+        side: str,
+        entry_price: float,
+        cost_basis: float,
+        source_wallet: str,
+        leverage: float,
     ) -> None:
         self.conn.execute(
             """
-            INSERT INTO paper_position_slices(coin, side, source_wallet, entry_price, cost_basis, opened_at, status)
-            VALUES(?, ?, ?, ?, ?, ?, 'OPEN')
+            INSERT INTO paper_position_slices(
+                coin, side, source_wallet, entry_price, cost_basis, leverage, opened_at, status
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, 'OPEN')
             """,
-            (coin, side, source_wallet, entry_price, cost_basis, utc_now()),
+            (coin, side, source_wallet, entry_price, cost_basis, leverage, utc_now()),
         )
         self.conn.commit()
 
@@ -1065,9 +1144,17 @@ class Store:
         self.conn.commit()
 
     def upsert_paper_position(
-        self, coin: str, side: str, entry_price: float, cost_basis: float, source_wallet: str
+        self,
+        coin: str,
+        side: str,
+        entry_price: float,
+        cost_basis: float,
+        source_wallet: str,
+        leverage: float,
     ) -> None:
-        self.insert_paper_position_slice(coin, side, entry_price, cost_basis, source_wallet)
+        self.insert_paper_position_slice(
+            coin, side, entry_price, cost_basis, source_wallet, leverage
+        )
         self.sync_paper_position(coin)
 
     def delete_paper_position(self, coin: str) -> None:
@@ -1135,16 +1222,17 @@ class Store:
         side: str | None,
         operation: str,
         result: ExecutionResult,
+        leverage: float | None = None,
     ) -> None:
         self.conn.execute(
             """
             INSERT INTO execution_audit(
-                ts, coin, side, operation, requested_size, filled_size,
+                ts, coin, side, operation, leverage, requested_size, filled_size,
                 avg_fill_price, order_id, exchange_status, confirmed, detail
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                utc_now(), coin, side, operation, result.requested_size,
+                utc_now(), coin, side, operation, leverage, result.requested_size,
                 result.filled_size, result.avg_fill_price, result.order_id,
                 result.status, 1 if result.confirmed else 0, result.detail,
             ),
@@ -1594,7 +1682,9 @@ class PlatformAdapter(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def open_position(self, coin: str, side: str, notional_usd: float, price: float) -> ExecutionResult:
+    def open_position(
+        self, coin: str, side: str, notional_usd: float, price: float, leverage: int
+    ) -> ExecutionResult:
         raise NotImplementedError
 
     @abstractmethod
@@ -1884,7 +1974,9 @@ class HyperliquidAdapter(PlatformAdapter):
             return None
         return result
 
-    def open_position(self, coin: str, side: str, notional_usd: float, price: float) -> ExecutionResult:
+    def open_position(
+        self, coin: str, side: str, notional_usd: float, price: float, leverage: int
+    ) -> ExecutionResult:
         if notional_usd < self.settings.min_order_notional or price <= 0:
             return ExecutionResult(False, status="rejected", detail="below minimum or invalid price")
 
@@ -1904,11 +1996,11 @@ class HyperliquidAdapter(PlatformAdapter):
         if not self.settings.live:
             print(f"[DRY] ENTRY {coin} {side} size={size} notional~${notional_usd:.2f}")
             result = ExecutionResult(True, size, size, price, status="paper", confirmed=True)
-            self.store.log_execution(coin, side, "OPEN", result)
+            self.store.log_execution(coin, side, "OPEN", result, leverage)
             return result
 
         try:
-            self._exchange.update_leverage(self.settings.leverage, coin, is_cross=True)  # type: ignore[union-attr]
+            self._exchange.update_leverage(leverage, coin, is_cross=True)  # type: ignore[union-attr]
             result = self._exchange.market_open(  # type: ignore[union-attr]
                 coin, side == "LONG", size, slippage=self.settings.slippage
             )
@@ -1930,13 +2022,13 @@ class HyperliquidAdapter(PlatformAdapter):
                     execution.order_id, execution.status, True, "live position confirmed",
                 )
                 self.store.clear_coin_quarantine(coin)
-            self.store.log_execution(coin, side, "OPEN", execution)
+            self.store.log_execution(coin, side, "OPEN", execution, leverage)
             return execution
         except Exception as exc:
             self.store.log_api_failure(self.name, "open_position", coin, str(exc))
             print(f"[LIVE] ENTRY failed {coin} {side}: {exc}")
             result = ExecutionResult(False, size, status="exception", detail=str(exc))
-            self.store.log_execution(coin, side, "OPEN", result)
+            self.store.log_execution(coin, side, "OPEN", result, leverage)
             return result
 
     def close_position(self, coin: str) -> ExecutionResult:
@@ -2109,7 +2201,8 @@ class PaperPortfolio:
                 pct = (price - entry) / entry
                 if pos["side"] == "SHORT":
                     pct = -pct
-                total += cost + cost * self.settings.leverage * pct
+                leverage = float(pos["leverage"]) if "leverage" in pos.keys() else float(self.settings.leverage)
+                total += cost + cost * leverage * pct
             else:
                 total += cost
         return round(total, 2)
@@ -2148,6 +2241,7 @@ class PaperPortfolio:
         price: float,
         cost_basis: float | None = None,
         allow_same_wallet_add: bool = False,
+        leverage: float | None = None,
     ) -> float | None:
         slot = cost_basis if cost_basis is not None else self.available_slot(coin, price, side=side)
         if slot is None:
@@ -2175,7 +2269,10 @@ class PaperPortfolio:
 
         acct["cash"] = round(float(acct["cash"]) - slot, 2)
         self.store.save_paper_account(acct)
-        self.store.upsert_paper_position(coin, side, price, round(slot, 2), wallet)
+        position_leverage = float(leverage if leverage is not None else self.settings.leverage)
+        self.store.upsert_paper_position(
+            coin, side, price, round(slot, 2), wallet, position_leverage
+        )
         return round(slot, 2)
 
     def close(self, wallet: str, coin: str, side: str, price: float | None) -> tuple[float | None, float | None, str]:
@@ -2191,7 +2288,8 @@ class PaperPortfolio:
             pnl_pct = (price - entry) / entry * 100
             if side == "SHORT":
                 pnl_pct = -pnl_pct
-            gain = round(cost * self.settings.leverage * (pnl_pct / 100), 2)
+            leverage = float(pos["leverage"]) if "leverage" in pos.keys() else float(self.settings.leverage)
+            gain = round(cost * leverage * (pnl_pct / 100), 2)
 
         acct = self.account()
         acct["cash"] = round(float(acct["cash"]) + cost + gain, 2)
@@ -2685,8 +2783,29 @@ class ScoringEngine:
             raw = 0.0
         return round(self._clamp(raw, 0.0, self.settings.scoring_engine_max_slot_multiplier), 4)
 
-    def allocation_note(self, score: ScoringEngineScore, multiplier: float) -> str:
-        return f"Scoring Engine {score.tier} x{multiplier:.2f}: {score.explanation}"
+    def leverage_for_score(self, score: ScoringEngineScore) -> int:
+        if score.tier == "Elite":
+            raw = self.settings.scoring_engine_elite_leverage
+        elif score.tier == "Core":
+            raw = self.settings.scoring_engine_core_leverage
+        elif score.tier == "Candidate":
+            if score.sample_size < 3:
+                raw = self.settings.scoring_engine_default_candidate_leverage
+            elif score.total_score >= 55.0 and score.realized_pnl > 0:
+                raw = self.settings.scoring_engine_proven_candidate_leverage
+            else:
+                raw = self.settings.scoring_engine_candidate_leverage
+        else:
+            raw = self.settings.scoring_engine_default_candidate_leverage
+        return max(1, min(int(raw), self.settings.max_leverage_cap))
+
+    def allocation_note(
+        self, score: ScoringEngineScore, multiplier: float, leverage: int
+    ) -> str:
+        return (
+            f"Scoring Engine {score.tier} x{multiplier:.2f} leverage={leverage}x: "
+            f"{score.explanation}"
+        )
 
     def observe_signal(
         self,
@@ -2987,6 +3106,7 @@ class Reconciler:
 
 class CopyTradingBot:
     def __init__(self, settings: Settings):
+        validate_settings(settings)
         self.settings = settings
         self.store = Store(settings.db_path)
         if settings.live:
@@ -3186,7 +3306,9 @@ class CopyTradingBot:
                 )
                 continue
             expected_size = sum(
-                float(row["cost_basis"]) * self.settings.leverage / float(row["entry_price"])
+                float(row["cost_basis"])
+                * float(row["leverage"])
+                / float(row["entry_price"])
                 for row in self.store.open_position_slices(coin)
                 if float(row["entry_price"]) > 0
             )
@@ -3243,7 +3365,10 @@ class CopyTradingBot:
             return
 
         multiplier = self.scoring_engine.allocation_multiplier(scoring_score)
-        allocation_reason = self.scoring_engine.allocation_note(scoring_score, multiplier)
+        tier_leverage = self.scoring_engine.leverage_for_score(scoring_score)
+        allocation_reason = self.scoring_engine.allocation_note(
+            scoring_score, multiplier, tier_leverage
+        )
         confirming = self.paper.position_side(event.coin, event.side) is not None
         cost = self.paper.available_slot(event.coin, price, multiplier, event.side)
         if cost is None:
@@ -3252,8 +3377,10 @@ class CopyTradingBot:
             print(f"[SKIP] {event.kind} {event.coin}: paper rejected")
             return
 
-        notional = cost * self.settings.leverage
-        execution = self.platform.open_position(event.coin, event.side, notional, price)
+        notional = cost * tier_leverage
+        execution = self.platform.open_position(
+            event.coin, event.side, notional, price, tier_leverage
+        )
         if not execution:
             signal_id = self.store.log_signal(event.wallet, event.coin, event.side, event.kind, price, "SKIPPED", "live open failed")
             self.scoring_engine.observe_signal(event, signal_id, "SKIPPED", "live open failed", price)
@@ -3263,7 +3390,7 @@ class CopyTradingBot:
         actual_price = execution.avg_fill_price or price
         actual_cost = cost
         if self.settings.live and execution.filled_size > 0 and actual_price > 0:
-            actual_cost = execution.filled_size * actual_price / self.settings.leverage
+            actual_cost = execution.filled_size * actual_price / tier_leverage
         opened_cost = self.paper.open(
             event.wallet,
             event.coin,
@@ -3271,6 +3398,7 @@ class CopyTradingBot:
             actual_price,
             actual_cost,
             allow_same_wallet_add=is_add,
+            leverage=tier_leverage,
         )
         if opened_cost is None:
             signal_id = self.store.log_signal(event.wallet, event.coin, event.side, event.kind, price, "SKIPPED", "paper commit failed")

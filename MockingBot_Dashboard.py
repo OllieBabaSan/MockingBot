@@ -195,7 +195,7 @@ def open_allocations(
 ) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
-        SELECT id, coin, side, source_wallet, entry_price, cost_basis, opened_at
+        SELECT id, coin, side, source_wallet, entry_price, cost_basis, leverage, opened_at
         FROM paper_position_slices
         WHERE status = 'OPEN'
         ORDER BY coin, side, opened_at, id
@@ -207,13 +207,14 @@ def open_allocations(
         side = str(row["side"])
         entry = float(row["entry_price"])
         cost = float(row["cost_basis"])
+        leverage = float(row["leverage"])
         last = prices.get(coin)
         pnl_pct = None
         pnl_usd = None
         if last and entry:
             direction = 1.0 if side == "LONG" else -1.0
             pnl_pct = ((last - entry) / entry) * direction * 100.0
-            pnl_usd = cost * LEVERAGE * (pnl_pct / 100.0)
+            pnl_usd = cost * leverage * (pnl_pct / 100.0)
         allocations.append(
             {
                 "id": int(row["id"]),
@@ -225,6 +226,7 @@ def open_allocations(
                 "entry_price": entry,
                 "last_price": last,
                 "cost_basis": cost,
+                "leverage": leverage,
                 "opened_at": row["opened_at"],
                 "pnl_pct": pnl_pct,
                 "pnl_usd": pnl_usd,
@@ -244,6 +246,7 @@ def aggregate_positions(allocations: list[dict[str, Any]]) -> list[dict[str, Any
                 "side": alloc["side"],
                 "cost_basis": 0.0,
                 "weighted_entry_sum": 0.0,
+                "weighted_leverage_sum": 0.0,
                 "weighted_pnl_pct_sum": 0.0,
                 "pnl_usd": 0.0,
                 "pnl_known": True,
@@ -256,6 +259,7 @@ def aggregate_positions(allocations: list[dict[str, Any]]) -> list[dict[str, Any
         cost = float(alloc["cost_basis"])
         group["cost_basis"] += cost
         group["weighted_entry_sum"] += float(alloc["entry_price"]) * cost
+        group["weighted_leverage_sum"] += float(alloc["leverage"]) * cost
         if alloc["pnl_pct"] is not None:
             group["weighted_pnl_pct_sum"] += float(alloc["pnl_pct"]) * cost
         group["allocation_count"] += 1
@@ -282,6 +286,7 @@ def aggregate_positions(allocations: list[dict[str, Any]]) -> list[dict[str, Any
                 "side": group["side"],
                 "cost_basis": group["cost_basis"],
                 "entry_price": avg_entry,
+                "leverage": group["weighted_leverage_sum"] / group["cost_basis"] if group["cost_basis"] else 0.0,
                 "last_price": group["last_price"],
                 "pnl_usd": pnl_usd,
                 "pnl_pct": pnl_pct,
@@ -357,6 +362,7 @@ def dashboard_data() -> dict[str, Any]:
                 slices.coin,
                 slices.side,
                 slices.cost_basis,
+                slices.leverage,
                 slices.paper_gain,
                 slices.pnl_pct,
                 COALESCE(scores.tier, 'Unscored') AS wallet_tier,
@@ -410,7 +416,7 @@ def dashboard_data() -> dict[str, Any]:
         recent_executions = recent_rows(
             conn,
             """
-            SELECT ts, coin, side, operation, requested_size, filled_size,
+            SELECT ts, coin, side, operation, leverage, requested_size, filled_size,
                    avg_fill_price, order_id, exchange_status, confirmed, detail
             FROM execution_audit
             ORDER BY id DESC
@@ -702,10 +708,10 @@ HTML = r"""<!doctype html>
           </tr>`), "No quarantined coins.");
       }
 
-      table(document.getElementById("positions"), ["Coin", "Side", "Alloc", "Cost", "Entry", "Last", "Open PnL", "Wallets", "Status"],
+      table(document.getElementById("positions"), ["Coin", "Side", "Alloc", "Lev", "Cost", "Entry", "Last", "Open PnL", "Wallets", "Status"],
         data.positions.map(p => `<tr>
           <td><strong>${esc(p.coin)}</strong></td><td><span class="pill">${esc(p.side)}</span></td>
-          <td>${p.allocation_count}</td><td>${fmtMoney(p.cost_basis)}</td>
+          <td>${p.allocation_count}</td><td>${Number(p.leverage).toFixed(1)}x</td><td>${fmtMoney(p.cost_basis)}</td>
           <td>${Number(p.entry_price).toLocaleString(undefined, {maximumFractionDigits: 6})}</td>
           <td>${p.last_price ? Number(p.last_price).toLocaleString(undefined, {maximumFractionDigits: 6}) : "n/a"}</td>
           <td class="${clsNum(p.pnl_usd)}">${fmtMoney(p.pnl_usd)} <span class="muted">${fmtPct(p.pnl_pct)}</span></td>
@@ -713,20 +719,21 @@ HTML = r"""<!doctype html>
           <td class="muted">${listCell(p.wallet_statuses)}</td>
         </tr>`), "No open positions.");
 
-      table(document.getElementById("closes"), ["Time", "Coin", "Side", "Wallet", "Status", "Cost", "Result"],
+      table(document.getElementById("closes"), ["Time", "Coin", "Side", "Wallet", "Status", "Lev", "Cost", "Result"],
         data.recent_closes.map(s => `<tr>
           <td class="muted">${esc((s.ts || "").replace("T", " ").slice(5, 19))}</td>
           <td><strong>${esc(s.coin)}</strong></td><td>${esc(s.side)}</td>
           <td class="muted">${esc(shortWallet(s.wallet))}</td>
           <td class="muted">${esc(s.wallet_tier === "Unscored" ? "Unscored" : `${s.wallet_tier} ${Number(s.wallet_score).toFixed(1)}`)}</td>
+          <td>${Number(s.leverage).toFixed(1)}x</td>
           <td>${fmtMoney(s.cost_basis)}</td>
           <td class="${clsNum(s.paper_gain)}">${fmtMoney(s.paper_gain)} <span class="muted">${fmtPct(s.pnl_pct)}</span></td>
         </tr>`), "No executed closes yet.");
 
-      table(document.getElementById("executions"), ["Time", "Coin", "Op", "Requested", "Filled", "Avg Fill", "Order", "Confirmed", "Detail"],
+      table(document.getElementById("executions"), ["Time", "Coin", "Op", "Lev", "Requested", "Filled", "Avg Fill", "Order", "Confirmed", "Detail"],
         (data.recent_executions || []).map(x => `<tr>
           <td class="muted">${esc((x.ts || "").slice(5, 19))}</td><td><strong>${esc(x.coin)}</strong></td>
-          <td>${esc(x.operation)}</td><td>${Number(x.requested_size || 0).toLocaleString()}</td>
+          <td>${esc(x.operation)}</td><td>${x.leverage ? `${Number(x.leverage).toFixed(1)}x` : "n/a"}</td><td>${Number(x.requested_size || 0).toLocaleString()}</td>
           <td>${Number(x.filled_size || 0).toLocaleString()}</td>
           <td>${x.avg_fill_price ? Number(x.avg_fill_price).toLocaleString(undefined, {maximumFractionDigits: 6}) : "n/a"}</td>
           <td class="muted">${esc(x.order_id || "")}</td>
