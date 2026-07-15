@@ -46,6 +46,26 @@ class ExecutionReconciliationTests(unittest.TestCase):
         self.assertEqual(risk.allow_entry("w", "ETH", "LONG", paper, False, set()).action, "SKIP")
         self.assertEqual(risk.allow_entry("w", "SOL", "LONG", paper, False, set()).action, "EXECUTE")
 
+    def test_same_coin_add_inherits_leverage_without_exchange_reset(self) -> None:
+        paper = core.PaperPortfolio(self.settings, self.store)
+        paper.open("wallet-a", "BTC", "LONG", 100.0, 10.0, leverage=3)
+        exchange = FakeExchange([fill_response()])
+        self.adapter._exchange = exchange
+        self.adapter._confirmed_position = lambda _coin: (
+            True,
+            core.Position("BTC", "LONG", 0.42, 100.0),
+        )
+
+        result = self.adapter.open_position("BTC", "LONG", 12.0, 100.0, 3, 5)
+
+        self.assertTrue(result)
+        self.assertEqual(result.filled_size, 0.12)
+        self.assertEqual(exchange.leverages, [])
+        audit = self.store.conn.execute(
+            "SELECT requested_leverage, leverage FROM execution_audit ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual((audit["requested_leverage"], audit["leverage"]), (5.0, 3.0))
+
     def test_residual_close_retries_once_and_confirms_flat(self) -> None:
         exchange = FakeExchange(
             [fill_response("0.10", "99", 8), fill_response("0.01", "98", 9)]

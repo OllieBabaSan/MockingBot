@@ -314,15 +314,27 @@ class EliteBot:
             print(f"[ELITE-SKIP] ENTRY {event.coin} {event.side}: paper rejected")
             return
 
-        notional = cost * self.settings.leverage
+        try:
+            existing_leverage = self.store.position_leverage(event.coin)
+        except RuntimeError as exc:
+            self.store.quarantine_coin(event.coin, "mixed local leverage", str(exc))
+            self.store.log_signal(
+                event.wallet, event.coin, event.side, "ENTRY", price, "SKIPPED", str(exc)
+            )
+            print(f"[ELITE-SKIP] ENTRY {event.coin} {event.side}: {exc}")
+            return
+        effective_leverage = int(existing_leverage) if existing_leverage is not None else self.settings.leverage
+        notional = cost * effective_leverage
         if not self.platform.open_position(
-            event.coin, event.side, notional, price, self.settings.leverage
+            event.coin, event.side, notional, price, effective_leverage, self.settings.leverage
         ):
             self.store.log_signal(event.wallet, event.coin, event.side, "ENTRY", price, "SKIPPED", "open failed")
             print(f"[ELITE-SKIP] ENTRY {event.coin} {event.side}: open failed")
             return
 
-        opened_cost = self.paper.open(event.wallet, event.coin, event.side, price, cost)
+        opened_cost = self.paper.open(
+            event.wallet, event.coin, event.side, price, cost, leverage=effective_leverage
+        )
         if opened_cost is None:
             self.store.log_signal(event.wallet, event.coin, event.side, "ENTRY", price, "SKIPPED", "paper commit failed")
             print(f"[ELITE-WARN] ENTRY {event.coin} {event.side}: paper commit failed")

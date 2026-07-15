@@ -78,3 +78,6 @@ Tier leverage can be adjusted later with
 `SCORING_ENGINE_PROVEN_CANDIDATE_LEVERAGE`,
 `SCORING_ENGINE_CORE_LEVERAGE`, and `SCORING_ENGINE_ELITE_LEVERAGE`.
 Invalid values fail startup before the bot connects or submits an order.
+Hyperliquid applies leverage per coin position: additions to an already-open
+coin inherit its effective leverage. The requested tier leverage and effective
+position leverage are both retained in the execution audit.

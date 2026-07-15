@@ -70,6 +70,21 @@ class LeveragePolicyTests(unittest.TestCase):
             finally:
                 store.conn.close()
 
+    def test_same_coin_slices_share_first_position_leverage(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            configured = settings(Path(td))
+            store = core.Store(configured.db_path)
+            try:
+                portfolio = core.PaperPortfolio(configured, store)
+                portfolio.open("wallet-a", "BTC", "LONG", 100, 100, leverage=3)
+                portfolio.open("wallet-b", "BTC", "LONG", 100, 100, leverage=5)
+                self.assertEqual(
+                    {float(row["leverage"]) for row in store.open_position_slices("BTC")},
+                    {3.0},
+                )
+            finally:
+                store.conn.close()
+
     def test_legacy_position_table_gets_three_x_default(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "legacy.db"

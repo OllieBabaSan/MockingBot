@@ -833,6 +833,7 @@ class Store:
                 coin TEXT NOT NULL,
                 side TEXT,
                 operation TEXT NOT NULL,
+                requested_leverage REAL,
                 leverage REAL,
                 requested_size REAL,
                 filled_size REAL,
@@ -855,6 +856,7 @@ class Store:
         self.conn.commit()
         self._ensure_column("paper_position_slices", "leverage", "REAL NOT NULL DEFAULT 3")
         self._ensure_column("execution_audit", "leverage", "REAL")
+        self._ensure_column("execution_audit", "requested_leverage", "REAL")
         self._migrate_legacy_paper_positions()
 
     def _ensure_column(self, table: str, column: str, declaration: str) -> None:
@@ -1128,6 +1130,17 @@ class Store:
             (coin,),
         ).fetchall()
 
+    def position_leverage(self, coin: str) -> float | None:
+        leverages = {
+            round(float(row["leverage"]), 8)
+            for row in self.open_position_slices(coin)
+        }
+        if not leverages:
+            return None
+        if len(leverages) != 1:
+            raise RuntimeError(f"mixed local leverage recorded for {coin}: {sorted(leverages)}")
+        return next(iter(leverages))
+
     def paper_position_slice(self, wallet: str, coin: str, side: str) -> sqlite3.Row | None:
         return self.conn.execute(
             """
@@ -1314,16 +1327,17 @@ class Store:
         operation: str,
         result: ExecutionResult,
         leverage: float | None = None,
+        requested_leverage: float | None = None,
     ) -> None:
         self.conn.execute(
             """
             INSERT INTO execution_audit(
-                ts, coin, side, operation, leverage, requested_size, filled_size,
+                ts, coin, side, operation, requested_leverage, leverage, requested_size, filled_size,
                 avg_fill_price, order_id, exchange_status, confirmed, detail
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                utc_now(), coin, side, operation, leverage, result.requested_size,
+                utc_now(), coin, side, operation, requested_leverage, leverage, result.requested_size,
                 result.filled_size, result.avg_fill_price, result.order_id,
                 result.status, 1 if result.confirmed else 0, result.detail,
             ),
@@ -1774,7 +1788,8 @@ class PlatformAdapter(ABC):
 
     @abstractmethod
     def open_position(
-        self, coin: str, side: str, notional_usd: float, price: float, leverage: int
+        self, coin: str, side: str, notional_usd: float, price: float,
+        leverage: int, requested_leverage: int | None = None,
     ) -> ExecutionResult:
         raise NotImplementedError
 
@@ -2066,8 +2081,23 @@ class HyperliquidAdapter(PlatformAdapter):
         return result
 
     def open_position(
-        self, coin: str, side: str, notional_usd: float, price: float, leverage: int
+        self, coin: str, side: str, notional_usd: float, price: float,
+        leverage: int, requested_leverage: int | None = None,
     ) -> ExecutionResult:
+        requested_leverage = requested_leverage or leverage
+        try:
+            existing_leverage = self.store.position_leverage(coin)
+        except RuntimeError as exc:
+            result = ExecutionResult(False, status="leverage_mismatch", detail=str(exc))
+            self.store.quarantine_coin(coin, "mixed local leverage", str(exc))
+            self.store.log_execution(coin, side, "OPEN", result, leverage, requested_leverage)
+            return result
+        if existing_leverage is not None and abs(existing_leverage - leverage) > 1e-8:
+            detail = f"existing={existing_leverage:g}x effective={leverage:g}x"
+            result = ExecutionResult(False, status="leverage_mismatch", detail=detail)
+            self.store.quarantine_coin(coin, "position leverage mismatch", detail)
+            self.store.log_execution(coin, side, "OPEN", result, leverage, requested_leverage)
+            return result
         if notional_usd < self.settings.min_order_notional or price <= 0:
             return ExecutionResult(False, status="rejected", detail="below minimum or invalid price")
 
@@ -2087,11 +2117,12 @@ class HyperliquidAdapter(PlatformAdapter):
         if not self.settings.live:
             print(f"[DRY] ENTRY {coin} {side} size={size} notional~${notional_usd:.2f}")
             result = ExecutionResult(True, size, size, price, status="paper", confirmed=True)
-            self.store.log_execution(coin, side, "OPEN", result, leverage)
+            self.store.log_execution(coin, side, "OPEN", result, leverage, requested_leverage)
             return result
 
         try:
-            self._exchange.update_leverage(leverage, coin, is_cross=True)  # type: ignore[union-attr]
+            if existing_leverage is None:
+                self._exchange.update_leverage(leverage, coin, is_cross=True)  # type: ignore[union-attr]
             result = self._exchange.market_open(  # type: ignore[union-attr]
                 coin, side == "LONG", size, slippage=self.settings.slippage
             )
@@ -2108,18 +2139,32 @@ class HyperliquidAdapter(PlatformAdapter):
                 )
                 self.store.quarantine_coin(coin, "entry confirmation mismatch", detail)
             else:
+                confirmed_fill_size = confirmed.size
+                confirmed_fill_price = confirmed.entry_price
+                if existing_leverage is not None:
+                    confirmed_fill_size = execution.filled_size
+                    confirmed_fill_price = execution.avg_fill_price or price
+                    if confirmed_fill_size <= 0:
+                        local_size = sum(
+                            float(row["cost_basis"])
+                            * float(row["leverage"])
+                            / float(row["entry_price"])
+                            for row in self.store.open_position_slices(coin)
+                            if float(row["entry_price"]) > 0
+                        )
+                        confirmed_fill_size = max(0.0, confirmed.size - local_size)
                 execution = ExecutionResult(
-                    True, size, confirmed.size, confirmed.entry_price,
+                    True, size, confirmed_fill_size, confirmed_fill_price,
                     execution.order_id, execution.status, True, "live position confirmed",
                 )
                 self.store.clear_coin_quarantine(coin)
-            self.store.log_execution(coin, side, "OPEN", execution, leverage)
+            self.store.log_execution(coin, side, "OPEN", execution, leverage, requested_leverage)
             return execution
         except Exception as exc:
             self.store.log_api_failure(self.name, "open_position", coin, str(exc))
             print(f"[LIVE] ENTRY failed {coin} {side}: {exc}")
             result = ExecutionResult(False, size, status="exception", detail=str(exc))
-            self.store.log_execution(coin, side, "OPEN", result, leverage)
+            self.store.log_execution(coin, side, "OPEN", result, leverage, requested_leverage)
             return result
 
     def close_position(self, coin: str) -> ExecutionResult:
@@ -2360,7 +2405,15 @@ class PaperPortfolio:
 
         acct["cash"] = round(float(acct["cash"]) - slot, 2)
         self.store.save_paper_account(acct)
-        position_leverage = float(leverage if leverage is not None else self.settings.leverage)
+        requested_position_leverage = float(
+            leverage if leverage is not None else self.settings.leverage
+        )
+        existing_position_leverage = self.store.position_leverage(coin)
+        position_leverage = (
+            existing_position_leverage
+            if existing_position_leverage is not None
+            else requested_position_leverage
+        )
         self.store.upsert_paper_position(
             coin, side, price, round(slot, 2), wallet, position_leverage
         )
@@ -3457,9 +3510,24 @@ class CopyTradingBot:
 
         multiplier = self.scoring_engine.allocation_multiplier(scoring_score)
         tier_leverage = self.scoring_engine.leverage_for_score(scoring_score)
+        try:
+            existing_leverage = self.store.position_leverage(event.coin)
+        except RuntimeError as exc:
+            self.store.quarantine_coin(event.coin, "mixed local leverage", str(exc))
+            signal_id = self.store.log_signal(
+                event.wallet, event.coin, event.side, event.kind, price, "SKIPPED", str(exc)
+            )
+            self.scoring_engine.observe_signal(event, signal_id, "SKIPPED", str(exc), price)
+            print(f"[SKIP] {event.kind} {event.coin}: {exc}")
+            return
+        effective_leverage = int(existing_leverage) if existing_leverage is not None else tier_leverage
         allocation_reason = self.scoring_engine.allocation_note(
-            scoring_score, multiplier, tier_leverage
+            scoring_score, multiplier, effective_leverage
         )
+        if effective_leverage != tier_leverage:
+            allocation_reason += (
+                f"; requested={tier_leverage}x inherited={effective_leverage}x"
+            )
         confirming = self.paper.position_side(event.coin, event.side) is not None
         cost = self.paper.available_slot(event.coin, price, multiplier, event.side)
         if cost is None:
@@ -3468,9 +3536,9 @@ class CopyTradingBot:
             print(f"[SKIP] {event.kind} {event.coin}: paper rejected")
             return
 
-        notional = cost * tier_leverage
+        notional = cost * effective_leverage
         execution = self.platform.open_position(
-            event.coin, event.side, notional, price, tier_leverage
+            event.coin, event.side, notional, price, effective_leverage, tier_leverage
         )
         if not execution:
             signal_id = self.store.log_signal(event.wallet, event.coin, event.side, event.kind, price, "SKIPPED", "live open failed")
@@ -3481,7 +3549,7 @@ class CopyTradingBot:
         actual_price = execution.avg_fill_price or price
         actual_cost = cost
         if self.settings.live and execution.filled_size > 0 and actual_price > 0:
-            actual_cost = execution.filled_size * actual_price / tier_leverage
+            actual_cost = execution.filled_size * actual_price / effective_leverage
         opened_cost = self.paper.open(
             event.wallet,
             event.coin,
@@ -3489,7 +3557,7 @@ class CopyTradingBot:
             actual_price,
             actual_cost,
             allow_same_wallet_add=is_add,
-            leverage=tier_leverage,
+            leverage=effective_leverage,
         )
         if opened_cost is None:
             signal_id = self.store.log_signal(event.wallet, event.coin, event.side, event.kind, price, "SKIPPED", "paper commit failed")

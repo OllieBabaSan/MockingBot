@@ -416,7 +416,7 @@ def dashboard_data() -> dict[str, Any]:
         recent_executions = recent_rows(
             conn,
             """
-            SELECT ts, coin, side, operation, leverage, requested_size, filled_size,
+            SELECT ts, coin, side, operation, requested_leverage, leverage, requested_size, filled_size,
                    avg_fill_price, order_id, exchange_status, confirmed, detail
             FROM execution_audit
             ORDER BY id DESC
@@ -730,10 +730,12 @@ HTML = r"""<!doctype html>
           <td class="${clsNum(s.paper_gain)}">${fmtMoney(s.paper_gain)} <span class="muted">${fmtPct(s.pnl_pct)}</span></td>
         </tr>`), "No executed closes yet.");
 
-      table(document.getElementById("executions"), ["Time", "Coin", "Op", "Lev", "Requested", "Filled", "Avg Fill", "Order", "Confirmed", "Detail"],
+      table(document.getElementById("executions"), ["Time", "Coin", "Op", "Req Lev", "Effective", "Requested", "Filled", "Avg Fill", "Order", "Confirmed", "Detail"],
         (data.recent_executions || []).map(x => `<tr>
           <td class="muted">${esc((x.ts || "").slice(5, 19))}</td><td><strong>${esc(x.coin)}</strong></td>
-          <td>${esc(x.operation)}</td><td>${x.leverage ? `${Number(x.leverage).toFixed(1)}x` : "n/a"}</td><td>${Number(x.requested_size || 0).toLocaleString()}</td>
+          <td>${esc(x.operation)}</td>
+          <td>${x.requested_leverage ? `${Number(x.requested_leverage).toFixed(1)}x` : "n/a"}</td>
+          <td>${x.leverage ? `${Number(x.leverage).toFixed(1)}x` : "n/a"}</td><td>${Number(x.requested_size || 0).toLocaleString()}</td>
           <td>${Number(x.filled_size || 0).toLocaleString()}</td>
           <td>${x.avg_fill_price ? Number(x.avg_fill_price).toLocaleString(undefined, {maximumFractionDigits: 6}) : "n/a"}</td>
           <td class="muted">${esc(x.order_id || "")}</td>
