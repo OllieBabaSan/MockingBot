@@ -1810,6 +1810,7 @@ class HyperliquidAdapter(PlatformAdapter):
         self._exchange = None
         self._info = None
         self._sz_decimals: dict[str, int] = {}
+        self._max_leverage: dict[str, int] = {}
 
     def _post_info(self, payload: dict[str, Any], operation: str, subject: str = "") -> Any | None:
         def call() -> Any:
@@ -2024,7 +2025,9 @@ class HyperliquidAdapter(PlatformAdapter):
         self._info = Info("https://api.hyperliquid.xyz", skip_ws=True)
         meta = self._info.meta()
         for asset in meta.get("universe", []):
-            self._sz_decimals[asset["name"]] = int(asset.get("szDecimals", 4))
+            name = str(asset["name"])
+            self._sz_decimals[name] = int(asset.get("szDecimals", 4))
+            self._max_leverage[name] = int(asset.get("maxLeverage", 1))
         self._exchange = Exchange(
             account,
             "https://api.hyperliquid.xyz",
@@ -2085,6 +2088,16 @@ class HyperliquidAdapter(PlatformAdapter):
         leverage: int, requested_leverage: int | None = None,
     ) -> ExecutionResult:
         requested_leverage = requested_leverage or leverage
+
+        def reject(detail: str, requested_size: float = 0.0, status: str = "rejected") -> ExecutionResult:
+            result = ExecutionResult(
+                False, requested_size=requested_size, status=status, detail=detail
+            )
+            self.store.log_execution(
+                coin, side, "OPEN", result, leverage, requested_leverage
+            )
+            return result
+
         try:
             existing_leverage = self.store.position_leverage(coin)
         except RuntimeError as exc:
@@ -2099,7 +2112,10 @@ class HyperliquidAdapter(PlatformAdapter):
             self.store.log_execution(coin, side, "OPEN", result, leverage, requested_leverage)
             return result
         if notional_usd < self.settings.min_order_notional or price <= 0:
-            return ExecutionResult(False, status="rejected", detail="below minimum or invalid price")
+            return reject(
+                f"requested notional ${notional_usd:.4f} is below "
+                f"${self.settings.min_order_notional:.2f} minimum or price is invalid"
+            )
 
         if self.settings.live:
             try:
@@ -2107,12 +2123,28 @@ class HyperliquidAdapter(PlatformAdapter):
             except Exception as exc:
                 self.store.log_api_failure(self.name, "init_sdk", coin, str(exc))
                 print(f"[LIVE] ENTRY failed {coin} {side}: {exc}")
-                return ExecutionResult(False, status="init_failed", detail=str(exc))
+                return reject(str(exc), status="init_failed")
+
+            if coin not in self._sz_decimals or coin not in self._max_leverage:
+                return reject(f"{coin} is absent from Hyperliquid asset metadata")
+            asset_max_leverage = self._max_leverage[coin]
+            if leverage > asset_max_leverage:
+                return reject(
+                    f"effective leverage {leverage}x exceeds {coin} maximum "
+                    f"{asset_max_leverage}x"
+                )
 
         decimals = self._sz_decimals.get(coin, 4)
         size = round(notional_usd / price, decimals)
         if size <= 0:
-            return ExecutionResult(False, status="rejected", detail="rounded size is zero")
+            return reject("rounded order size is zero")
+        rounded_notional = size * price
+        if rounded_notional < self.settings.min_order_notional:
+            return reject(
+                f"rounded notional ${rounded_notional:.4f} is below "
+                f"${self.settings.min_order_notional:.2f} minimum",
+                requested_size=size,
+            )
 
         if not self.settings.live:
             print(f"[DRY] ENTRY {coin} {side} size={size} notional~${notional_usd:.2f}")
@@ -3541,9 +3573,10 @@ class CopyTradingBot:
             event.coin, event.side, notional, price, effective_leverage, tier_leverage
         )
         if not execution:
-            signal_id = self.store.log_signal(event.wallet, event.coin, event.side, event.kind, price, "SKIPPED", "live open failed")
-            self.scoring_engine.observe_signal(event, signal_id, "SKIPPED", "live open failed", price)
-            print(f"[SKIP] {event.kind} {event.coin} {event.side}: live open failed")
+            failure_reason = execution.detail or execution.status or "live open failed"
+            signal_id = self.store.log_signal(event.wallet, event.coin, event.side, event.kind, price, "SKIPPED", failure_reason)
+            self.scoring_engine.observe_signal(event, signal_id, "SKIPPED", failure_reason, price)
+            print(f"[SKIP] {event.kind} {event.coin} {event.side}: {failure_reason}")
             return
 
         actual_price = execution.avg_fill_price or price

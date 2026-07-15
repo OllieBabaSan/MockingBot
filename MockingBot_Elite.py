@@ -325,11 +325,13 @@ class EliteBot:
             return
         effective_leverage = int(existing_leverage) if existing_leverage is not None else self.settings.leverage
         notional = cost * effective_leverage
-        if not self.platform.open_position(
+        execution = self.platform.open_position(
             event.coin, event.side, notional, price, effective_leverage, self.settings.leverage
-        ):
-            self.store.log_signal(event.wallet, event.coin, event.side, "ENTRY", price, "SKIPPED", "open failed")
-            print(f"[ELITE-SKIP] ENTRY {event.coin} {event.side}: open failed")
+        )
+        if not execution:
+            failure_reason = execution.detail or execution.status or "open failed"
+            self.store.log_signal(event.wallet, event.coin, event.side, "ENTRY", price, "SKIPPED", failure_reason)
+            print(f"[ELITE-SKIP] ENTRY {event.coin} {event.side}: {failure_reason}")
             return
 
         opened_cost = self.paper.open(

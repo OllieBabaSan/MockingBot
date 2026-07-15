@@ -16,6 +16,8 @@ class ExecutionReconciliationTests(unittest.TestCase):
         self.store = core.Store(self.settings.db_path)
         self.adapter = core.HyperliquidAdapter(self.settings, self.store)
         self.adapter._sz_decimals["BTC"] = 3
+        self.adapter._sz_decimals["ETH"] = 3
+        self.adapter._max_leverage.update({"BTC": 50, "ETH": 50})
 
     def tearDown(self) -> None:
         self.store.conn.close()
@@ -65,6 +67,34 @@ class ExecutionReconciliationTests(unittest.TestCase):
             "SELECT requested_leverage, leverage FROM execution_audit ORDER BY id DESC LIMIT 1"
         ).fetchone()
         self.assertEqual((audit["requested_leverage"], audit["leverage"]), (5.0, 3.0))
+
+    def test_preflight_rejects_asset_leverage_above_exchange_maximum(self) -> None:
+        exchange = FakeExchange([])
+        self.adapter._exchange = exchange
+        self.adapter._max_leverage["BTC"] = 2
+
+        result = self.adapter.open_position("BTC", "LONG", 12.0, 100.0, 3)
+
+        self.assertFalse(result)
+        self.assertIn("exceeds BTC maximum 2x", result.detail)
+        self.assertEqual(exchange.opens, 0)
+        self.assertIsNone(self.store.coin_quarantine("BTC"))
+
+    def test_preflight_checks_notional_after_size_rounding(self) -> None:
+        exchange = FakeExchange([])
+        self.adapter._exchange = exchange
+        self.adapter._sz_decimals["BTC"] = 1
+
+        result = self.adapter.open_position("BTC", "LONG", 11.001, 100.0, 3)
+
+        self.assertFalse(result)
+        self.assertIn("rounded notional $10.0000", result.detail)
+        self.assertEqual(exchange.opens, 0)
+        audit = self.store.conn.execute(
+            "SELECT exchange_status, detail FROM execution_audit ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(audit["exchange_status"], "rejected")
+        self.assertIn("rounded notional", audit["detail"])
 
     def test_residual_close_retries_once_and_confirms_flat(self) -> None:
         exchange = FakeExchange(

@@ -81,3 +81,6 @@ Invalid values fail startup before the bot connects or submits an order.
 Hyperliquid applies leverage per coin position: additions to an already-open
 coin inherit its effective leverage. The requested tier leverage and effective
 position leverage are both retained in the execution audit.
+Before submission, live orders are checked against Hyperliquid's per-asset
+maximum leverage and size precision. Notional is checked again after size
+rounding; predictable rejections are audited without quarantining the coin.
