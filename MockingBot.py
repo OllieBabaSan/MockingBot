@@ -558,6 +558,7 @@ class CopyEvent:
     entry_price: float | None = None
     previous_size: float | None = None
     current_size: float | None = None
+    event_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -730,6 +731,23 @@ class Store:
                 paper_gain REAL,
                 pnl_pct REAL
             );
+
+            CREATE TABLE IF NOT EXISTS pending_copy_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                detected_at TEXT NOT NULL,
+                wallet TEXT NOT NULL,
+                coin TEXT NOT NULL,
+                side TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                entry_price REAL,
+                previous_size REAL,
+                current_size REAL,
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                handled_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pending_copy_events_status
+            ON pending_copy_events(status, id);
 
             CREATE TABLE IF NOT EXISTS api_failures (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1101,6 +1119,87 @@ class Store:
         seeded = set(self.get_json("seeded_wallets", []))
         seeded.add(wallet)
         self.set_json("seeded_wallets", sorted(seeded))
+
+    def record_wallet_observation(
+        self,
+        wallet: str,
+        positions: dict[str, Position],
+        events: list[CopyEvent],
+    ) -> None:
+        seeded = set(self.get_json("seeded_wallets", []))
+        seeded.add(wallet)
+        with self.conn:
+            self.conn.executemany(
+                """
+                INSERT INTO pending_copy_events(
+                    detected_at, wallet, coin, side, kind, entry_price,
+                    previous_size, current_size, status
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+                """,
+                [
+                    (
+                        utc_now(),
+                        event.wallet,
+                        event.coin,
+                        event.side,
+                        event.kind,
+                        event.entry_price,
+                        event.previous_size,
+                        event.current_size,
+                    )
+                    for event in events
+                ],
+            )
+            self.conn.execute("DELETE FROM wallet_positions WHERE wallet = ?", (wallet,))
+            self.conn.executemany(
+                """
+                INSERT INTO wallet_positions(wallet, coin, side, size, entry_price, seen_at)
+                VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (wallet, p.coin, p.side, p.size, p.entry_price, utc_now())
+                    for p in positions.values()
+                ],
+            )
+            self.conn.execute(
+                "INSERT INTO kv(key, value) VALUES('seeded_wallets', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (json.dumps(sorted(seeded)),),
+            )
+
+    def pending_copy_events(self) -> list[CopyEvent]:
+        rows = self.conn.execute(
+            """
+            SELECT id, wallet, coin, side, kind, entry_price, previous_size, current_size
+            FROM pending_copy_events
+            WHERE status = 'PENDING'
+            ORDER BY id
+            """
+        ).fetchall()
+        return [
+            CopyEvent(
+                kind=str(row["kind"]),
+                wallet=str(row["wallet"]),
+                coin=str(row["coin"]),
+                side=str(row["side"]),
+                entry_price=None if row["entry_price"] is None else float(row["entry_price"]),
+                previous_size=None if row["previous_size"] is None else float(row["previous_size"]),
+                current_size=None if row["current_size"] is None else float(row["current_size"]),
+                event_id=int(row["id"]),
+            )
+            for row in rows
+        ]
+
+    def acknowledge_copy_event(self, event_id: int) -> None:
+        self.conn.execute(
+            """
+            UPDATE pending_copy_events
+            SET status = 'HANDLED', handled_at = ?
+            WHERE id = ? AND status = 'PENDING'
+            """,
+            (utc_now(), event_id),
+        )
+        self.conn.commit()
 
     def paper_account(self, starting_cash: float) -> dict[str, Any]:
         acct = self.get_json("paper_account", None)
@@ -3485,7 +3584,6 @@ class WalletMonitor:
         self.platform = platform
 
     def scan(self, wallets: list[str]) -> tuple[list[CopyEvent], float]:
-        events: list[CopyEvent] = []
         failures = 0
         checked = 0
 
@@ -3499,22 +3597,38 @@ class WalletMonitor:
 
             previous = self.store.wallet_snapshot(wallet)
             if previous is None:
-                self.store.save_wallet_snapshot(wallet, current)
+                self.store.record_wallet_observation(wallet, current, [])
                 print(f"[MONITOR] Seeded {wallet[:16]} baseline")
                 time.sleep(self.settings.wallet_poll_delay)
                 continue
 
+            wallet_events: list[CopyEvent] = []
             for coin, pos in current.items():
                 old = previous.get(coin)
                 if old is None:
-                    events.append(CopyEvent("ENTRY", wallet, coin, pos.side, pos.entry_price))
+                    wallet_events.append(
+                        CopyEvent(
+                            "ENTRY", wallet, coin, pos.side, pos.entry_price,
+                            previous_size=0.0, current_size=pos.size,
+                        )
+                    )
                 elif old.side != pos.side:
-                    events.append(CopyEvent("EXIT", wallet, coin, old.side))
-                    events.append(CopyEvent("ENTRY", wallet, coin, pos.side, pos.entry_price))
+                    wallet_events.append(
+                        CopyEvent(
+                            "EXIT", wallet, coin, old.side,
+                            previous_size=old.size, current_size=0.0,
+                        )
+                    )
+                    wallet_events.append(
+                        CopyEvent(
+                            "ENTRY", wallet, coin, pos.side, pos.entry_price,
+                            previous_size=0.0, current_size=pos.size,
+                        )
+                    )
                 elif old.size > 0:
                     size_increase_pct = (pos.size - old.size) / old.size * 100
                     if size_increase_pct >= self.settings.same_wallet_add_threshold_pct:
-                        events.append(
+                        wallet_events.append(
                             CopyEvent(
                                 "ADD",
                                 wallet,
@@ -3528,13 +3642,18 @@ class WalletMonitor:
 
             for coin, old in previous.items():
                 if coin not in current:
-                    events.append(CopyEvent("EXIT", wallet, coin, old.side))
+                    wallet_events.append(
+                        CopyEvent(
+                            "EXIT", wallet, coin, old.side,
+                            previous_size=old.size, current_size=0.0,
+                        )
+                    )
 
-            self.store.save_wallet_snapshot(wallet, current)
+            self.store.record_wallet_observation(wallet, current, wallet_events)
             time.sleep(self.settings.wallet_poll_delay)
 
         fail_ratio = failures / checked if checked else 0.0
-        return events, fail_ratio
+        return self.store.pending_copy_events(), fail_ratio
 
 
 class Reconciler:
@@ -3801,6 +3920,8 @@ class CopyTradingBot:
                     self._handle_entry(event, wind_down, live_held)
                 elif event.kind == "EXIT":
                     self._handle_exit(event)
+                if event.event_id is not None:
+                    self.store.acknowledge_copy_event(event.event_id)
 
             tag = f" dd={dd:.1%}" if dd >= 0.01 else ""
             live_tag = f" live=${risk_value:,.2f}" if self.settings.live and risk_value is not None else ""

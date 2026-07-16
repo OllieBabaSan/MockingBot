@@ -265,6 +265,8 @@ class EliteBot:
                     self._handle_entry(event)
                 elif event.kind == "EXIT":
                     self._handle_exit(event, "source exit")
+                if event.event_id is not None:
+                    self.store.acknowledge_copy_event(event.event_id)
 
             print(
                 f"[{time.strftime('%H:%M:%S')}] elite_wallets={len(wallets)} "
