@@ -231,6 +231,7 @@ class ExecutionReconciliationTests(unittest.TestCase):
         self.assertIsNone(self.store.coin_quarantine("BTC"))
 
     def test_capital_snapshot_uses_conservative_available_margin(self) -> None:
+        self.adapter._live_account_mode = lambda: "standard"
         self.adapter._user_state = lambda: {
             "marginSummary": {
                 "accountValue": "500",
@@ -244,6 +245,43 @@ class ExecutionReconciliationTests(unittest.TestCase):
         self.assertIsNotNone(snapshot)
         self.assertEqual(snapshot.account_value, 500.0)
         self.assertEqual(snapshot.available_margin, 375.0)
+
+    def test_unified_capital_uses_spot_available_after_maintenance(self) -> None:
+        class UnifiedInfo:
+            def spot_user_state(self, _wallet):
+                return {
+                    "balances": [
+                        {"coin": "USDC", "token": 0, "total": "501.897265", "hold": "0"}
+                    ],
+                    "tokenToAvailableAfterMaintenance": [[0, "451.25"]],
+                }
+
+        self.adapter._live_account_mode = lambda: "unifiedAccount"
+        self.adapter._info = UnifiedInfo()
+        self.adapter._exchange = object()
+
+        snapshot = core.HyperliquidAdapter.capital_snapshot(self.adapter)
+
+        self.assertIsNotNone(snapshot)
+        self.assertAlmostEqual(snapshot.account_value, 501.897265)
+        self.assertEqual(snapshot.available_margin, 451.25)
+        self.assertAlmostEqual(snapshot.total_margin_used, 50.647265)
+
+    def test_unified_capital_rejects_missing_maintenance_availability(self) -> None:
+        class IncompleteInfo:
+            def spot_user_state(self, _wallet):
+                return {
+                    "balances": [{"coin": "USDC", "token": 0, "total": "500"}],
+                    "tokenToAvailableAfterMaintenance": [],
+                }
+
+        self.adapter._live_account_mode = lambda: "unifiedAccount"
+        self.adapter._info = IncompleteInfo()
+        self.adapter._exchange = object()
+
+        snapshot = core.HyperliquidAdapter.capital_snapshot(self.adapter)
+
+        self.assertIsNone(snapshot)
 
     def test_preflight_caps_order_by_verified_usable_margin(self) -> None:
         exchange = FakeExchange([])

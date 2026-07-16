@@ -1850,6 +1850,7 @@ class HyperliquidAdapter(PlatformAdapter):
         self._info = None
         self._sz_decimals: dict[str, int] = {}
         self._max_leverage: dict[str, int] = {}
+        self._account_mode: str | None = None
 
     def _post_info(self, payload: dict[str, Any], operation: str, subject: str = "") -> Any | None:
         def call() -> Any:
@@ -2094,16 +2095,68 @@ class HyperliquidAdapter(PlatformAdapter):
         return state or {}
 
     def account_value(self) -> float | None:
-        state = self._user_state()
-        if not state:
-            return None
+        snapshot = self.capital_snapshot()
+        return snapshot.account_value if snapshot is not None else None
+
+    def _live_account_mode(self) -> str | None:
+        if not self.settings.live:
+            return "standard"
+        if self._account_mode is not None:
+            return self._account_mode
         try:
-            value = float(state.get("marginSummary", {}).get("accountValue") or 0)
-            return value if value > 0 else None
-        except Exception:
+            self._init_sdk()
+            mode = self._info.query_user_abstraction_state(  # type: ignore[union-attr]
+                self.settings.hl_wallet_address
+            )
+            if isinstance(mode, str) and mode:
+                self._account_mode = mode
+                return mode
+        except Exception as exc:
+            self.store.log_api_failure(self.name, "account_abstraction", "", str(exc))
+        return None
+
+    def _unified_capital_snapshot(self) -> CapitalSnapshot | None:
+        try:
+            self._init_sdk()
+            state = self._info.spot_user_state(  # type: ignore[union-attr]
+                self.settings.hl_wallet_address
+            )
+            balances = state.get("balances", []) if isinstance(state, dict) else []
+            usdc = next(
+                (
+                    row
+                    for row in balances
+                    if int(row.get("token", -1)) == 0
+                    or str(row.get("coin", "")).upper() == "USDC"
+                ),
+                None,
+            )
+            if not isinstance(usdc, dict):
+                return None
+            account_value = float(usdc.get("total") or 0)
+            available_by_token = dict(state.get("tokenToAvailableAfterMaintenance", []))
+            available_raw = available_by_token.get(0, available_by_token.get("0"))
+            if available_raw is None:
+                return None
+            available = float(available_raw)
+            if account_value <= 0 or available < 0 or available > account_value + 1e-8:
+                return None
+            return CapitalSnapshot(
+                account_value=account_value,
+                total_margin_used=max(0.0, account_value - available),
+                withdrawable=available,
+                available_margin=available,
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            self.store.log_api_failure(self.name, "unified_capital", "", str(exc))
             return None
 
     def capital_snapshot(self) -> CapitalSnapshot | None:
+        mode = self._live_account_mode()
+        if mode in {"unifiedAccount", "portfolioMargin"}:
+            return self._unified_capital_snapshot()
+        if mode is None and self.settings.live:
+            return None
         state = self._user_state()
         if not state:
             return None

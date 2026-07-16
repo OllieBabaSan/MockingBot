@@ -125,6 +125,11 @@ the smaller available amount after a default 5% equity reserve
 (`LIVE_MARGIN_RESERVE_PCT`). If the snapshot is unavailable, entries stop while
 exits continue. The Live dashboard reports available/usable margin and the
 variance between exchange equity and the local comparison ledger.
+Hyperliquid account abstraction is detected automatically. Standard accounts
+use their perpetuals margin summary; Unified and Portfolio Margin accounts use
+USDC total and `tokenToAvailableAfterMaintenance` from the spot clearinghouse,
+which Hyperliquid defines as the authoritative unified balance state. Missing or
+internally inconsistent availability data blocks entries.
 Leverage is also verified from live clearinghouse position state. New entries
 require a successful leverage-update response and post-fill confirmation;
 same-coin additions require the existing exchange leverage to match the local
