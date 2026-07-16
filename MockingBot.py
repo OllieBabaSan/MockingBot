@@ -1484,7 +1484,14 @@ class Store:
     ) -> None:
         slippage_bps: float | None = None
         if reference_price and result.avg_fill_price and side in {"LONG", "SHORT"}:
-            direction = -1.0 if side == "LONG" else 1.0
+            # Positive is adverse, negative is price improvement. Entry and exit
+            # have opposite economics for the same position side.
+            direction = (
+                1.0
+                if (operation == "OPEN" and side == "LONG")
+                or (operation == "CLOSE" and side == "SHORT")
+                else -1.0
+            )
             slippage_bps = (
                 (result.avg_fill_price - reference_price)
                 / reference_price
@@ -3963,9 +3970,9 @@ class CopyTradingBot:
             if unix_now() - last_reconcile >= self.settings.reconcile_seconds:
                 if not self.settings.live or live_held is not None:
                     self.reconciler.run(scan_wallets)
+                    last_reconcile = unix_now()
                 else:
                     print("[RECONCILE] Skipped: live book unavailable")
-                last_reconcile = unix_now()
 
             events, fail_ratio = self.monitor.scan(scan_wallets)
             if fail_ratio > self.settings.api_degraded_max_fail_ratio:
@@ -3978,6 +3985,14 @@ class CopyTradingBot:
                     self._handle_entry(event, wind_down, live_held)
                 elif event.kind == "EXIT":
                     self._handle_exit(event)
+                    # A flip is persisted as EXIT then ENTRY. Refresh the local
+                    # held-set after a successful full close so the following
+                    # opposite-side ENTRY is not rejected using stale state.
+                    if (
+                        live_held is not None
+                        and self.paper.position(event.coin) is None
+                    ):
+                        live_held.discard(event.coin)
                 if event.event_id is not None:
                     self.store.acknowledge_copy_event(event.event_id)
 

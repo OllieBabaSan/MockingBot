@@ -386,6 +386,26 @@ class ExecutionReconciliationTests(unittest.TestCase):
         self.assertAlmostEqual(audit["slippage_bps"], 100.0)
         self.assertEqual(audit["price_source"], "exchange_fill")
 
+    def test_execution_slippage_is_positive_only_when_adverse(self) -> None:
+        cases = [
+            ("LONG", "OPEN", 101.0, 100.0),
+            ("LONG", "CLOSE", 99.0, 100.0),
+            ("SHORT", "OPEN", 99.0, 100.0),
+            ("SHORT", "CLOSE", 101.0, 100.0),
+        ]
+        for side, operation, fill, expected_bps in cases:
+            result = core.ExecutionResult(
+                True, requested_size=1.0, filled_size=1.0,
+                avg_fill_price=fill, confirmed=True,
+            )
+            self.store.log_execution(
+                "BTC", side, operation, result, reference_price=100.0
+            )
+            row = self.store.conn.execute(
+                "SELECT slippage_bps FROM execution_audit ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            self.assertAlmostEqual(row["slippage_bps"], expected_bps)
+
     def test_wallet_allocation_size_excludes_other_wallets(self) -> None:
         paper = core.PaperPortfolio(self.settings, self.store)
         paper.open("wallet-a", "BTC", "LONG", 100, 10, leverage=3)
