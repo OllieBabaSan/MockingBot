@@ -1301,6 +1301,62 @@ class Store:
         )
         self.conn.commit()
 
+    def commit_paper_open(
+        self,
+        acct: dict[str, Any],
+        coin: str,
+        side: str,
+        entry_price: float,
+        cost_basis: float,
+        source_wallet: str,
+        leverage: float,
+    ) -> None:
+        """Commit cash, allocation slice, and aggregate position as one ledger change."""
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO kv(key, value) VALUES('paper_account', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (json.dumps(acct),),
+            )
+            self.conn.execute(
+                """
+                INSERT INTO paper_position_slices(
+                    coin, side, source_wallet, entry_price, cost_basis, leverage, opened_at, status
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, 'OPEN')
+                """,
+                (coin, side, source_wallet, entry_price, cost_basis, leverage, utc_now()),
+            )
+            self._sync_paper_position_tx(coin)
+
+    def commit_paper_close(
+        self,
+        acct: dict[str, Any],
+        slice_id: int,
+        coin: str,
+        exit_price: float | None,
+        paper_gain: float,
+        pnl_pct: float | None,
+    ) -> None:
+        """Commit proceeds, closed allocation, and aggregate position atomically."""
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO kv(key, value) VALUES('paper_account', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (json.dumps(acct),),
+            )
+            cursor = self.conn.execute(
+                """
+                UPDATE paper_position_slices
+                SET status = 'CLOSED', closed_at = ?, exit_price = ?,
+                    paper_gain = ?, pnl_pct = ?
+                WHERE id = ? AND status = 'OPEN'
+                """,
+                (utc_now(), exit_price, paper_gain, pnl_pct, slice_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(f"paper allocation {slice_id} is no longer open")
+            self._sync_paper_position_tx(coin)
+
     def close_paper_position_slice(
         self,
         slice_id: int,
@@ -1323,6 +1379,10 @@ class Store:
         self.conn.commit()
 
     def sync_paper_position(self, coin: str) -> None:
+        with self.conn:
+            self._sync_paper_position_tx(coin)
+
+    def _sync_paper_position_tx(self, coin: str) -> None:
         row = self.conn.execute(
             """
             SELECT
@@ -1341,7 +1401,7 @@ class Store:
             (coin,),
         ).fetchone()
         if row is None:
-            self.delete_paper_position(coin)
+            self.conn.execute("DELETE FROM paper_positions WHERE coin = ?", (coin,))
             return
         self.conn.execute(
             """
@@ -1363,7 +1423,6 @@ class Store:
                 row["opened_at"],
             ),
         )
-        self.conn.commit()
 
     def upsert_paper_position(
         self,
@@ -2883,7 +2942,6 @@ class PaperPortfolio:
             return None
 
         acct["cash"] = round(float(acct["cash"]) - slot, 2)
-        self.store.save_paper_account(acct)
         requested_position_leverage = float(
             leverage if leverage is not None else self.settings.leverage
         )
@@ -2893,8 +2951,8 @@ class PaperPortfolio:
             if existing_position_leverage is not None
             else requested_position_leverage
         )
-        self.store.upsert_paper_position(
-            coin, side, price, round(slot, 2), wallet, position_leverage
+        self.store.commit_paper_open(
+            acct, coin, side, price, round(slot, 2), wallet, position_leverage
         )
         return round(slot, 2)
 
@@ -2917,9 +2975,9 @@ class PaperPortfolio:
         acct = self.account()
         acct["cash"] = round(float(acct["cash"]) + cost + gain, 2)
         acct["realized_pnl"] = round(float(acct.get("realized_pnl", 0)) + gain, 2)
-        self.store.save_paper_account(acct)
-        self.store.close_paper_position_slice(int(pos["id"]), price, gain, pnl_pct)
-        self.store.sync_paper_position(coin)
+        self.store.commit_paper_close(
+            acct, int(pos["id"]), coin, price, gain, pnl_pct
+        )
         return gain, pnl_pct, side
 
 
