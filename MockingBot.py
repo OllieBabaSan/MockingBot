@@ -236,6 +236,7 @@ class Settings:
     same_wallet_add_threshold_pct: float = env_float("SAME_WALLET_ADD_THRESHOLD_PCT", 25.0)
     min_slot_usd: float = env_float("MIN_SLOT_USD", 5.0)
     min_order_notional: float = env_float("MIN_ORDER_NOTIONAL", 11.0)
+    live_margin_reserve_pct: float = env_float("LIVE_MARGIN_RESERVE_PCT", 0.05)
     slippage: float = env_float("SLIPPAGE", 0.01)
     scoring_engine_default_candidate_multiplier: float = env_float(
         "SCORING_ENGINE_DEFAULT_CANDIDATE_MULT",
@@ -321,6 +322,7 @@ def settings_fingerprint(settings: Settings) -> str:
         "core_leverage": settings.scoring_engine_core_leverage,
         "elite_leverage": settings.scoring_engine_elite_leverage,
         "max_positions": settings.max_positions,
+        "live_margin_reserve_pct": settings.live_margin_reserve_pct,
         "max_slices_per_coin": settings.max_slices_per_coin,
         "max_coin_cost_multiplier": settings.max_coin_cost_multiplier,
         "max_allocations_per_wallet_coin_side": settings.max_allocations_per_wallet_coin_side,
@@ -367,6 +369,8 @@ def validate_settings(settings: Settings) -> None:
         errors.append("roster refresh intervals must be positive")
     if settings.min_order_notional <= 0 or settings.min_slot_usd <= 0:
         errors.append("minimum order and slot values must be positive")
+    if not 0 <= settings.live_margin_reserve_pct < 1:
+        errors.append("LIVE_MARGIN_RESERVE_PCT must be between 0 and 1")
     multipliers = (
         settings.scoring_engine_default_candidate_multiplier,
         settings.scoring_engine_candidate_multiplier,
@@ -526,6 +530,14 @@ class Position:
     side: str
     size: float
     entry_price: float
+
+
+@dataclass(frozen=True)
+class CapitalSnapshot:
+    account_value: float
+    total_margin_used: float
+    withdrawable: float
+    available_margin: float
 
 
 @dataclass(frozen=True)
@@ -1963,6 +1975,7 @@ class HyperliquidAdapter(PlatformAdapter):
         )
         if fills is None:
             return None
+
         try:
             day_cutoff_ms = (unix_now() - 86400) * 1000
             fills_24h = sum(1 for f in fills if float(f.get("time", 0)) >= day_cutoff_ms)
@@ -2084,6 +2097,28 @@ class HyperliquidAdapter(PlatformAdapter):
         except Exception:
             return None
 
+    def capital_snapshot(self) -> CapitalSnapshot | None:
+        state = self._user_state()
+        if not state:
+            return None
+        try:
+            summary = state.get("marginSummary", {})
+            account_value = float(summary.get("accountValue") or 0)
+            total_margin_used = float(summary.get("totalMarginUsed") or 0)
+            withdrawable = float(state.get("withdrawable") or 0)
+            if account_value <= 0 or min(total_margin_used, withdrawable) < 0:
+                return None
+            return CapitalSnapshot(
+                account_value=account_value,
+                total_margin_used=total_margin_used,
+                withdrawable=withdrawable,
+                available_margin=max(
+                    0.0, min(withdrawable, account_value - total_margin_used)
+                ),
+            )
+        except (TypeError, ValueError):
+            return None
+
     def live_positions(self) -> dict[str, Position] | None:
         state = self._user_state()
         if not state:
@@ -2177,6 +2212,35 @@ class HyperliquidAdapter(PlatformAdapter):
                 return reject(
                     f"effective leverage {leverage}x exceeds {coin} maximum "
                     f"{asset_max_leverage}x"
+                )
+
+            capital = self.capital_snapshot()
+            if capital is None:
+                return reject(
+                    "live buying power unavailable; no order submitted",
+                    status="buying_power_unavailable",
+                )
+            reserve = capital.account_value * self.settings.live_margin_reserve_pct
+            usable_margin = max(0.0, capital.available_margin - reserve)
+            required_margin = notional_usd / leverage
+            self.store.set_json(
+                "live_capital_snapshot",
+                {
+                    "ts": utc_now(),
+                    "account_value": capital.account_value,
+                    "total_margin_used": capital.total_margin_used,
+                    "withdrawable": capital.withdrawable,
+                    "available_margin": capital.available_margin,
+                    "reserve": reserve,
+                    "usable_margin": usable_margin,
+                    "required_margin": required_margin,
+                },
+            )
+            if required_margin > usable_margin + 1e-8:
+                return reject(
+                    f"required margin ${required_margin:.2f} exceeds verified usable "
+                    f"margin ${usable_margin:.2f} after ${reserve:.2f} reserve",
+                    status="insufficient_buying_power",
                 )
 
         decimals = self._sz_decimals.get(coin, 4)
@@ -3789,6 +3853,15 @@ class CopyTradingBot:
         execution = self.platform.open_position(
             event.coin, event.side, notional, price, effective_leverage, tier_leverage
         )
+        if self.settings.live:
+            capital_snapshot = self.store.get_json("live_capital_snapshot", {})
+            if capital_snapshot:
+                local_value = self.paper.value(self.platform.mid_price)
+                capital_snapshot["local_estimated_value"] = local_value
+                capital_snapshot["equity_variance"] = round(
+                    float(capital_snapshot.get("account_value", 0)) - local_value, 2
+                )
+                self.store.set_json("live_capital_snapshot", capital_snapshot)
         if not execution:
             failure_reason = execution.detail or execution.status or "live open failed"
             signal_id = self.store.log_signal(event.wallet, event.coin, event.side, event.kind, price, "SKIPPED", failure_reason)

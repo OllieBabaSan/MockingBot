@@ -56,6 +56,8 @@ class LeveragePolicyTests(unittest.TestCase):
                 core.validate_settings(replace(configured, scoring_engine_elite_leverage=6))
             with self.assertRaisesRegex(ValueError, "SLIPPAGE"):
                 core.validate_settings(replace(configured, slippage=0.021))
+            with self.assertRaisesRegex(ValueError, "LIVE_MARGIN_RESERVE_PCT"):
+                core.validate_settings(replace(configured, live_margin_reserve_pct=1.0))
 
     def test_position_pnl_uses_persisted_leverage(self) -> None:
         with tempfile.TemporaryDirectory() as td:

@@ -100,3 +100,9 @@ Confirmed average close fills drive live-ledger realized PnL and copied-wallet
 scoring. The execution audit retains the pre-order quote, adverse slippage in
 basis points, and whether pricing came from an exchange fill or a midpoint
 estimate after response recovery.
+Before every live entry, MockingBot reads Hyperliquid account value,
+`totalMarginUsed`, and `withdrawable`. Required allocation margin must fit within
+the smaller available amount after a default 5% equity reserve
+(`LIVE_MARGIN_RESERVE_PCT`). If the snapshot is unavailable, entries stop while
+exits continue. The Live dashboard reports available/usable margin and the
+variance between exchange equity and the local comparison ledger.

@@ -18,6 +18,12 @@ class ExecutionReconciliationTests(unittest.TestCase):
         self.adapter._sz_decimals["BTC"] = 3
         self.adapter._sz_decimals["ETH"] = 3
         self.adapter._max_leverage.update({"BTC": 50, "ETH": 50})
+        self.adapter.capital_snapshot = lambda: core.CapitalSnapshot(
+            account_value=500.0,
+            total_margin_used=0.0,
+            withdrawable=500.0,
+            available_margin=500.0,
+        )
 
     def tearDown(self) -> None:
         self.store.conn.close()
@@ -98,6 +104,53 @@ class ExecutionReconciliationTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(audit["exchange_status"], "rejected")
         self.assertIn("rounded notional", audit["detail"])
+
+    def test_preflight_blocks_entry_when_buying_power_is_unavailable(self) -> None:
+        exchange = FakeExchange([])
+        self.adapter._exchange = exchange
+        self.adapter.capital_snapshot = lambda: None
+
+        result = self.adapter.open_position("BTC", "LONG", 12.0, 100.0, 3)
+
+        self.assertFalse(result)
+        self.assertEqual(result.status, "buying_power_unavailable")
+        self.assertEqual(exchange.opens, 0)
+        self.assertIsNone(self.store.coin_quarantine("BTC"))
+
+    def test_capital_snapshot_uses_conservative_available_margin(self) -> None:
+        self.adapter._user_state = lambda: {
+            "marginSummary": {
+                "accountValue": "500",
+                "totalMarginUsed": "125",
+            },
+            "withdrawable": "410",
+        }
+
+        snapshot = core.HyperliquidAdapter.capital_snapshot(self.adapter)
+
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot.account_value, 500.0)
+        self.assertEqual(snapshot.available_margin, 375.0)
+
+    def test_preflight_caps_order_by_verified_usable_margin(self) -> None:
+        exchange = FakeExchange([])
+        self.adapter._exchange = exchange
+        self.adapter.capital_snapshot = lambda: core.CapitalSnapshot(
+            account_value=500.0,
+            total_margin_used=100.0,
+            withdrawable=450.0,
+            available_margin=400.0,
+        )
+
+        result = self.adapter.open_position("BTC", "LONG", 1200.0, 100.0, 3)
+
+        self.assertFalse(result)
+        self.assertEqual(result.status, "insufficient_buying_power")
+        self.assertIn("$375.00", result.detail)
+        self.assertEqual(exchange.opens, 0)
+        snapshot = self.store.get_json("live_capital_snapshot", {})
+        self.assertEqual(snapshot["available_margin"], 400.0)
+        self.assertEqual(snapshot["reserve"], 25.0)
 
     def test_lost_response_recovers_measured_fill_without_resubmission(self) -> None:
         exchange = FakeExchange([])

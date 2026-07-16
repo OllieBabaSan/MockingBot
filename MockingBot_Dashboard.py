@@ -310,6 +310,7 @@ def dashboard_data() -> dict[str, Any]:
     with connect() as conn:
         acct = get_json(conn, "paper_account", {"cash": 0.0, "realized_pnl": 0.0})
         identity = get_json(conn, "live_account_identity", {}) if MODE == "live" else {}
+        capital = get_json(conn, "live_capital_snapshot", {}) if MODE == "live" else {}
         if MODE == "live":
             risk_baseline = get_json(conn, "live_risk_baseline", {})
             baseline = float(
@@ -431,6 +432,7 @@ def dashboard_data() -> dict[str, Any]:
             "mode": MODE,
             "instance_label": "LIVE" if MODE == "live" else "PAPER",
             "account_wallet": short_wallet(account_wallet),
+            "capital": capital,
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "db_path": str(DB_PATH),
             "price_source": price_source,
@@ -673,6 +675,7 @@ HTML = r"""<!doctype html>
       document.title = `MockingBot ${data.instance_label} Dashboard`;
       document.getElementById("updated").textContent = `Updated ${data.generated_at} | read-only | ${priceLabel}${accountLabel}`;
       const c = data.counts || {};
+      const capital = data.capital || {};
       const cards = [
         ["Est. Value", fmtMoney(data.estimated_value), clsNum(data.estimated_value - data.baseline)],
         ["Cash", fmtMoney(data.cash), ""],
@@ -681,6 +684,11 @@ HTML = r"""<!doctype html>
         ["Open PnL", fmtMoney(data.open_pnl), clsNum(data.open_pnl)],
         ["Closed Trades", String(c.exits ?? 0), ""],
         ["Quarantined", String(c.quarantined ?? 0), (c.quarantined ?? 0) > 0 ? "bad" : ""],
+        ...(data.mode === "live" ? [
+          ["Available Margin", fmtMoney(capital.available_margin), ""],
+          ["Usable Margin", fmtMoney(capital.usable_margin), ""],
+          ["Ledger Variance", fmtMoney(capital.equity_variance), clsNum(-(capital.equity_variance || 0))],
+        ] : []),
       ];
       document.getElementById("stats").innerHTML = cards.map(([label, value, klass]) => `<div class="stat"><div class="label">${label}</div><div class="value ${klass}">${value}</div></div>`).join("");
 
