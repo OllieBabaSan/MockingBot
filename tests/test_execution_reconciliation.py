@@ -426,6 +426,37 @@ class ExecutionReconciliationTests(unittest.TestCase):
         self.assertEqual(signal["paper_gain"], -3.0)
         self.assertIn("price_source=exchange_fill", signal["reason"])
 
+    def test_reconciler_does_not_close_quarantined_live_coin(self) -> None:
+        paper = core.PaperPortfolio(self.settings, self.store)
+        paper.open("wallet-a", "BTC", "LONG", 100, 10, leverage=3)
+
+        class ClosePlatform:
+            closes = 0
+
+            def close_position(self, *_args, **_kwargs):
+                self.closes += 1
+                return core.ExecutionResult(True, confirmed=True)
+
+        platform = ClosePlatform()
+        self.store.quarantine_coin("BTC", "live size mismatch", "test")
+        reconciler = core.Reconciler(
+            self.settings,
+            self.store,
+            platform,
+            paper,
+            core.RiskManager(self.settings, self.store, core.Notifier("")),
+        )
+
+        reconciler._force_close("BTC", "wallet-a", "LONG", "source closed", 0.50)
+
+        self.assertEqual(platform.closes, 0)
+        self.assertTrue(paper.owns_position("wallet-a", "BTC", "LONG"))
+        signal = self.store.conn.execute(
+            "SELECT action, reason FROM signals ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(signal["action"], "SKIPPED")
+        self.assertIn("coin quarantined", signal["reason"])
+
     def test_already_flat_close_self_heals(self) -> None:
         exchange = FakeExchange([])
         self.adapter._exchange = exchange

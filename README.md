@@ -161,6 +161,12 @@ Live size reconciliation starts at a 1% relative tolerance
 The setting cannot exceed 1%. The Live dashboard shows measured size difference
 and permitted tolerance; synchronized positions clear their quarantine
 automatically.
+Each live cycle validates the exchange book before source-wallet reconciliation.
+Source-driven and signal-driven closes are skipped for quarantined coins until
+side, leverage, and size synchronization clears the quarantine; unrelated coins
+continue normally. If the live book is unavailable, entries and periodic source
+reconciliation are blocked for that cycle, while an ordinary exit still performs
+its own authoritative pre-close exchange-state check.
 An entry that produces a measured exchange fill but fails post-fill validation
 gets one reduce-only rollback for exactly that fill size. Confirmed rollback
 restores the pre-entry size without retrying the entry. Failed or unverifiable

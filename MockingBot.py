@@ -3651,6 +3651,15 @@ class Reconciler:
                 self._force_close(coin, wallet, pos["side"], f"reconcile: {reason}", loss_threshold)
 
     def _force_close(self, coin: str, wallet: str, side: str, reason: str, loss_threshold: float) -> None:
+        if self.settings.live:
+            quarantine = self.store.coin_quarantine(coin)
+            if quarantine is not None:
+                detail = f"{reason}; coin quarantined: {quarantine['reason']}"
+                self.store.log_signal(
+                    wallet, coin, side, "EXIT", None, "SKIPPED", detail
+                )
+                print(f"[RECONCILE] Skip {coin} {side}: {detail}")
+                return
         paper_pos = self.paper.position(coin)
         if paper_pos is None:
             self.store.log_signal(wallet, coin, side, "EXIT", None, "SKIPPED", f"{reason}; not tracked")
@@ -3833,8 +3842,23 @@ class CopyTradingBot:
                 last_roster_check = unix_now()
 
             scan_wallets = self._effective_wallets(wallets)
+            live_held: set[str] | None = set()
+            if self.settings.live:
+                live_positions = self.platform.live_positions()
+                if live_positions is None:
+                    print(
+                        "[LIVE] Unable to read live positions; blocking entries and "
+                        "source reconciliation this cycle"
+                    )
+                    live_held = None
+                else:
+                    self._reconcile_live_book(live_positions)
+                    live_held = set(live_positions.keys())
             if unix_now() - last_reconcile >= self.settings.reconcile_seconds:
-                self.reconciler.run(scan_wallets, loss_threshold)
+                if not self.settings.live or live_held is not None:
+                    self.reconciler.run(scan_wallets, loss_threshold)
+                else:
+                    print("[RECONCILE] Skipped: live book unavailable")
                 last_reconcile = unix_now()
 
             events, fail_ratio = self.monitor.scan(scan_wallets)
@@ -3843,15 +3867,6 @@ class CopyTradingBot:
                 self._sleep_remaining(cycle_start)
                 continue
 
-            live_held: set[str] | None = set()
-            if self.settings.live:
-                live_positions = self.platform.live_positions()
-                if live_positions is None:
-                    print("[LIVE] Unable to read live positions; blocking ENTRY signals this cycle")
-                    live_held = None
-                else:
-                    self._reconcile_live_book(live_positions)
-                    live_held = set(live_positions.keys())
             for event in events:
                 if event.kind in {"ENTRY", "ADD"}:
                     self._handle_entry(event, wind_down, live_held)
@@ -4145,6 +4160,18 @@ class CopyTradingBot:
         return "; AUTOMATIC ROLLBACK FAILED; coin quarantined"
 
     def _handle_exit(self, event: CopyEvent, loss_threshold: float) -> None:
+        if self.settings.live:
+            quarantine = self.store.coin_quarantine(event.coin)
+            if quarantine is not None:
+                reason = f"coin quarantined: {quarantine['reason']}"
+                signal_id = self.store.log_signal(
+                    event.wallet, event.coin, event.side, "EXIT", None, "SKIPPED", reason
+                )
+                self.scoring_engine.observe_signal(
+                    event, signal_id, "SKIPPED", reason, event.entry_price
+                )
+                print(f"[EXIT] {event.coin} {event.side}: {reason}")
+                return
         paper_pos = self.paper.position(event.coin)
         if paper_pos is None:
             shadow_price = self.platform.mid_price(event.coin)
