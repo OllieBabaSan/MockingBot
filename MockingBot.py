@@ -838,6 +838,9 @@ class Store:
                 requested_size REAL,
                 filled_size REAL,
                 avg_fill_price REAL,
+                reference_price REAL,
+                slippage_bps REAL,
+                price_source TEXT,
                 order_id TEXT,
                 exchange_status TEXT,
                 confirmed INTEGER NOT NULL,
@@ -857,6 +860,9 @@ class Store:
         self._ensure_column("paper_position_slices", "leverage", "REAL NOT NULL DEFAULT 3")
         self._ensure_column("execution_audit", "leverage", "REAL")
         self._ensure_column("execution_audit", "requested_leverage", "REAL")
+        self._ensure_column("execution_audit", "reference_price", "REAL")
+        self._ensure_column("execution_audit", "slippage_bps", "REAL")
+        self._ensure_column("execution_audit", "price_source", "TEXT")
         self._migrate_legacy_paper_positions()
 
     def _ensure_column(self, table: str, column: str, declaration: str) -> None:
@@ -1328,17 +1334,30 @@ class Store:
         result: ExecutionResult,
         leverage: float | None = None,
         requested_leverage: float | None = None,
+        reference_price: float | None = None,
+        price_source: str | None = None,
     ) -> None:
+        slippage_bps: float | None = None
+        if reference_price and result.avg_fill_price and side in {"LONG", "SHORT"}:
+            direction = -1.0 if side == "LONG" else 1.0
+            slippage_bps = (
+                (result.avg_fill_price - reference_price)
+                / reference_price
+                * direction
+                * 10_000
+            )
         self.conn.execute(
             """
             INSERT INTO execution_audit(
                 ts, coin, side, operation, requested_leverage, leverage, requested_size, filled_size,
-                avg_fill_price, order_id, exchange_status, confirmed, detail
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                avg_fill_price, reference_price, slippage_bps, price_source,
+                order_id, exchange_status, confirmed, detail
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 utc_now(), coin, side, operation, requested_leverage, leverage, result.requested_size,
-                result.filled_size, result.avg_fill_price, result.order_id,
+                result.filled_size, result.avg_fill_price, reference_price,
+                slippage_bps, price_source, result.order_id,
                 result.status, 1 if result.confirmed else 0, result.detail,
             ),
         )
@@ -1794,7 +1813,10 @@ class PlatformAdapter(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def close_position(self, coin: str, size: float | None = None) -> ExecutionResult:
+    def close_position(
+        self, coin: str, size: float | None = None,
+        reference_price: float | None = None,
+    ) -> ExecutionResult:
         raise NotImplementedError
 
 
@@ -2255,12 +2277,30 @@ class HyperliquidAdapter(PlatformAdapter):
             self.store.log_execution(coin, side, "OPEN", result, leverage, requested_leverage)
             return result
 
-    def close_position(self, coin: str, size: float | None = None) -> ExecutionResult:
+    def _log_close_execution(
+        self, coin: str, side: str | None, result: ExecutionResult,
+        reference_price: float | None,
+    ) -> None:
+        if result.avg_fill_price is not None:
+            price_source = "exchange_fill"
+        elif result.accepted and result.confirmed and reference_price is not None:
+            price_source = "midpoint_estimate"
+        else:
+            price_source = None
+        self.store.log_execution(
+            coin, side, "CLOSE", result,
+            reference_price=reference_price, price_source=price_source,
+        )
+
+    def close_position(
+        self, coin: str, size: float | None = None,
+        reference_price: float | None = None,
+    ) -> ExecutionResult:
         if not self.settings.live:
             result = ExecutionResult(
                 True, requested_size=float(size or 0), status="paper", confirmed=True
             )
-            self.store.log_execution(coin, None, "CLOSE", result)
+            self._log_close_execution(coin, None, result, reference_price)
             return result
         try:
             self._init_sdk()
@@ -2269,14 +2309,14 @@ class HyperliquidAdapter(PlatformAdapter):
             self.store.log_api_failure(self.name, "close_position", coin, str(exc))
             result = ExecutionResult(False, status="exception", detail=str(exc))
             self.store.quarantine_coin(coin, "close exception", str(exc))
-            self.store.log_execution(coin, None, "CLOSE", result)
+            self._log_close_execution(coin, None, result, reference_price)
             return result
         if not state_available:
             result = ExecutionResult(
                 False, status="state_unavailable", detail="pre-close position state unavailable"
             )
             self.store.quarantine_coin(coin, "close state unavailable", result.detail)
-            self.store.log_execution(coin, None, "CLOSE", result)
+            self._log_close_execution(coin, None, result, reference_price)
             return result
         if before is None:
             result = ExecutionResult(
@@ -2284,7 +2324,7 @@ class HyperliquidAdapter(PlatformAdapter):
                 detail="exchange already flat; local state may be cleared",
             )
             self.store.clear_coin_quarantine(coin)
-            self.store.log_execution(coin, None, "CLOSE", result)
+            self._log_close_execution(coin, None, result, reference_price)
             return result
 
         decimals = self._sz_decimals.get(coin, 4)
@@ -2295,7 +2335,7 @@ class HyperliquidAdapter(PlatformAdapter):
             result = ExecutionResult(
                 False, requested_size, status="rejected", detail="close size rounds to zero"
             )
-            self.store.log_execution(coin, before.side, "CLOSE", result)
+            self._log_close_execution(coin, before.side, result, reference_price)
             return result
 
         def measure(remaining: Position | None) -> tuple[float, str]:
@@ -2330,7 +2370,7 @@ class HyperliquidAdapter(PlatformAdapter):
                 "ambiguous", False, detail,
             )
             self.store.quarantine_coin(coin, "ambiguous close state", detail)
-            self.store.log_execution(coin, before.side, "CLOSE", result)
+            self._log_close_execution(coin, before.side, result, reference_price)
             return result
 
         reduction, state_detail = measure(remaining)
@@ -2338,7 +2378,7 @@ class HyperliquidAdapter(PlatformAdapter):
             detail = f"close reduction mismatch: requested={requested_size:g}; {state_detail}"
             result = ExecutionResult(False, requested_size, status="mismatch", detail=detail)
             self.store.quarantine_coin(coin, "close reduction mismatch", detail)
-            self.store.log_execution(coin, before.side, "CLOSE", result)
+            self._log_close_execution(coin, before.side, result, reference_price)
             return result
 
         if tolerance < reduction < requested_size - tolerance:
@@ -2350,7 +2390,21 @@ class HyperliquidAdapter(PlatformAdapter):
                 )
                 retry_execution = self._parse_execution_result(retry_response, retry_size)
                 if retry_execution.avg_fill_price:
-                    response_execution = retry_execution
+                    prior_qty = response_execution.filled_size
+                    retry_qty = retry_execution.filled_size
+                    combined_qty = prior_qty + retry_qty
+                    combined_price = retry_execution.avg_fill_price
+                    if response_execution.avg_fill_price and combined_qty > 0:
+                        combined_price = (
+                            response_execution.avg_fill_price * prior_qty
+                            + retry_execution.avg_fill_price * retry_qty
+                        ) / combined_qty
+                    response_execution = ExecutionResult(
+                        response_execution.accepted or retry_execution.accepted,
+                        requested_size, combined_qty, combined_price,
+                        retry_execution.order_id or response_execution.order_id,
+                        retry_execution.status or response_execution.status,
+                    )
             except Exception as exc:
                 retry_error = str(exc)
                 self.store.log_api_failure(
@@ -2365,7 +2419,7 @@ class HyperliquidAdapter(PlatformAdapter):
                     False, requested_size, reduction, status="partial", detail=detail
                 )
                 self.store.quarantine_coin(coin, "residual live position", detail)
-                self.store.log_execution(coin, before.side, "CLOSE", result)
+                self._log_close_execution(coin, before.side, result, reference_price)
                 return result
             reduction, state_detail = measure(final_remaining)
 
@@ -2400,7 +2454,7 @@ class HyperliquidAdapter(PlatformAdapter):
                 "partial", False, detail,
             )
             self.store.quarantine_coin(coin, "residual live position", detail)
-        self.store.log_execution(coin, before.side, "CLOSE", result)
+        self._log_close_execution(coin, before.side, result, reference_price)
         return result
 
     def _confirmed_position(self, coin: str, attempts: int = 3) -> tuple[bool, Position | None]:
@@ -3414,21 +3468,25 @@ class Reconciler:
             return
 
         close_size = self.paper.allocation_position_size(wallet, coin, side)
-        if not self.platform.close_position(coin, close_size):
+        execution = self.platform.close_position(coin, close_size, price)
+        if not execution:
             self.store.log_signal(wallet, coin, side, "EXIT", price, "SKIPPED", f"{reason}; live close failed")
             print(f"[RECONCILE] Close failed {coin} {side}: {reason}")
             return
 
+        exit_price = execution.avg_fill_price or price
+        price_source = "exchange_fill" if execution.avg_fill_price else "midpoint_estimate"
         total_gain = 0.0
         last_pnl_pct: float | None = None
         while self.paper.owns_position(wallet, coin, side):
-            gain, pnl_pct, _ = self.paper.close(wallet, coin, side, price)
+            gain, pnl_pct, _ = self.paper.close(wallet, coin, side, exit_price)
             if gain is None:
                 break
             total_gain += gain
             last_pnl_pct = pnl_pct
             self.store.log_signal(
-                wallet, coin, side, "EXIT", price, "EXECUTED", reason, gain, pnl_pct
+                wallet, coin, side, "EXIT", exit_price, "EXECUTED",
+                f"{reason}; price_source={price_source} quote={price:g}", gain, pnl_pct
             )
         self.risk.maybe_pause_wallet(wallet, coin, last_pnl_pct, loss_threshold)
         print(f"[RECONCILE] Closed {coin} {side}: {reason}")
@@ -3755,7 +3813,9 @@ class CopyTradingBot:
             signal_id = self.store.log_signal(event.wallet, event.coin, event.side, event.kind, price, "SKIPPED", "paper commit failed")
             self.scoring_engine.observe_signal(event, signal_id, "SKIPPED", "paper commit failed", price)
             print(f"[WARN] {event.kind} {event.coin} {event.side}: live opened but paper commit failed")
-            if not self.platform.close_position(event.coin, execution.filled_size):
+            if not self.platform.close_position(
+                event.coin, execution.filled_size, price
+            ):
                 recovery_id = self.store.log_signal(
                     event.wallet,
                     event.coin,
@@ -3812,26 +3872,32 @@ class CopyTradingBot:
         close_size = self.paper.allocation_position_size(
             event.wallet, event.coin, event.side
         )
-        if not self.platform.close_position(event.coin, close_size):
+        execution = self.platform.close_position(event.coin, close_size, price)
+        if not execution:
             signal_id = self.store.log_signal(event.wallet, event.coin, side, "EXIT", price, "SKIPPED", "live close failed")
             self.scoring_engine.observe_signal(event, signal_id, "SKIPPED", "live close failed", price)
             print(f"[EXIT] {event.coin} {side}: live close failed")
             return
 
+        exit_price = execution.avg_fill_price or price
+        price_source = "exchange_fill" if execution.avg_fill_price else "midpoint_estimate"
         closed_any = False
         total_gain = 0.0
         last_pnl_pct: float | None = None
         side = event.side
         while self.paper.owns_position(event.wallet, event.coin, event.side):
-            gain, pnl_pct, paper_side = self.paper.close(event.wallet, event.coin, event.side, price)
+            gain, pnl_pct, paper_side = self.paper.close(
+                event.wallet, event.coin, event.side, exit_price
+            )
             side = paper_side or event.side
             if gain is None:
                 break
             closed_any = True
             total_gain += gain
             last_pnl_pct = pnl_pct
-            signal_id = self.store.log_signal(event.wallet, event.coin, side, "EXIT", price, "EXECUTED", "", gain, pnl_pct)
-            self.scoring_engine.observe_signal(event, signal_id, "EXECUTED", "", price)
+            close_reason = f"price_source={price_source} quote={price:g}"
+            signal_id = self.store.log_signal(event.wallet, event.coin, side, "EXIT", exit_price, "EXECUTED", close_reason, gain, pnl_pct)
+            self.scoring_engine.observe_signal(event, signal_id, "EXECUTED", close_reason, exit_price)
             self.risk.maybe_pause_wallet(event.wallet, event.coin, pnl_pct, loss_threshold)
 
         if not closed_any:
@@ -3841,7 +3907,7 @@ class CopyTradingBot:
             return
 
         pnl = "n/a" if last_pnl_pct is None else f"{last_pnl_pct:+.2f}%"
-        print(f"[EXIT] {event.coin} {side} @ {price or 0:,.4f} pnl={pnl} paper=${total_gain:+.2f}")
+        print(f"[EXIT] {event.coin} {side} @ {exit_price:,.4f} pnl={pnl} paper=${total_gain:+.2f} source={price_source}")
 
     def _sleep_remaining(self, cycle_start: float) -> None:
         elapsed = unix_now() - cycle_start

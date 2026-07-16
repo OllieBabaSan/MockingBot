@@ -96,3 +96,7 @@ When several wallets share a coin position, exits use Hyperliquid's reduce-only
 `market_close` size parameter for only the exiting wallet's reconstructed fill
 size. The measured reduction must match before that wallet's local slices are
 removed; unrelated wallet allocations remain open.
+Confirmed average close fills drive live-ledger realized PnL and copied-wallet
+scoring. The execution audit retains the pre-order quote, adverse slippage in
+basis points, and whether pricing came from an exchange fill or a midpoint
+estimate after response recovery.

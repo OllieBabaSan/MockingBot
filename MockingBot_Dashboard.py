@@ -417,7 +417,8 @@ def dashboard_data() -> dict[str, Any]:
             conn,
             """
             SELECT ts, coin, side, operation, requested_leverage, leverage, requested_size, filled_size,
-                   avg_fill_price, order_id, exchange_status, confirmed, detail
+                   avg_fill_price, reference_price, slippage_bps, price_source,
+                   order_id, exchange_status, confirmed, detail
             FROM execution_audit
             ORDER BY id DESC
             LIMIT ?
@@ -730,7 +731,7 @@ HTML = r"""<!doctype html>
           <td class="${clsNum(s.paper_gain)}">${fmtMoney(s.paper_gain)} <span class="muted">${fmtPct(s.pnl_pct)}</span></td>
         </tr>`), "No executed closes yet.");
 
-      table(document.getElementById("executions"), ["Time", "Coin", "Op", "Req Lev", "Effective", "Requested", "Filled", "Avg Fill", "Order", "Confirmed", "Detail"],
+      table(document.getElementById("executions"), ["Time", "Coin", "Op", "Req Lev", "Effective", "Requested", "Filled", "Avg Fill", "Quote", "Slip", "Source", "Order", "Confirmed", "Detail"],
         (data.recent_executions || []).map(x => `<tr>
           <td class="muted">${esc((x.ts || "").slice(5, 19))}</td><td><strong>${esc(x.coin)}</strong></td>
           <td>${esc(x.operation)}</td>
@@ -738,6 +739,9 @@ HTML = r"""<!doctype html>
           <td>${x.leverage ? `${Number(x.leverage).toFixed(1)}x` : "n/a"}</td><td>${Number(x.requested_size || 0).toLocaleString()}</td>
           <td>${Number(x.filled_size || 0).toLocaleString()}</td>
           <td>${x.avg_fill_price ? Number(x.avg_fill_price).toLocaleString(undefined, {maximumFractionDigits: 6}) : "n/a"}</td>
+          <td>${x.reference_price ? Number(x.reference_price).toLocaleString(undefined, {maximumFractionDigits: 6}) : "n/a"}</td>
+          <td class="${clsNum(-(x.slippage_bps || 0))}">${x.slippage_bps === null || x.slippage_bps === undefined ? "n/a" : `${Number(x.slippage_bps).toFixed(1)} bp`}</td>
+          <td class="muted">${esc(x.price_source || "")}</td>
           <td class="muted">${esc(x.order_id || "")}</td>
           <td class="${x.confirmed ? "good" : "bad"}">${x.confirmed ? "yes" : "no"}</td>
           <td class="muted">${esc(x.detail || x.exchange_status || "")}</td>

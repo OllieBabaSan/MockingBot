@@ -365,19 +365,25 @@ class EliteBot:
         close_size = self.paper.allocation_position_size(
             event.wallet, event.coin, event.side
         )
-        if not self.platform.close_position(event.coin, close_size):
+        execution = self.platform.close_position(event.coin, close_size, price)
+        if not execution:
             self.store.log_signal(event.wallet, event.coin, event.side, "EXIT", price, "SKIPPED", "close failed")
             print(f"[ELITE-EXIT] {event.coin} {event.side}: close failed")
             return
 
-        gain, pnl_pct, side = self.paper.close(event.wallet, event.coin, event.side, price)
+        exit_price = execution.avg_fill_price or price
+        price_source = "exchange_fill" if execution.avg_fill_price else "midpoint_estimate"
+        gain, pnl_pct, side = self.paper.close(
+            event.wallet, event.coin, event.side, exit_price
+        )
         if gain is None:
             self.store.log_signal(event.wallet, event.coin, event.side, "EXIT", price, "SKIPPED", "not tracked")
             print(f"[ELITE-EXIT] {event.coin} {event.side}: not tracked")
             return
-        self.store.log_signal(event.wallet, event.coin, side, "EXIT", price, "EXECUTED", reason, gain, pnl_pct)
+        close_reason = f"{reason}; price_source={price_source} quote={price:g}"
+        self.store.log_signal(event.wallet, event.coin, side, "EXIT", exit_price, "EXECUTED", close_reason, gain, pnl_pct)
         pnl = "n/a" if pnl_pct is None else f"{pnl_pct:+.2f}%"
-        print(f"[ELITE-EXIT] {event.coin} {side} @ {price:,.4f} pnl={pnl} paper=${gain:+.2f} reason={reason}")
+        print(f"[ELITE-EXIT] {event.coin} {side} @ {exit_price:,.4f} pnl={pnl} paper=${gain:+.2f} reason={reason} source={price_source}")
 
     def _sleep_remaining(self, cycle_start: float) -> None:
         elapsed = core.unix_now() - cycle_start

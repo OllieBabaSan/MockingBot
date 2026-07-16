@@ -167,13 +167,20 @@ class ExecutionReconciliationTests(unittest.TestCase):
         ])
         self.adapter._confirmed_position = lambda _coin: next(states)
 
-        result = self.adapter.close_position("BTC", 0.20)
+        result = self.adapter.close_position("BTC", 0.20, 100.0)
 
         self.assertTrue(result)
         self.assertTrue(result.confirmed)
         self.assertAlmostEqual(result.filled_size, 0.20)
         self.assertEqual(exchange.close_sizes, [0.20])
         self.assertIn("remaining=0.3", result.detail)
+        audit = self.store.conn.execute(
+            """SELECT reference_price, slippage_bps, price_source
+               FROM execution_audit ORDER BY id DESC LIMIT 1"""
+        ).fetchone()
+        self.assertEqual(audit["reference_price"], 100.0)
+        self.assertAlmostEqual(audit["slippage_bps"], 100.0)
+        self.assertEqual(audit["price_source"], "exchange_fill")
 
     def test_wallet_allocation_size_excludes_other_wallets(self) -> None:
         paper = core.PaperPortfolio(self.settings, self.store)
@@ -186,6 +193,34 @@ class ExecutionReconciliationTests(unittest.TestCase):
         self.assertAlmostEqual(
             paper.allocation_position_size("wallet-b", "BTC", "LONG"), 0.60
         )
+
+    def test_reconciler_uses_confirmed_fill_price_for_local_pnl(self) -> None:
+        paper = core.PaperPortfolio(self.settings, self.store)
+        paper.open("wallet-a", "BTC", "LONG", 100, 10, leverage=3)
+
+        class FillPlatform:
+            def mid_price(self, _coin):
+                return 100.0
+
+            def close_position(self, _coin, size=None, reference_price=None):
+                return core.ExecutionResult(
+                    True, size or 0, size or 0, 90.0,
+                    status="filled", confirmed=True,
+                )
+
+        risk = core.RiskManager(self.settings, self.store, core.Notifier(""))
+        reconciler = core.Reconciler(
+            self.settings, self.store, FillPlatform(), paper, risk
+        )
+
+        reconciler._force_close("BTC", "wallet-a", "LONG", "test exit", 0.50)
+
+        signal = self.store.conn.execute(
+            "SELECT price, paper_gain, reason FROM signals ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(signal["price"], 90.0)
+        self.assertEqual(signal["paper_gain"], -3.0)
+        self.assertIn("price_source=exchange_fill", signal["reason"])
 
     def test_already_flat_close_self_heals(self) -> None:
         exchange = FakeExchange([])
