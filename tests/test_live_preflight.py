@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 import MockingBot as core
 from helpers import TEST_USER, settings
@@ -84,6 +85,34 @@ class LivePreflightTests(unittest.TestCase):
             result, output = self.run_preflight(configured, FakePreflightAdapter(positions=mismatched))
             self.assertFalse(result)
             self.assertIn("[FAIL] position state", output)
+
+    def test_start_live_never_constructs_bot_when_preflight_fails(self) -> None:
+        class Lock:
+            def __init__(self, configured):
+                self.configured = configured
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+        with (
+            patch.object(core, "InstanceLock", Lock),
+            patch.object(core, "run_live_preflight", return_value=False) as preflight,
+            patch.object(core, "CopyTradingBot") as bot,
+            redirect_stdout(io.StringIO()),
+        ):
+            result = core.start_live()
+
+        self.assertEqual(result, 2)
+        bot.assert_not_called()
+        configured = preflight.call_args.args[0]
+        self.assertTrue(configured.live)
+        self.assertEqual(configured.max_positions, 4)
+        self.assertEqual(configured.instance_id, "live-main")
+        self.assertEqual(configured.data_dir.name, "MockingBot_Main_Live_Test_Data")
+        self.assertFalse(preflight.call_args.kwargs["check_instance_lock"])
 
 
 if __name__ == "__main__":

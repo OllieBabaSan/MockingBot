@@ -15,7 +15,19 @@ python -m pip install -r .\requirements.txt
 python .\MockingBot.py
 ```
 
-Default state lives in `MockingBot_Data/`.
+That command is the paper bot; its default state lives in `MockingBot_Data/`.
+
+Start the live bot only through its preflight-gated launcher:
+
+```powershell
+.\Start-MockingBot_Live.ps1
+# equivalent: python .\MockingBot.py start-live
+```
+
+`start-live` forces live mode, four slots, the `live-main` instance identity,
+and `MockingBot_Main_Live_Test_Data/` regardless of the calling shell's paper
+defaults. It holds the duplicate-instance lock throughout preflight and startup,
+and cannot continue to the trading loop unless every preflight gate passes.
 
 ## Dashboard
 

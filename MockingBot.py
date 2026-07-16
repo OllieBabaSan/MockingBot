@@ -4243,6 +4243,8 @@ def live_command_settings() -> Settings:
 def run_live_preflight(
     settings: Settings,
     platform: HyperliquidAdapter | Any | None = None,
+    *,
+    check_instance_lock: bool = True,
 ) -> bool:
     results: list[tuple[str, str, str]] = []
 
@@ -4256,14 +4258,17 @@ def run_live_preflight(
     except Exception as exc:
         record(False, "configuration", str(exc))
 
-    lock = InstanceLock(settings)
-    try:
-        lock.acquire()
-        record(True, "instance lock", "no duplicate live bot detected")
-    except Exception as exc:
-        record(False, "instance lock", str(exc))
-    finally:
-        lock.release()
+    if check_instance_lock:
+        lock = InstanceLock(settings)
+        try:
+            lock.acquire()
+            record(True, "instance lock", "no duplicate live bot detected")
+        except Exception as exc:
+            record(False, "instance lock", str(exc))
+        finally:
+            lock.release()
+    else:
+        record(True, "instance lock", "held by this live startup")
 
     try:
         settings.data_dir.mkdir(parents=True, exist_ok=True)
@@ -4424,17 +4429,7 @@ def run_live_preflight(
     return passed
 
 
-def main(argv: list[str]) -> int:
-    settings = Settings()
-    if len(argv) > 1 and argv[1] == "preflight-live":
-        return 0 if run_live_preflight(live_command_settings()) else 2
-    if len(argv) > 1 and argv[1] == "status":
-        print_status(settings)
-        return 0
-    if len(argv) > 1 and argv[1] == "export-signals":
-        output = Path(argv[2]) if len(argv) > 2 else settings.data_dir / "signals.csv"
-        export_signals_csv(settings, output)
-        return 0
+def run_bot(settings: Settings) -> None:
     with InstanceLock(settings):
         log_handle, original_stdout, original_stderr = enable_monitor_log(settings)
         try:
@@ -4446,6 +4441,46 @@ def main(argv: list[str]) -> int:
             sys.stdout = original_stdout
             sys.stderr = original_stderr
             log_handle.close()
+
+
+def start_live() -> int:
+    settings = live_command_settings()
+    with InstanceLock(settings):
+        print("\n*** MOCKINGBOT LIVE START: REAL ORDERS ENABLED AFTER PREFLIGHT ***\n")
+        if not run_live_preflight(settings, check_instance_lock=False):
+            return 2
+        log_handle, original_stdout, original_stderr = enable_monitor_log(settings)
+        try:
+            print(
+                f"[LIVE] Starting account={settings.hl_wallet_address[:8]}..."
+                f"{settings.hl_wallet_address[-4:]} slots={settings.max_positions} "
+                f"data={settings.data_dir}"
+            )
+            bot = CopyTradingBot(settings)
+            bot.run_forever()
+        finally:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+            log_handle.close()
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    settings = Settings()
+    if len(argv) > 1 and argv[1] == "preflight-live":
+        return 0 if run_live_preflight(live_command_settings()) else 2
+    if len(argv) > 1 and argv[1] == "start-live":
+        return start_live()
+    if len(argv) > 1 and argv[1] == "status":
+        print_status(settings)
+        return 0
+    if len(argv) > 1 and argv[1] == "export-signals":
+        output = Path(argv[2]) if len(argv) > 2 else settings.data_dir / "signals.csv"
+        export_signals_csv(settings, output)
+        return 0
+    run_bot(settings)
     return 0
 
 
