@@ -28,6 +28,10 @@ Start the live bot only through its preflight-gated launcher:
 and `MockingBot_Main_Live_Test_Data/` regardless of the calling shell's paper
 defaults. It holds the duplicate-instance lock throughout preflight and startup,
 and cannot continue to the trading loop unless every preflight gate passes.
+Generic `HL_LIVE`, `MAX_POSITIONS`, and `MOCKINGBOT_DATA_DIR` environment values
+cannot bypass or redirect this launcher. Future deliberate expansion can use
+`MOCKINGBOT_LIVE_MAX_POSITIONS`; a non-default live state location requires the
+dedicated `MOCKINGBOT_LIVE_DATA_DIR` setting.
 
 ## Dashboard
 

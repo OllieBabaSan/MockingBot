@@ -4225,8 +4225,8 @@ def export_signals_csv(settings: Settings, output: Path) -> None:
 
 def live_command_settings() -> Settings:
     base = Settings()
-    explicit_data_dir = os.getenv("MOCKINGBOT_DATA_DIR", "").strip()
-    explicit_slots = os.getenv("MAX_POSITIONS", "").strip()
+    explicit_data_dir = os.getenv("MOCKINGBOT_LIVE_DATA_DIR", "").strip()
+    explicit_slots = os.getenv("MOCKINGBOT_LIVE_MAX_POSITIONS", "").strip()
     return replace(
         base,
         live=True,
@@ -4480,6 +4480,12 @@ def main(argv: list[str]) -> int:
         output = Path(argv[2]) if len(argv) > 2 else settings.data_dir / "signals.csv"
         export_signals_csv(settings, output)
         return 0
+    if settings.live:
+        print(
+            "Live startup blocked: use 'python .\\MockingBot.py start-live' "
+            "or Start-MockingBot_Live.ps1 so preflight cannot be bypassed."
+        )
+        return 2
     run_bot(settings)
     return 0
 

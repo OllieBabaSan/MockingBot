@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import os
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -113,6 +115,34 @@ class LivePreflightTests(unittest.TestCase):
         self.assertEqual(configured.instance_id, "live-main")
         self.assertEqual(configured.data_dir.name, "MockingBot_Main_Live_Test_Data")
         self.assertFalse(preflight.call_args.kwargs["check_instance_lock"])
+
+    def test_live_launcher_ignores_generic_paper_overrides(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "MOCKINGBOT_DATA_DIR": "wrong-paper-directory",
+                "MAX_POSITIONS": "99",
+            },
+            clear=False,
+        ):
+            configured = core.live_command_settings()
+
+        self.assertTrue(configured.live)
+        self.assertEqual(configured.max_positions, 4)
+        self.assertEqual(configured.data_dir.name, "MockingBot_Main_Live_Test_Data")
+
+    def test_ordinary_main_rejects_environment_live_mode(self) -> None:
+        live_settings = settings(Path("unused"), live=True)
+        with (
+            patch.object(core, "Settings", return_value=live_settings),
+            patch.object(core, "run_bot") as run_bot,
+            redirect_stdout(io.StringIO()) as output,
+        ):
+            result = core.main([sys.executable])
+
+        self.assertEqual(result, 2)
+        run_bot.assert_not_called()
+        self.assertIn("preflight cannot be bypassed", output.getvalue())
 
 
 if __name__ == "__main__":
