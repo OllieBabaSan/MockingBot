@@ -359,7 +359,9 @@ def dashboard_data() -> dict[str, Any]:
                 (SELECT COUNT(*) FROM signals) AS signals,
                 (SELECT COUNT(*) FROM signals WHERE signal = 'EXIT' AND action = 'EXECUTED') AS exits,
                 (SELECT COUNT(*) FROM api_failures) AS api_failures,
-                (SELECT COUNT(*) FROM reconciliation_quarantine) AS quarantined
+                (SELECT COUNT(*) FROM reconciliation_quarantine) AS quarantined,
+                (SELECT COUNT(*) FROM execution_intents
+                 WHERE state IN ('PREPARED', 'SUBMITTING', 'AMBIGUOUS')) AS unresolved_intents
             """
         ).fetchone()
 
@@ -435,6 +437,17 @@ def dashboard_data() -> dict[str, Any]:
             """,
             20,
         )
+        execution_intents = recent_rows(
+            conn,
+            """
+            SELECT updated_at, coin, side, operation, requested_size, leverage,
+                   cloid, state
+            FROM execution_intents
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            20,
+        )
 
         return {
             "ok": True,
@@ -465,6 +478,7 @@ def dashboard_data() -> dict[str, Any]:
             "token_risk_alerts": token_risk_alerts,
             "quarantines": quarantines,
             "recent_executions": recent_executions,
+            "execution_intents": execution_intents,
         }
 
 
@@ -643,6 +657,10 @@ HTML = r"""<!doctype html>
       <h2>Execution Confirmations</h2>
       <div class="table-wrap"><table id="executions"></table></div>
     </section>
+    <section>
+      <h2>Durable Exchange Intents</h2>
+      <div class="table-wrap"><table id="execution-intents"></table></div>
+    </section>
     <section class="api-panel">
       <details>
       <summary>API Health</summary>
@@ -695,6 +713,7 @@ HTML = r"""<!doctype html>
         ["Open PnL", fmtMoney(data.open_pnl), clsNum(data.open_pnl)],
         ["Closed Trades", String(c.exits ?? 0), ""],
         ["Quarantined", String(c.quarantined ?? 0), (c.quarantined ?? 0) > 0 ? "bad" : ""],
+        ["Unresolved Intents", String(c.unresolved_intents ?? 0), (c.unresolved_intents ?? 0) > 0 ? "bad" : ""],
         ...(data.mode === "live" ? [
           ["Available Margin", fmtMoney(capital.available_margin), ""],
           ["Usable Margin", fmtMoney(capital.usable_margin), ""],
@@ -770,6 +789,16 @@ HTML = r"""<!doctype html>
           <td class="${x.confirmed ? "good" : "bad"}">${x.confirmed ? "yes" : "no"}</td>
           <td class="muted">${esc(x.detail || x.exchange_status || "")}</td>
         </tr>`), "No execution records yet.");
+
+      table(document.getElementById("execution-intents"), ["Updated", "Coin", "Side", "Op", "Requested", "Leverage", "Client Order ID", "State"],
+        (data.execution_intents || []).map(x => `<tr>
+          <td class="muted">${esc(x.updated_at || "")}</td><td><strong>${esc(x.coin)}</strong></td>
+          <td>${esc(x.side || "")}</td><td>${esc(x.operation)}</td>
+          <td>${Number(x.requested_size || 0).toLocaleString()}</td>
+          <td>${x.leverage ? `${Number(x.leverage).toFixed(1)}x` : "n/a"}</td>
+          <td class="muted">${esc(x.cloid)}</td>
+          <td class="${["PREPARED", "SUBMITTING", "AMBIGUOUS"].includes(x.state) ? "bad" : "good"}">${esc(x.state)}</td>
+        </tr>`), "No durable exchange intents yet.");
 
       const failures = document.getElementById("failures");
       if (!data.recent_failures.length) {

@@ -43,6 +43,94 @@ class ExecutionReconciliationTests(unittest.TestCase):
         self.assertEqual(result.avg_fill_price, 101.0)
         self.assertEqual(self.adapter._exchange.leverages, [3])
 
+    def test_confirmed_open_intent_replays_without_second_order(self) -> None:
+        exchange = FakeExchange([fill_response()])
+        self.adapter._exchange = exchange
+        states = iter([
+            (True, None),
+            (True, core.Position("BTC", "LONG", 0.12, 100.0, 3)),
+        ])
+        self.adapter._confirmed_position = lambda _coin: next(states)
+        key = "copy-event:42:open"
+
+        first = self.adapter.open_position("BTC", "LONG", 12.0, 100.0, 3, 3, key)
+        second = self.adapter.open_position("BTC", "LONG", 12.0, 100.0, 3, 3, key)
+
+        self.assertTrue(first)
+        self.assertTrue(second)
+        self.assertEqual(exchange.opens, 1)
+        row = self.store.execution_intent(key)
+        self.assertEqual(row["state"], "CONFIRMED")
+        self.assertEqual(row["cloid"], self.store.execution_cloid(key))
+        self.assertEqual(exchange.cloids[0].to_raw(), row["cloid"])
+
+    def test_submitting_open_intent_recovers_from_position_delta(self) -> None:
+        key = "copy-event:43:open"
+        self.store.prepare_execution_intent(key, "OPEN", "BTC", "LONG", 0.12, None)
+        self.store.update_execution_intent(key, "SUBMITTING")
+        exchange = FakeExchange([])
+        self.adapter._exchange = exchange
+        self.adapter._confirmed_position = lambda _coin: (
+            True, core.Position("BTC", "LONG", 0.12, 101.0, 3)
+        )
+
+        result = self.adapter.open_position("BTC", "LONG", 12.0, 100.0, 3, 3, key)
+
+        self.assertTrue(result)
+        self.assertEqual(result.status, "recovered_intent")
+        self.assertEqual(exchange.opens, 0)
+        self.assertEqual(self.store.execution_intent(key)["state"], "CONFIRMED")
+
+    def test_submitting_marker_without_exchange_order_safely_resubmits_same_cloid(self) -> None:
+        class UnknownOrderInfo:
+            def query_order_by_cloid(self, _wallet, _cloid):
+                return {"status": "unknownOid"}
+
+        key = "copy-event:45:open"
+        self.store.prepare_execution_intent(
+            key, "OPEN", "BTC", "LONG", 0.12, None, leverage=3
+        )
+        self.store.update_execution_intent(key, "SUBMITTING")
+        exchange = FakeExchange([fill_response()])
+        self.adapter._exchange = exchange
+        self.adapter._info = UnknownOrderInfo()
+        states = iter([
+            (True, None),
+            (True, core.Position("BTC", "LONG", 0.12, 100.0, 3)),
+        ])
+        self.adapter._confirmed_position = lambda _coin: next(states)
+
+        result = self.adapter.open_position("BTC", "LONG", 12.0, 100.0, 3, 3, key)
+
+        self.assertTrue(result)
+        self.assertEqual(exchange.opens, 1)
+        self.assertEqual(exchange.cloids[0].to_raw(), self.store.execution_cloid(key))
+
+    def test_submitting_close_intent_recovers_when_exchange_is_flat(self) -> None:
+        class FilledOrderInfo:
+            def user_fills(self, _wallet):
+                return [{
+                    "cloid": core.Store.execution_cloid("copy-event:44:close"),
+                    "sz": "0.12", "px": "99.5",
+                }]
+
+        key = "copy-event:44:close"
+        before = core.Position("BTC", "LONG", 0.12, 100.0, 3)
+        self.store.prepare_execution_intent(key, "CLOSE", "BTC", "LONG", 0.12, before)
+        self.store.update_execution_intent(key, "SUBMITTING")
+        exchange = FakeExchange([])
+        self.adapter._exchange = exchange
+        self.adapter._info = FilledOrderInfo()
+        self.adapter._confirmed_position = lambda _coin: (True, None)
+
+        result = self.adapter.close_position("BTC", 0.12, 100.0, key)
+
+        self.assertTrue(result)
+        self.assertEqual(result.status, "recovered_intent")
+        self.assertEqual(result.avg_fill_price, 99.5)
+        self.assertEqual(exchange.closes, 0)
+        self.assertEqual(self.store.execution_intent(key)["state"], "CONFIRMED")
+
     def test_unconfirmed_entry_quarantines_only_that_coin(self) -> None:
         self.adapter._exchange = FakeExchange([fill_response()])
         states = iter([(True, None), (False, None)])

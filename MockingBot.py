@@ -749,6 +749,27 @@ class Store:
             CREATE INDEX IF NOT EXISTS idx_pending_copy_events_status
             ON pending_copy_events(status, id);
 
+            CREATE TABLE IF NOT EXISTS execution_intents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                intent_key TEXT NOT NULL UNIQUE,
+                cloid TEXT NOT NULL UNIQUE,
+                operation TEXT NOT NULL,
+                coin TEXT NOT NULL,
+                side TEXT,
+                requested_size REAL NOT NULL,
+                leverage REAL,
+                pre_side TEXT,
+                pre_size REAL NOT NULL DEFAULT 0,
+                pre_entry_price REAL,
+                state TEXT NOT NULL,
+                result_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_execution_intents_state
+            ON execution_intents(state, id);
+
             CREATE TABLE IF NOT EXISTS api_failures (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts TEXT NOT NULL,
@@ -893,6 +914,7 @@ class Store:
         self._ensure_column("execution_audit", "requested_leverage", "REAL")
         self._ensure_column("execution_audit", "reference_price", "REAL")
         self._ensure_column("execution_audit", "slippage_bps", "REAL")
+        self._ensure_column("execution_intents", "leverage", "REAL")
         self._ensure_column("execution_audit", "price_source", "TEXT")
         self._migrate_legacy_paper_positions()
 
@@ -1200,6 +1222,94 @@ class Store:
             (utc_now(), event_id),
         )
         self.conn.commit()
+
+    @staticmethod
+    def execution_cloid(intent_key: str) -> str:
+        return "0x" + hashlib.sha256(intent_key.encode("utf-8")).hexdigest()[:32]
+
+    def execution_intent(self, intent_key: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM execution_intents WHERE intent_key = ?", (intent_key,)
+        ).fetchone()
+
+    def prepare_execution_intent(
+        self,
+        intent_key: str,
+        operation: str,
+        coin: str,
+        side: str | None,
+        requested_size: float,
+        before: Position | None,
+        leverage: float | None = None,
+    ) -> sqlite3.Row:
+        existing = self.execution_intent(intent_key)
+        if existing is not None:
+            expected = (operation, coin, side, round(requested_size, 12))
+            actual = (
+                str(existing["operation"]), str(existing["coin"]),
+                existing["side"], round(float(existing["requested_size"]), 12),
+            )
+            if actual != expected:
+                raise RuntimeError(
+                    f"execution intent collision for {intent_key}: {actual} != {expected}"
+                )
+            return existing
+        now = utc_now()
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO execution_intents(
+                    intent_key, cloid, operation, coin, side, requested_size, leverage,
+                    pre_side, pre_size, pre_entry_price, state, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?)
+                """,
+                (
+                    intent_key, self.execution_cloid(intent_key), operation, coin, side,
+                    requested_size, leverage, before.side if before else None,
+                    before.size if before else 0.0,
+                    before.entry_price if before else None, now, now,
+                ),
+            )
+        row = self.execution_intent(intent_key)
+        if row is None:
+            raise RuntimeError(f"failed to persist execution intent {intent_key}")
+        return row
+
+    def update_execution_intent(
+        self, intent_key: str, state: str, result: ExecutionResult | None = None
+    ) -> None:
+        result_json = None
+        if result is not None:
+            result_json = json.dumps(
+                {
+                    "accepted": result.accepted,
+                    "requested_size": result.requested_size,
+                    "filled_size": result.filled_size,
+                    "avg_fill_price": result.avg_fill_price,
+                    "order_id": result.order_id,
+                    "status": result.status,
+                    "confirmed": result.confirmed,
+                    "detail": result.detail,
+                }
+            )
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE execution_intents
+                SET state = ?, result_json = COALESCE(?, result_json), updated_at = ?
+                WHERE intent_key = ?
+                """,
+                (state, result_json, utc_now(), intent_key),
+            )
+
+    def unresolved_execution_intents(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """
+            SELECT * FROM execution_intents
+            WHERE state IN ('PREPARED', 'SUBMITTING', 'AMBIGUOUS')
+            ORDER BY id
+            """
+        ).fetchall()
 
     def paper_account(self, starting_cash: float) -> dict[str, Any]:
         acct = self.get_json("paper_account", None)
@@ -1961,13 +2071,14 @@ class PlatformAdapter(ABC):
     def open_position(
         self, coin: str, side: str, notional_usd: float, price: float,
         leverage: int, requested_leverage: int | None = None,
+        intent_key: str | None = None,
     ) -> ExecutionResult:
         raise NotImplementedError
 
     @abstractmethod
     def close_position(
         self, coin: str, size: float | None = None,
-        reference_price: float | None = None,
+        reference_price: float | None = None, intent_key: str | None = None,
     ) -> ExecutionResult:
         raise NotImplementedError
 
@@ -2361,6 +2472,7 @@ class HyperliquidAdapter(PlatformAdapter):
     def open_position(
         self, coin: str, side: str, notional_usd: float, price: float,
         leverage: int, requested_leverage: int | None = None,
+        intent_key: str | None = None,
     ) -> ExecutionResult:
         requested_leverage = requested_leverage or leverage
 
@@ -2456,11 +2568,28 @@ class HyperliquidAdapter(PlatformAdapter):
             self.store.log_execution(coin, side, "OPEN", result, leverage, requested_leverage)
             return result
 
-        pre_state_available, before = self._confirmed_position(coin)
+        intent_key = intent_key or f"adhoc:open:{uuid.uuid4().hex}"
+        prior_intent = self.store.execution_intent(intent_key)
+        if prior_intent is not None and prior_intent["state"] == "CONFIRMED":
+            saved = self._execution_result_from_json(prior_intent["result_json"])
+            if saved is not None:
+                return saved
+
+        pre_state_available, current_before = self._confirmed_position(coin)
         if not pre_state_available:
             detail = "pre-order position state unavailable; no order submitted"
             self.store.quarantine_coin(coin, "pre-order state unavailable", detail)
             return reject(detail, requested_size=size, status="state_unavailable")
+        if prior_intent is not None:
+            before = self._intent_pre_position(prior_intent)
+            recovered = self._recover_open_intent(
+                prior_intent, current_before, side, price, leverage, decimals
+            )
+            if recovered is not None:
+                return recovered
+        else:
+            before = current_before
+
         if (existing_leverage is None) != (before is None):
             detail = (
                 f"local_open={existing_leverage is not None} "
@@ -2482,6 +2611,11 @@ class HyperliquidAdapter(PlatformAdapter):
             self.store.quarantine_coin(coin, "exchange leverage mismatch", detail)
             return reject(detail, requested_size=size, status="leverage_mismatch")
 
+        intent = self.store.prepare_execution_intent(
+            intent_key, "OPEN", coin, side, size, before, leverage
+        )
+        cloid = self._cloid(str(intent["cloid"]))
+
         try:
             if existing_leverage is None:
                 leverage_response = self._exchange.update_leverage(  # type: ignore[union-attr]
@@ -2493,8 +2627,10 @@ class HyperliquidAdapter(PlatformAdapter):
                         requested_size=size,
                         status="leverage_update_rejected",
                     )
+            self.store.update_execution_intent(intent_key, "SUBMITTING")
             result = self._exchange.market_open(  # type: ignore[union-attr]
-                coin, side == "LONG", size, slippage=self.settings.slippage
+                coin, side == "LONG", size, slippage=self.settings.slippage,
+                cloid=cloid,
             )
             execution = self._parse_execution_result(result, size)
             state_available, confirmed = self._confirmed_position(coin)
@@ -2540,6 +2676,9 @@ class HyperliquidAdapter(PlatformAdapter):
                         execution.order_id, execution.status, False, detail,
                     )
                     self.store.quarantine_coin(coin, "entry confirmation mismatch", detail)
+            self.store.update_execution_intent(
+                intent_key, self._execution_intent_state(execution), execution
+            )
             self.store.log_execution(coin, side, "OPEN", execution, leverage, requested_leverage)
             return execution
         except Exception as exc:
@@ -2584,8 +2723,155 @@ class HyperliquidAdapter(PlatformAdapter):
                     detail = f"submission failed with no position change: {exc}"
                     result = ExecutionResult(False, size, status="exception", detail=detail)
             print(f"[LIVE] ENTRY {coin} {side}: {result.detail}")
+            self.store.update_execution_intent(
+                intent_key, self._execution_intent_state(result), result
+            )
             self.store.log_execution(coin, side, "OPEN", result, leverage, requested_leverage)
             return result
+
+    @staticmethod
+    def _cloid(raw: str) -> Any:
+        from hyperliquid.utils.types import Cloid
+        return Cloid.from_str(raw)
+
+    @staticmethod
+    def _execution_result_from_json(raw: str | None) -> ExecutionResult | None:
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+            return ExecutionResult(**data)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    @staticmethod
+    def _execution_intent_state(result: ExecutionResult) -> str:
+        if result.confirmed:
+            return "CONFIRMED"
+        if not result.accepted and result.filled_size <= 0 and result.status in {
+            "exception", "rejected", "unfilled", "leverage_update_rejected",
+        }:
+            return "FAILED"
+        return "AMBIGUOUS"
+
+    @staticmethod
+    def _intent_pre_position(intent: sqlite3.Row) -> Position | None:
+        if not intent["pre_side"] or float(intent["pre_size"]) <= 0:
+            return None
+        return Position(
+            str(intent["coin"]), str(intent["pre_side"]),
+            float(intent["pre_size"]), float(intent["pre_entry_price"] or 0),
+        )
+
+    def _recover_open_intent(
+        self, intent: sqlite3.Row, current: Position | None, side: str,
+        fallback_price: float, leverage: int, decimals: int,
+    ) -> ExecutionResult | None:
+        before = self._intent_pre_position(intent)
+        fill_size, fill_price, detail = self._entry_position_delta(before, current, side)
+        tolerance = 10 ** (-decimals) / 2
+        if fill_size > tolerance:
+            leverage_ok = (
+                current is not None and current.leverage is not None
+                and abs(current.leverage - leverage) <= 1e-8
+            )
+            result = ExecutionResult(
+                True, float(intent["requested_size"]), fill_size,
+                fill_price or fallback_price, status="recovered_intent",
+                confirmed=leverage_ok,
+                detail=f"recovered durable intent; {detail}",
+            )
+            self.store.update_execution_intent(
+                str(intent["intent_key"]),
+                "CONFIRMED" if leverage_ok else "AMBIGUOUS", result,
+            )
+            if leverage_ok:
+                self.store.clear_coin_quarantine(str(intent["coin"]))
+            else:
+                self.store.quarantine_coin(
+                    str(intent["coin"]), "recovered intent leverage mismatch", result.detail
+                )
+            return result
+        if str(intent["state"]) == "PREPARED":
+            return None
+        lookup = self._lookup_intent_order(intent)
+        if lookup == "NOT_FOUND":
+            # The durable marker was written before submission. Reusing the same
+            # cloid preserves idempotency if the exchange view races with us.
+            return None
+        if lookup == "TERMINAL_NO_FILL":
+            result = ExecutionResult(
+                False, float(intent["requested_size"]), status="unfilled",
+                detail="durable intent reached a terminal exchange state without a fill",
+            )
+            self.store.update_execution_intent(str(intent["intent_key"]), "FAILED", result)
+            return result
+        detail = "durable open intent exists but no position delta can be verified"
+        self.store.quarantine_coin(str(intent["coin"]), "ambiguous execution intent", detail)
+        result = ExecutionResult(
+            False, float(intent["requested_size"]), status="ambiguous_intent", detail=detail
+        )
+        self.store.update_execution_intent(str(intent["intent_key"]), "AMBIGUOUS", result)
+        return result
+
+    def _lookup_intent_order(self, intent: sqlite3.Row) -> str:
+        """Return NOT_FOUND, TERMINAL_NO_FILL, PRESENT, or UNAVAILABLE."""
+        try:
+            self._init_sdk()
+            response = self._info.query_order_by_cloid(  # type: ignore[union-attr]
+                self.settings.hl_wallet_address, self._cloid(str(intent["cloid"]))
+            )
+        except Exception as exc:
+            self.store.log_api_failure(
+                self.name, "query_order_by_cloid", str(intent["coin"]), str(exc)
+            )
+            return "UNAVAILABLE"
+        if not isinstance(response, dict):
+            return "UNAVAILABLE"
+        status = str(response.get("status", "")).lower()
+        if status == "unknownoid":
+            return "NOT_FOUND"
+        order_status = ""
+        order = response.get("order")
+        if isinstance(order, dict):
+            order_status = str(order.get("status", "")).lower()
+        if order_status in {
+            "canceled", "rejected", "margincanceled", "vaultwithdrawal",
+            "openinterestcapcanceled", "selftradecanceled", "reduceonlycanceled",
+            "siblingfilledcanceled", "delistedcanceled", "scheduledcancel",
+        }:
+            return "TERMINAL_NO_FILL"
+        return "PRESENT"
+
+    def _intent_fill_price(self, intent: sqlite3.Row) -> float | None:
+        try:
+            self._init_sdk()
+            fills = self._info.user_fills(  # type: ignore[union-attr]
+                self.settings.hl_wallet_address
+            )
+        except Exception as exc:
+            self.store.log_api_failure(
+                self.name, "user_fills_intent", str(intent["coin"]), str(exc)
+            )
+            return None
+        target = str(intent["cloid"]).lower()
+        matched: list[tuple[float, float]] = []
+        for fill in fills if isinstance(fills, list) else []:
+            if not isinstance(fill, dict):
+                continue
+            if str(fill.get("cloid", "")).lower() != target:
+                continue
+            try:
+                quantity = abs(float(fill.get("sz") or 0))
+                price = float(fill.get("px") or 0)
+            except (TypeError, ValueError):
+                continue
+            if quantity > 0 and price > 0:
+                matched.append((quantity, price))
+        total = sum(quantity for quantity, _ in matched)
+        if total <= 0:
+            return None
+        return sum(quantity * price for quantity, price in matched) / total
 
     def _log_close_execution(
         self, coin: str, side: str | None, result: ExecutionResult,
@@ -2604,7 +2890,7 @@ class HyperliquidAdapter(PlatformAdapter):
 
     def close_position(
         self, coin: str, size: float | None = None,
-        reference_price: float | None = None,
+        reference_price: float | None = None, intent_key: str | None = None,
     ) -> ExecutionResult:
         if not self.settings.live:
             result = ExecutionResult(
@@ -2621,6 +2907,12 @@ class HyperliquidAdapter(PlatformAdapter):
             self.store.quarantine_coin(coin, "close exception", str(exc))
             self._log_close_execution(coin, None, result, reference_price)
             return result
+        intent_key = intent_key or f"adhoc:close:{uuid.uuid4().hex}"
+        prior_intent = self.store.execution_intent(intent_key)
+        if prior_intent is not None and prior_intent["state"] == "CONFIRMED":
+            saved = self._execution_result_from_json(prior_intent["result_json"])
+            if saved is not None:
+                return saved
         if not state_available:
             result = ExecutionResult(
                 False, status="state_unavailable", detail="pre-close position state unavailable"
@@ -2629,6 +2921,31 @@ class HyperliquidAdapter(PlatformAdapter):
             self._log_close_execution(coin, None, result, reference_price)
             return result
         if before is None:
+            if prior_intent is not None:
+                baseline = self._intent_pre_position(prior_intent)
+                if baseline is not None:
+                    fill_price = self._intent_fill_price(prior_intent)
+                    if fill_price is None:
+                        detail = "close completed but fill price is unavailable by client order ID"
+                        result = ExecutionResult(
+                            False, float(prior_intent["requested_size"]), baseline.size,
+                            status="ambiguous_intent", detail=detail,
+                        )
+                        self.store.update_execution_intent(
+                            intent_key, "AMBIGUOUS", result
+                        )
+                        self.store.quarantine_coin(
+                            coin, "close fill price unavailable", detail
+                        )
+                        return result
+                    result = ExecutionResult(
+                        True, float(prior_intent["requested_size"]), baseline.size,
+                        fill_price, status="recovered_intent", confirmed=True,
+                        detail="recovered durable close intent; exchange is flat",
+                    )
+                    self.store.update_execution_intent(intent_key, "CONFIRMED", result)
+                    self.store.clear_coin_quarantine(coin)
+                    return result
             result = ExecutionResult(
                 True, status="already_flat", confirmed=True,
                 detail="exchange already flat; local state may be cleared",
@@ -2648,6 +2965,64 @@ class HyperliquidAdapter(PlatformAdapter):
             self._log_close_execution(coin, before.side, result, reference_price)
             return result
 
+        if prior_intent is not None:
+            baseline = self._intent_pre_position(prior_intent)
+            if baseline is None:
+                raise RuntimeError(f"close intent {intent_key} has no pre-order position")
+            reduction = baseline.size - (before.size if before.side == baseline.side else 0.0)
+            if abs(reduction - float(prior_intent["requested_size"])) <= tolerance:
+                fill_price = self._intent_fill_price(prior_intent)
+                if fill_price is None:
+                    detail = "close delta verified but fill price is unavailable by client order ID"
+                    result = ExecutionResult(
+                        False, float(prior_intent["requested_size"]), reduction,
+                        status="ambiguous_intent", detail=detail,
+                    )
+                    self.store.update_execution_intent(intent_key, "AMBIGUOUS", result)
+                    self.store.quarantine_coin(coin, "close fill price unavailable", detail)
+                    return result
+                result = ExecutionResult(
+                    True, float(prior_intent["requested_size"]), reduction,
+                    fill_price, status="recovered_intent", confirmed=True,
+                    detail="recovered durable close intent from exchange position delta",
+                )
+                self.store.update_execution_intent(intent_key, "CONFIRMED", result)
+                return result
+            if str(prior_intent["state"]) != "PREPARED":
+                lookup = self._lookup_intent_order(prior_intent)
+                if lookup == "NOT_FOUND" and reduction <= tolerance:
+                    before = baseline
+                    requested_size = float(prior_intent["requested_size"])
+                    prior_intent = self.store.execution_intent(intent_key)
+                elif lookup == "TERMINAL_NO_FILL":
+                    result = ExecutionResult(
+                        False, float(prior_intent["requested_size"]),
+                        status="unfilled",
+                        detail="durable close intent terminated without a fill",
+                    )
+                    self.store.update_execution_intent(intent_key, "FAILED", result)
+                    return result
+                else:
+                    detail = (
+                        f"durable close intent delta unresolved: expected="
+                        f"{float(prior_intent['requested_size']):g} measured={reduction:g}"
+                    )
+                    result = ExecutionResult(
+                        False, float(prior_intent["requested_size"]), max(0.0, reduction),
+                        status="ambiguous_intent", detail=detail,
+                    )
+                    self.store.update_execution_intent(intent_key, "AMBIGUOUS", result)
+                    self.store.quarantine_coin(coin, "ambiguous execution intent", detail)
+                    return result
+            before = baseline
+            requested_size = float(prior_intent["requested_size"])
+
+        intent = self.store.prepare_execution_intent(
+            intent_key, "CLOSE", coin, before.side, requested_size, before,
+            before.leverage,
+        )
+        cloid = self._cloid(str(intent["cloid"]))
+
         def measure(remaining: Position | None) -> tuple[float, str]:
             if remaining is None:
                 return before.size, "exchange is flat"
@@ -2661,8 +3036,9 @@ class HyperliquidAdapter(PlatformAdapter):
         response_execution = ExecutionResult(False, requested_size, status="unsubmitted")
         submission_error = ""
         try:
+            self.store.update_execution_intent(intent_key, "SUBMITTING")
             response = self._exchange.market_close(  # type: ignore[union-attr]
-                coin, sz=requested_size, slippage=self.settings.slippage
+                coin, sz=requested_size, slippage=self.settings.slippage, cloid=cloid
             )
             response_execution = self._parse_execution_result(response, requested_size)
         except Exception as exc:
@@ -2696,7 +3072,8 @@ class HyperliquidAdapter(PlatformAdapter):
             retry_error = ""
             try:
                 retry_response = self._exchange.market_close(  # type: ignore[union-attr]
-                    coin, sz=retry_size, slippage=self.settings.slippage
+                    coin, sz=retry_size, slippage=self.settings.slippage,
+                    cloid=self._cloid(self.store.execution_cloid(intent_key + ":residual")),
                 )
                 retry_execution = self._parse_execution_result(retry_response, retry_size)
                 if retry_execution.avg_fill_price:
@@ -2765,6 +3142,9 @@ class HyperliquidAdapter(PlatformAdapter):
             )
             self.store.quarantine_coin(coin, "residual live position", detail)
         self._log_close_execution(coin, before.side, result, reference_price)
+        self.store.update_execution_intent(
+            intent_key, self._execution_intent_state(result), result
+        )
         return result
 
     def _confirmed_position(self, coin: str, attempts: int = 3) -> tuple[bool, Position | None]:
@@ -3750,7 +4130,10 @@ class Reconciler:
             except Exception:
                 age_days = 0
             if age_days > self.settings.max_position_days:
-                self._force_close(coin, pos["source_wallet"], pos["side"], "position timeout")
+                self._force_close(
+                    coin, pos["source_wallet"], pos["side"], "position timeout",
+                    f"reconcile:slice:{int(pos['id'])}:close",
+                )
 
         for wallet in wallets:
             current = self.platform.positions(wallet)
@@ -3764,10 +4147,20 @@ class Reconciler:
                 if source and source.side == pos["side"]:
                     continue
                 reason = "source closed" if source is None else "source flipped"
-                self._force_close(coin, wallet, pos["side"], f"reconcile: {reason}")
+                self._force_close(
+                    coin, wallet, pos["side"], f"reconcile: {reason}",
+                    f"reconcile:slice:{int(pos['id'])}:close",
+                )
 
-    def _force_close(self, coin: str, wallet: str, side: str, reason: str) -> None:
-        if self.settings.live:
+    def _force_close(
+        self, coin: str, wallet: str, side: str, reason: str,
+        intent_key: str | None = None,
+    ) -> None:
+        recovering = (
+            intent_key is not None
+            and self.store.execution_intent(intent_key) is not None
+        )
+        if self.settings.live and not recovering:
             quarantine = self.store.coin_quarantine(coin)
             if quarantine is not None:
                 detail = f"{reason}; coin quarantined: {quarantine['reason']}"
@@ -3792,8 +4185,18 @@ class Reconciler:
             return
 
         close_size = self.paper.allocation_position_size(wallet, coin, side)
-        execution = self.platform.close_position(coin, close_size, price)
+        if isinstance(self.platform, HyperliquidAdapter):
+            execution = self.platform.close_position(
+                coin, close_size, price, intent_key
+            )
+        else:
+            execution = self.platform.close_position(coin, close_size, price)
         if not execution:
+            if recovering:
+                raise RuntimeError(
+                    f"reconciliation intent {intent_key} remains unresolved: "
+                    f"{execution.detail or execution.status}"
+                )
             self.store.log_signal(wallet, coin, side, "EXIT", price, "SKIPPED", f"{reason}; live close failed")
             print(f"[RECONCILE] Close failed {coin} {side}: {reason}")
             return
@@ -3886,6 +4289,7 @@ class CopyTradingBot:
         if identity:
             if str(identity.get("wallet", "")).lower() != wallet.lower():
                 raise RuntimeError("Live startup blocked: database belongs to a different account")
+            self._quarantine_unresolved_execution_intents()
             return
 
         if self.store.open_position_slices():
@@ -3917,6 +4321,21 @@ class CopyTradingBot:
             f"[LIVE] Fresh isolated state verified; new signals only; "
             f"allocation basis=${account_value:,.2f}"
         )
+
+    def _quarantine_unresolved_execution_intents(self) -> None:
+        unresolved = self.store.unresolved_execution_intents()
+        risky = [row for row in unresolved if row["state"] != "PREPARED"]
+        for row in risky:
+            self.store.quarantine_coin(
+                str(row["coin"]),
+                "unresolved execution intent",
+                f"{row['operation']} {row['state']} cloid={row['cloid']}",
+            )
+        if risky:
+            print(
+                f"[RECOVERY] {len(risky)} unresolved exchange intent(s) quarantined; "
+                "pending copy events will reconcile them from live position deltas"
+            )
 
     def _run_loop(self) -> None:
         wallets = self.roster.load_or_refresh(force=False)
@@ -4095,6 +4514,15 @@ class CopyTradingBot:
 
     def _handle_entry(self, event: CopyEvent, wind_down: bool, live_held: set[str] | None) -> None:
         self.token_risk.observe(event)
+        recovery_key = (
+            f"copy-event:{event.event_id}:open" if event.event_id is not None else None
+        )
+        recovery_intent = (
+            self.store.execution_intent(recovery_key) if recovery_key is not None else None
+        )
+        if recovery_intent is not None:
+            self._recover_entry_event(event, recovery_key, recovery_intent)
+            return
         if live_held is None:
             signal_id = self.store.log_signal(event.wallet, event.coin, event.side, event.kind, None, "SKIPPED", "live positions unknown")
             self.scoring_engine.observe_signal(event, signal_id, "SKIPPED", "live positions unknown", event.entry_price)
@@ -4160,9 +4588,18 @@ class CopyTradingBot:
             return
 
         notional = cost * effective_leverage
-        execution = self.platform.open_position(
-            event.coin, event.side, notional, price, effective_leverage, tier_leverage
+        execution_key = (
+            f"copy-event:{event.event_id}:open" if event.event_id is not None else None
         )
+        if isinstance(self.platform, HyperliquidAdapter):
+            execution = self.platform.open_position(
+                event.coin, event.side, notional, price, effective_leverage,
+                tier_leverage, execution_key,
+            )
+        else:
+            execution = self.platform.open_position(
+                event.coin, event.side, notional, price, effective_leverage, tier_leverage
+            )
         if self.settings.live:
             capital_snapshot = self.store.get_json("live_capital_snapshot", {})
             if capital_snapshot:
@@ -4174,10 +4611,27 @@ class CopyTradingBot:
                 self.store.set_json("live_capital_snapshot", capital_snapshot)
         if not execution:
             failure_reason = execution.detail or execution.status or "live open failed"
+            rollback_succeeded = False
             if self.settings.live and execution.accepted and execution.filled_size > 0:
-                failure_reason += self._rollback_uncommitted_entry(
+                rollback_detail = self._rollback_uncommitted_entry(
                     event, execution, price, existing_leverage is not None
                 )
+                failure_reason += rollback_detail
+                rollback_succeeded = "rollback confirmed" in rollback_detail.lower()
+                if rollback_succeeded and execution_key is not None:
+                    self.store.update_execution_intent(
+                        execution_key, "ROLLED_BACK", execution
+                    )
+            if execution_key is not None:
+                intent = self.store.execution_intent(execution_key)
+                if (
+                    intent is not None
+                    and intent["state"] in {"PREPARED", "SUBMITTING", "AMBIGUOUS"}
+                    and not rollback_succeeded
+                ):
+                    raise RuntimeError(
+                        f"execution intent {execution_key} remains unresolved: {failure_reason}"
+                    )
             signal_id = self.store.log_signal(event.wallet, event.coin, event.side, event.kind, price, "SKIPPED", failure_reason)
             self.scoring_engine.observe_signal(event, signal_id, "SKIPPED", failure_reason, price)
             print(f"[SKIP] {event.kind} {event.coin} {event.side}: {failure_reason}")
@@ -4200,9 +4654,19 @@ class CopyTradingBot:
             signal_id = self.store.log_signal(event.wallet, event.coin, event.side, event.kind, price, "SKIPPED", "paper commit failed")
             self.scoring_engine.observe_signal(event, signal_id, "SKIPPED", "paper commit failed", price)
             print(f"[WARN] {event.kind} {event.coin} {event.side}: live opened but paper commit failed")
-            if not self.platform.close_position(
-                event.coin, execution.filled_size, price
-            ):
+            recovery_key = (
+                f"copy-event:{event.event_id}:paper-commit-rollback"
+                if event.event_id is not None else None
+            )
+            if isinstance(self.platform, HyperliquidAdapter):
+                recovery_close = self.platform.close_position(
+                    event.coin, execution.filled_size, price, recovery_key
+                )
+            else:
+                recovery_close = self.platform.close_position(
+                    event.coin, execution.filled_size, price
+                )
+            if not recovery_close:
                 recovery_id = self.store.log_signal(
                     event.wallet,
                     event.coin,
@@ -4233,6 +4697,55 @@ class CopyTradingBot:
         action_label = "ADD" if is_add else ("REINFORCE" if confirming else "ENTRY")
         print(f"[{action_label}] {event.coin} {event.side} @ {price:,.4f} source={event.wallet[:16]} slot=${cost:.2f} {allocation_reason}")
 
+    def _recover_entry_event(
+        self, event: CopyEvent, intent_key: str, intent: sqlite3.Row
+    ) -> None:
+        if self.paper.owns_position(event.wallet, event.coin, event.side):
+            self.store.clear_coin_quarantine(event.coin)
+            return
+        price = self.platform.mid_price(event.coin) or event.entry_price
+        leverage = int(float(intent["leverage"] or self.settings.leverage))
+        if not price or price <= 0 or leverage <= 0:
+            raise RuntimeError(
+                f"cannot recover {intent_key}: price or leverage unavailable"
+            )
+        requested_size = float(intent["requested_size"])
+        if not isinstance(self.platform, HyperliquidAdapter):
+            raise RuntimeError(f"cannot recover {intent_key}: unsupported platform")
+        execution = self.platform.open_position(
+            event.coin, event.side, requested_size * price, price,
+            leverage, leverage, intent_key,
+        )
+        if not execution:
+            raise RuntimeError(
+                f"execution intent {intent_key} remains unresolved: "
+                f"{execution.detail or execution.status}"
+            )
+        actual_price = execution.avg_fill_price or price
+        actual_cost = execution.filled_size * actual_price / leverage
+        opened = self.paper.open(
+            event.wallet, event.coin, event.side, actual_price, actual_cost,
+            allow_same_wallet_add=event.kind == "ADD", leverage=leverage,
+        )
+        if opened is None:
+            self.store.quarantine_coin(
+                event.coin, "recovered execution ledger commit failed", intent_key
+            )
+            raise RuntimeError(
+                f"recovered live fill for {intent_key}, but local ledger commit failed"
+            )
+        self.store.clear_coin_quarantine(event.coin)
+        score = self.scoring_engine.score_wallet(event.wallet)
+        reason = f"recovered durable exchange intent; {score.tier} {score.total_score:.1f}"
+        signal_id = self.store.log_signal(
+            event.wallet, event.coin, event.side, event.kind, actual_price,
+            "EXECUTED", reason,
+        )
+        self.scoring_engine.observe_signal(
+            event, signal_id, "EXECUTED", reason, actual_price
+        )
+        print(f"[RECOVERY] {event.coin} {event.side}: local ledger completed")
+
     def _rollback_uncommitted_entry(
         self,
         event: CopyEvent,
@@ -4240,9 +4753,18 @@ class CopyTradingBot:
         reference_price: float,
         had_local_position: bool,
     ) -> str:
-        rollback = self.platform.close_position(
-            event.coin, execution.filled_size, reference_price
+        rollback_key = (
+            f"copy-event:{event.event_id}:entry-rollback"
+            if event.event_id is not None else None
         )
+        if isinstance(self.platform, HyperliquidAdapter):
+            rollback = self.platform.close_position(
+                event.coin, execution.filled_size, reference_price, rollback_key
+            )
+        else:
+            rollback = self.platform.close_position(
+                event.coin, execution.filled_size, reference_price
+            )
         payload = {
             "ts": utc_now(),
             "coin": event.coin,
@@ -4283,7 +4805,14 @@ class CopyTradingBot:
         return "; AUTOMATIC ROLLBACK FAILED; coin quarantined"
 
     def _handle_exit(self, event: CopyEvent) -> None:
-        if self.settings.live:
+        close_intent_key = (
+            f"copy-event:{event.event_id}:close" if event.event_id is not None else None
+        )
+        recovering_close = (
+            close_intent_key is not None
+            and self.store.execution_intent(close_intent_key) is not None
+        )
+        if self.settings.live and not recovering_close:
             quarantine = self.store.coin_quarantine(event.coin)
             if quarantine is not None:
                 reason = f"coin quarantined: {quarantine['reason']}"
@@ -4320,8 +4849,21 @@ class CopyTradingBot:
         close_size = self.paper.allocation_position_size(
             event.wallet, event.coin, event.side
         )
-        execution = self.platform.close_position(event.coin, close_size, price)
+        execution_key = (
+            f"copy-event:{event.event_id}:close" if event.event_id is not None else None
+        )
+        if isinstance(self.platform, HyperliquidAdapter):
+            execution = self.platform.close_position(
+                event.coin, close_size, price, execution_key
+            )
+        else:
+            execution = self.platform.close_position(event.coin, close_size, price)
         if not execution:
+            if recovering_close:
+                raise RuntimeError(
+                    f"execution intent {close_intent_key} remains unresolved: "
+                    f"{execution.detail or execution.status}"
+                )
             signal_id = self.store.log_signal(event.wallet, event.coin, side, "EXIT", price, "SKIPPED", "live close failed")
             self.scoring_engine.observe_signal(event, signal_id, "SKIPPED", "live close failed", price)
             print(f"[EXIT] {event.coin} {side}: live close failed")
