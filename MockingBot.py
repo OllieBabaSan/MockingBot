@@ -200,6 +200,8 @@ class Settings:
     roster_refresh_batch_seconds: int = env_int("ROSTER_REFRESH_BATCH_SECS", 10 * 60)
     roster_refresh_batch_size: int = env_int("ROSTER_REFRESH_BATCH_SIZE", 25)
     reconcile_seconds: int = env_int("RECONCILE_INTERVAL_SECS", 6 * 3600)
+    backup_interval_seconds: int = env_int("BACKUP_INTERVAL_SECS", 6 * 3600)
+    backup_retention_count: int = env_int("BACKUP_RETENTION_COUNT", 14)
     api_degraded_max_fail_ratio: float = env_float("API_DEGRADED_MAX_FAIL_RATIO", 0.50)
 
     hyperliquid_info_url: str = env_str("HL_INFO_URL", "https://api.hyperliquid.xyz/info")
@@ -303,6 +305,10 @@ class Settings:
     def monitor_log_path(self) -> Path:
         return Path(env_str("MOCKINGBOT_MONITOR_LOG", str(self.data_dir / "mockingbot_live.log")))
 
+    @property
+    def backup_dir(self) -> Path:
+        return self.data_dir / "backups"
+
 
 CODE_FINGERPRINT = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
 
@@ -402,6 +408,10 @@ def validate_settings(settings: Settings) -> None:
         errors.append("drawdown settings must satisfy 0 < warning < maximum < 1")
     if settings.poll_seconds <= 0 or settings.reconcile_seconds <= 0:
         errors.append("poll and reconciliation intervals must be positive")
+    if settings.backup_interval_seconds <= 0:
+        errors.append("BACKUP_INTERVAL_SECS must be positive")
+    if settings.backup_retention_count < 2:
+        errors.append("BACKUP_RETENTION_COUNT must be at least 2")
     if settings.roster_refresh_seconds <= 0 or settings.roster_refresh_batch_seconds <= 0:
         errors.append("roster refresh intervals must be positive")
     if settings.min_order_notional <= 0 or settings.min_slot_usd <= 0:
@@ -1077,6 +1087,44 @@ class Store:
             (key, json.dumps(value)),
         )
         self.conn.commit()
+
+    def create_verified_backup(
+        self, backup_dir: Path, retention_count: int
+    ) -> Path:
+        """Create an online SQLite snapshot, verify it, then enforce retention."""
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        suffix = uuid.uuid4().hex[:8]
+        final_path = backup_dir / f"mockingbot-{stamp}-{suffix}.sqlite3"
+        temp_path = backup_dir / f".{final_path.name}.tmp"
+        destination: sqlite3.Connection | None = None
+        try:
+            destination = sqlite3.connect(str(temp_path), timeout=30.0)
+            self.conn.backup(destination)
+            destination.commit()
+            integrity = destination.execute("PRAGMA integrity_check").fetchone()
+            if integrity is None or str(integrity[0]).lower() != "ok":
+                raise RuntimeError(
+                    f"backup integrity check failed: {integrity[0] if integrity else 'no result'}"
+                )
+            destination.close()
+            destination = None
+            temp_path.replace(final_path)
+        except Exception:
+            if destination is not None:
+                destination.close()
+            if temp_path.exists():
+                temp_path.unlink()
+            raise
+
+        backups = sorted(
+            backup_dir.glob("mockingbot-*.sqlite3"),
+            key=lambda path: (path.stat().st_mtime_ns, path.name),
+            reverse=True,
+        )
+        for expired in backups[max(2, retention_count):]:
+            expired.unlink()
+        return final_path
 
     def roster(self) -> list[str]:
         rows = self.conn.execute(
@@ -4314,6 +4362,9 @@ class CopyTradingBot:
         self.monitor = WalletMonitor(settings, self.store, self.platform)
         self.reconciler = Reconciler(settings, self.store, self.platform, self.paper, self.risk)
         self.running = True
+        self._last_backup_attempt = float(
+            self.store.get_json("backup_status", {}).get("attempted_unix", 0) or 0
+        )
 
     def _build_platform(self) -> PlatformAdapter:
         if self.settings.platform == "hyperliquid":
@@ -4333,6 +4384,7 @@ class CopyTradingBot:
         if self.settings.live and isinstance(self.platform, HyperliquidAdapter):
             self.platform.validate_live_credentials()
             self._validate_live_state()
+            self._maintain_live_backup(force=True)
         self.notifier.send("MockingBot started.")
 
         restart_count = 0
@@ -4407,6 +4459,46 @@ class CopyTradingBot:
                 "pending copy events will reconcile them from live position deltas"
             )
 
+    def _maintain_live_backup(self, force: bool = False) -> None:
+        if not self.settings.live:
+            return
+        now = unix_now()
+        if (
+            not force
+            and now - self._last_backup_attempt < self.settings.backup_interval_seconds
+        ):
+            return
+        self._last_backup_attempt = now
+        previous = self.store.get_json("backup_status", {})
+        try:
+            path = self.store.create_verified_backup(
+                self.settings.backup_dir, self.settings.backup_retention_count
+            )
+            status = {
+                "attempted_at": utc_now(),
+                "attempted_unix": now,
+                "successful_at": utc_now(),
+                "successful_unix": unix_now(),
+                "path": str(path),
+                "size_bytes": path.stat().st_size,
+                "integrity": "ok",
+                "error": "",
+            }
+            self.store.set_json("backup_status", status)
+            print(f"[BACKUP] Verified SQLite snapshot: {path.name}")
+        except Exception as exc:
+            status = dict(previous)
+            status.update(
+                {
+                    "attempted_at": utc_now(),
+                    "attempted_unix": now,
+                    "error": str(exc)[:500],
+                }
+            )
+            self.store.set_json("backup_status", status)
+            self.store.log_api_failure("sqlite", "live_backup", "", str(exc))
+            self.notifier.send(f"MockingBot backup failed: {exc}")
+            print(f"[BACKUP] Failed: {exc}")
     def _run_loop(self) -> None:
         wallets = self.roster.load_or_refresh(force=False)
         session_start = self.risk.session_start_value(self.paper, self.platform)
@@ -4416,6 +4508,7 @@ class CopyTradingBot:
         while self.running:
             cycle_start = unix_now()
             self.token_risk.maintain()
+            self._maintain_live_backup()
             paper_value = self.paper.value(self.platform.mid_price)
             risk_value = self.risk.current_value(self.paper, self.platform)
             if self.settings.live:

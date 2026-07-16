@@ -294,6 +294,12 @@ def dashboard_data() -> dict[str, Any]:
         acct = get_json(conn, "paper_account", {"cash": 0.0, "realized_pnl": 0.0})
         identity = get_json(conn, "live_account_identity", {}) if MODE == "live" else {}
         capital = get_json(conn, "live_capital_snapshot", {}) if MODE == "live" else {}
+        backup_status = get_json(conn, "backup_status", {}) if MODE == "live" else {}
+        backup_success_unix = float(backup_status.get("successful_unix", 0) or 0)
+        backup_status["age_seconds"] = (
+            max(0.0, time.time() - backup_success_unix)
+            if backup_success_unix else None
+        )
         last_entry_rollback = get_json(conn, "last_entry_rollback", {}) if MODE == "live" else {}
         if MODE == "live":
             risk_baseline = get_json(conn, "live_risk_baseline", {})
@@ -452,6 +458,7 @@ def dashboard_data() -> dict[str, Any]:
             "instance_label": "LIVE" if MODE == "live" else "PAPER",
             "account_wallet": short_wallet(account_wallet),
             "capital": capital,
+            "backup_status": backup_status,
             "last_entry_rollback": last_entry_rollback,
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "db_path": str(DB_PATH),
@@ -710,6 +717,7 @@ HTML = r"""<!doctype html>
       const c = data.counts || {};
       const capital = data.capital || {};
       const rollback = data.last_entry_rollback || {};
+      const backup = data.backup_status || {};
       const cards = [
         [data.mode === "live" ? "Live Equity" : "Paper Value", fmtMoney(data.estimated_value), data.estimated_value === null || data.estimated_value === undefined ? "bad" : clsNum(data.estimated_value - data.baseline)],
         [data.mode === "live" ? "Breaker High-Water" : "Session Baseline", fmtMoney(data.baseline), ""],
@@ -727,6 +735,7 @@ HTML = r"""<!doctype html>
           ["Usable Margin", fmtMoney(capital.usable_margin), ""],
           ["Ledger Variance", fmtMoney(capital.equity_variance), clsNum(-(capital.equity_variance || 0))],
           ["Last Rollback", !rollback.ts ? "none" : (rollback.rollback_confirmed ? "confirmed" : "FAILED"), rollback.ts && !rollback.rollback_confirmed ? "bad" : ""],
+          ["Last Backup", !backup.successful_at ? "none" : `${Math.round((backup.age_seconds || 0) / 60)}m ago`, !backup.successful_at || backup.error ? "bad" : "good"],
         ] : []),
       ];
       document.getElementById("stats").innerHTML = cards.map(([label, value, klass]) => `<div class="stat"><div class="label">${label}</div><div class="value ${klass}">${value}</div></div>`).join("");
