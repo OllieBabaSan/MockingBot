@@ -146,6 +146,11 @@ use their perpetuals margin summary; Unified and Portfolio Margin accounts use
 USDC total and `tokenToAvailableAfterMaintenance` from the spot clearinghouse,
 which Hyperliquid defines as the authoritative unified balance state. Missing or
 internally inconsistent availability data blocks entries.
+The live 15% warning and 25% breaker use a persistent equity high-water mark,
+including gains observed after a restart. After an intentional deposit or
+withdrawal, explicitly rebase it to verified current equity with the no-order
+command `python .\MockingBot.py reset-live-risk-baseline`. The command is blocked
+while another live bot instance owns the data directory.
 Leverage is also verified from live clearinghouse position state. New entries
 require a successful leverage-update response and post-fill confirmation;
 same-coin additions require the existing exchange leverage to match the local

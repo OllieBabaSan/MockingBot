@@ -2865,28 +2865,52 @@ class RiskManager:
     def session_start_value(self, portfolio: PaperPortfolio, platform: PlatformAdapter) -> float | None:
         if self.settings.live:
             stored = self.store.get_json("live_risk_baseline", {})
-            if (
-                stored.get("wallet") == self.settings.hl_wallet_address
-                and float(stored.get("start_value", 0) or 0) > 0
-            ):
-                return float(stored["start_value"])
-
-            start = platform.account_value()
-            if start is None:
+            current = platform.account_value()
+            if current is None:
                 return None
+            stored_reference = 0.0
+            if stored.get("wallet") == self.settings.hl_wallet_address:
+                stored_reference = float(
+                    stored.get("high_water_value", stored.get("start_value", 0)) or 0
+                )
+            reference = max(current, stored_reference)
             self.store.set_json(
                 "live_risk_baseline",
                 {
-                    "started": utc_now(),
+                    "started": stored.get("started") or utc_now(),
                     "wallet": self.settings.hl_wallet_address,
-                    "start_value": start,
+                    "start_value": float(stored.get("start_value", 0) or current),
+                    "high_water_value": reference,
+                    "high_water_updated": utc_now(),
                 },
             )
-            return start
+            return reference
 
         start = portfolio.value(platform.mid_price)
         self.store.set_json("session", {"started": utc_now(), "paper_start": start})
         return start
+
+    def update_live_high_water(
+        self, current_value: float, current_reference: float | None
+    ) -> float:
+        if not self.settings.live:
+            return current_reference if current_reference is not None else current_value
+        reference = float(current_reference or 0)
+        if current_value <= reference:
+            return reference
+        stored = self.store.get_json("live_risk_baseline", {})
+        self.store.set_json(
+            "live_risk_baseline",
+            {
+                "started": stored.get("started") or utc_now(),
+                "wallet": self.settings.hl_wallet_address,
+                "start_value": float(stored.get("start_value", 0) or current_value),
+                "high_water_value": current_value,
+                "high_water_updated": utc_now(),
+            },
+        )
+        print(f"[LIVE-RISK] New equity high-water mark ${current_value:,.2f}")
+        return current_value
 
     def current_value(self, portfolio: PaperPortfolio, platform: PlatformAdapter) -> float | None:
         if self.settings.live:
@@ -3782,6 +3806,8 @@ class CopyTradingBot:
             risk_value = self.risk.current_value(self.paper, self.platform)
             if session_start is None and risk_value is not None:
                 session_start = self.risk.session_start_value(self.paper, self.platform)
+            if self.settings.live and risk_value is not None:
+                session_start = self.risk.update_live_high_water(risk_value, session_start)
             equity_available = session_start is not None and risk_value is not None
             self.risk.live_equity_available(equity_available)
             dd = self.risk.drawdown(session_start, risk_value) if equity_available else 0.0
@@ -4467,12 +4493,52 @@ def start_live() -> int:
     return 0
 
 
+def reset_live_risk_baseline(
+    settings: Settings,
+    platform: HyperliquidAdapter | Any | None = None,
+) -> bool:
+    with InstanceLock(settings):
+        store = Store(settings.db_path)
+        try:
+            adapter = platform or HyperliquidAdapter(settings, store)
+            adapter.validate_live_credentials()
+            capital = adapter.capital_snapshot()
+            if capital is None or capital.account_value <= 0:
+                print("Live risk reset blocked: verified account equity is unavailable.")
+                return False
+            identity = store.get_json("live_account_identity", {})
+            if identity and str(identity.get("wallet", "")).lower() != settings.hl_wallet_address.lower():
+                print("Live risk reset blocked: database belongs to another wallet.")
+                return False
+            now = utc_now()
+            store.set_json(
+                "live_risk_baseline",
+                {
+                    "started": now,
+                    "wallet": settings.hl_wallet_address,
+                    "start_value": capital.account_value,
+                    "high_water_value": capital.account_value,
+                    "high_water_updated": now,
+                    "manual_reset": True,
+                },
+            )
+            print(
+                f"Live risk baseline reset to verified equity "
+                f"${capital.account_value:,.2f}; no orders submitted."
+            )
+            return True
+        finally:
+            store.conn.close()
+
+
 def main(argv: list[str]) -> int:
     settings = Settings()
     if len(argv) > 1 and argv[1] == "preflight-live":
         return 0 if run_live_preflight(live_command_settings()) else 2
     if len(argv) > 1 and argv[1] == "start-live":
         return start_live()
+    if len(argv) > 1 and argv[1] == "reset-live-risk-baseline":
+        return 0 if reset_live_risk_baseline(live_command_settings()) else 2
     if len(argv) > 1 and argv[1] == "status":
         print_status(settings)
         return 0

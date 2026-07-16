@@ -49,7 +49,33 @@ class RiskAndIsolationTests(unittest.TestCase):
                 self.assertEqual(payload["mode"], "live")
                 self.assertEqual(payload["drawdown_pct"], 25.0)
                 platform.value = 700.0
-                self.assertEqual(risk.session_start_value(FakePortfolio(), platform), 500.0)
+                self.assertEqual(risk.session_start_value(FakePortfolio(), platform), 700.0)
+                self.assertEqual(
+                    store.get_json("live_risk_baseline", {})["high_water_value"], 700.0
+                )
+                self.assertEqual(risk.update_live_high_water(750.0, 700.0), 750.0)
+                self.assertEqual(risk.update_live_high_water(725.0, 750.0), 750.0)
+                self.assertAlmostEqual(risk.drawdown(750.0, 562.5), 0.25)
+            finally:
+                store.conn.close()
+
+    def test_manual_live_risk_reset_uses_verified_equity(self) -> None:
+        class ResetPlatform:
+            def validate_live_credentials(self):
+                return None
+
+            def capital_snapshot(self):
+                return core.CapitalSnapshot(640.0, 0.0, 640.0, 640.0)
+
+        with tempfile.TemporaryDirectory() as td:
+            configured = settings(Path(td), live=True)
+            self.assertTrue(core.reset_live_risk_baseline(configured, ResetPlatform()))
+            store = core.Store(configured.db_path)
+            try:
+                baseline = store.get_json("live_risk_baseline", {})
+                self.assertEqual(baseline["start_value"], 640.0)
+                self.assertEqual(baseline["high_water_value"], 640.0)
+                self.assertTrue(baseline["manual_reset"])
             finally:
                 store.conn.close()
 
