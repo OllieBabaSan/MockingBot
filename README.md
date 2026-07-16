@@ -116,3 +116,8 @@ Live size reconciliation starts at a 1% relative tolerance
 The setting cannot exceed 1%. The Live dashboard shows measured size difference
 and permitted tolerance; synchronized positions clear their quarantine
 automatically.
+An entry that produces a measured exchange fill but fails post-fill validation
+gets one reduce-only rollback for exactly that fill size. Confirmed rollback
+restores the pre-entry size without retrying the entry. Failed or unverifiable
+rollback produces a prominent `ENTRY ROLLBACK FAILED` coin quarantine and
+notification while the remaining book continues.

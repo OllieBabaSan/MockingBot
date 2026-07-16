@@ -3957,6 +3957,10 @@ class CopyTradingBot:
                 self.store.set_json("live_capital_snapshot", capital_snapshot)
         if not execution:
             failure_reason = execution.detail or execution.status or "live open failed"
+            if self.settings.live and execution.accepted and execution.filled_size > 0:
+                failure_reason += self._rollback_uncommitted_entry(
+                    event, execution, price, existing_leverage is not None
+                )
             signal_id = self.store.log_signal(event.wallet, event.coin, event.side, event.kind, price, "SKIPPED", failure_reason)
             self.scoring_engine.observe_signal(event, signal_id, "SKIPPED", failure_reason, price)
             print(f"[SKIP] {event.kind} {event.coin} {event.side}: {failure_reason}")
@@ -4011,6 +4015,55 @@ class CopyTradingBot:
         self.scoring_engine.observe_signal(event, signal_id, "EXECUTED", allocation_reason, price)
         action_label = "ADD" if is_add else ("REINFORCE" if confirming else "ENTRY")
         print(f"[{action_label}] {event.coin} {event.side} @ {price:,.4f} source={event.wallet[:16]} slot=${cost:.2f} {allocation_reason}")
+
+    def _rollback_uncommitted_entry(
+        self,
+        event: CopyEvent,
+        execution: ExecutionResult,
+        reference_price: float,
+        had_local_position: bool,
+    ) -> str:
+        rollback = self.platform.close_position(
+            event.coin, execution.filled_size, reference_price
+        )
+        payload = {
+            "ts": utc_now(),
+            "coin": event.coin,
+            "side": event.side,
+            "filled_size": execution.filled_size,
+            "trigger_status": execution.status,
+            "rollback_status": rollback.status,
+            "rollback_confirmed": bool(rollback),
+            "detail": rollback.detail,
+        }
+        self.store.set_json("last_entry_rollback", payload)
+        if rollback:
+            if had_local_position:
+                self.store.quarantine_coin(
+                    event.coin,
+                    "entry rollback pending reconciliation",
+                    "measured fill was reversed; existing position leverage/size "
+                    "must reconcile before new entries",
+                )
+            else:
+                self.store.clear_coin_quarantine(event.coin)
+            print(
+                f"[ROLLBACK] {event.coin} {event.side}: reversed uncommitted "
+                f"fill size={execution.filled_size:g}"
+            )
+            return "; automatic rollback confirmed"
+
+        detail = (
+            f"trigger={execution.status} rollback={rollback.status}: "
+            f"{rollback.detail or 'not confirmed'}"
+        )
+        self.store.quarantine_coin(event.coin, "ENTRY ROLLBACK FAILED", detail)
+        self.notifier.send(
+            f"MockingBot ALERT: {event.coin} {event.side} entry rollback failed; "
+            "coin quarantined."
+        )
+        print(f"[ALERT] {event.coin} {event.side}: ENTRY ROLLBACK FAILED - {detail}")
+        return "; AUTOMATIC ROLLBACK FAILED; coin quarantined"
 
     def _handle_exit(self, event: CopyEvent, loss_threshold: float) -> None:
         paper_pos = self.paper.position(event.coin)

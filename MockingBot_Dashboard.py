@@ -311,6 +311,7 @@ def dashboard_data() -> dict[str, Any]:
         acct = get_json(conn, "paper_account", {"cash": 0.0, "realized_pnl": 0.0})
         identity = get_json(conn, "live_account_identity", {}) if MODE == "live" else {}
         capital = get_json(conn, "live_capital_snapshot", {}) if MODE == "live" else {}
+        last_entry_rollback = get_json(conn, "last_entry_rollback", {}) if MODE == "live" else {}
         if MODE == "live":
             risk_baseline = get_json(conn, "live_risk_baseline", {})
             baseline = float(
@@ -442,6 +443,7 @@ def dashboard_data() -> dict[str, Any]:
             "instance_label": "LIVE" if MODE == "live" else "PAPER",
             "account_wallet": short_wallet(account_wallet),
             "capital": capital,
+            "last_entry_rollback": last_entry_rollback,
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "db_path": str(DB_PATH),
             "price_source": price_source,
@@ -685,6 +687,7 @@ HTML = r"""<!doctype html>
       document.getElementById("updated").textContent = `Updated ${data.generated_at} | read-only | ${priceLabel}${accountLabel}`;
       const c = data.counts || {};
       const capital = data.capital || {};
+      const rollback = data.last_entry_rollback || {};
       const cards = [
         ["Est. Value", fmtMoney(data.estimated_value), clsNum(data.estimated_value - data.baseline)],
         ["Cash", fmtMoney(data.cash), ""],
@@ -697,6 +700,7 @@ HTML = r"""<!doctype html>
           ["Available Margin", fmtMoney(capital.available_margin), ""],
           ["Usable Margin", fmtMoney(capital.usable_margin), ""],
           ["Ledger Variance", fmtMoney(capital.equity_variance), clsNum(-(capital.equity_variance || 0))],
+          ["Last Rollback", !rollback.ts ? "none" : (rollback.rollback_confirmed ? "confirmed" : "FAILED"), rollback.ts && !rollback.rollback_confirmed ? "bad" : ""],
         ] : []),
       ];
       document.getElementById("stats").innerHTML = cards.map(([label, value, klass]) => `<div class="stat"><div class="label">${label}</div><div class="value ${klass}">${value}</div></div>`).join("");

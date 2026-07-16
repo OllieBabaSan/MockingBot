@@ -140,6 +140,68 @@ class ExecutionReconciliationTests(unittest.TestCase):
             "post-entry leverage mismatch",
         )
 
+    def test_uncommitted_fill_rollback_restores_new_position(self) -> None:
+        class RollbackPlatform:
+            def __init__(self):
+                self.calls = []
+
+            def close_position(self, coin, size=None, reference_price=None):
+                self.calls.append((coin, size, reference_price))
+                return core.ExecutionResult(
+                    True, size or 0, size or 0, 100.0,
+                    status="filled", confirmed=True, detail="verified reduction",
+                )
+
+        platform = RollbackPlatform()
+        bot = core.CopyTradingBot.__new__(core.CopyTradingBot)
+        bot.settings = self.settings
+        bot.store = self.store
+        bot.platform = platform
+        bot.notifier = core.Notifier("")
+        self.store.quarantine_coin("BTC", "post-entry leverage mismatch")
+        event = core.CopyEvent("ENTRY", "wallet", "BTC", "LONG")
+        execution = core.ExecutionResult(
+            True, 0.12, 0.12, 100.0,
+            status="leverage_mismatch", confirmed=False,
+        )
+
+        suffix = bot._rollback_uncommitted_entry(event, execution, 100.0, False)
+
+        self.assertEqual(suffix, "; automatic rollback confirmed")
+        self.assertEqual(platform.calls, [("BTC", 0.12, 100.0)])
+        self.assertIsNone(self.store.coin_quarantine("BTC"))
+        self.assertTrue(
+            self.store.get_json("last_entry_rollback", {})["rollback_confirmed"]
+        )
+
+    def test_failed_uncommitted_fill_rollback_stays_quarantined(self) -> None:
+        class FailedRollbackPlatform:
+            def close_position(self, _coin, size=None, reference_price=None):
+                return core.ExecutionResult(
+                    False, size or 0, status="ambiguous", detail="state unavailable"
+                )
+
+        bot = core.CopyTradingBot.__new__(core.CopyTradingBot)
+        bot.settings = self.settings
+        bot.store = self.store
+        bot.platform = FailedRollbackPlatform()
+        bot.notifier = core.Notifier("")
+        event = core.CopyEvent("ENTRY", "wallet", "BTC", "LONG")
+        execution = core.ExecutionResult(
+            True, 0.12, 0.12, 100.0,
+            status="leverage_mismatch", confirmed=False,
+        )
+
+        suffix = bot._rollback_uncommitted_entry(event, execution, 100.0, False)
+
+        self.assertIn("ROLLBACK FAILED", suffix)
+        self.assertEqual(
+            self.store.coin_quarantine("BTC")["reason"], "ENTRY ROLLBACK FAILED"
+        )
+        self.assertFalse(
+            self.store.get_json("last_entry_rollback", {})["rollback_confirmed"]
+        )
+
     def test_preflight_checks_notional_after_size_rounding(self) -> None:
         exchange = FakeExchange([])
         self.adapter._exchange = exchange
