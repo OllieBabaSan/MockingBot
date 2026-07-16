@@ -36,6 +36,7 @@ import os
 import signal
 import sqlite3
 import sys
+import threading
 import time
 import traceback
 import uuid
@@ -1919,8 +1920,12 @@ class TokenRiskMonitor:
         self.settings = settings
         self.store = store
         self._cache_loaded = False
+        self._cache_initialized = False
+        self._refreshed_at = 0.0
         self._symbols: set[str] = set()
         self._ranks: dict[str, int] = {}
+        self._refresh_thread: threading.Thread | None = None
+        self._refresh_result: tuple[set[str], dict[str, int], Exception | None] | None = None
 
     @staticmethod
     def _coin_variants(coin: str) -> set[str]:
@@ -1956,7 +1961,7 @@ class TokenRiskMonitor:
         self._cache_loaded = True
         self._save_cache(symbols, ranks)
 
-    def _refresh_cache(self) -> None:
+    def _fetch_cache(self) -> tuple[set[str], dict[str, int], Exception | None]:
         per_page = 250
         pages = max(1, math.ceil(self.settings.token_risk_top_n / per_page))
         symbols: set[str] = set()
@@ -1972,9 +1977,8 @@ class TokenRiskMonitor:
             try:
                 response = requests.get(self.settings.coingecko_markets_url, params=params, timeout=12)
                 response.raise_for_status()
-            except Exception:
-                self._save_partial_cache(symbols, ranks)
-                raise
+            except Exception as exc:
+                return symbols, ranks, exc
             rows = response.json()
             if not isinstance(rows, list):
                 break
@@ -1991,38 +1995,66 @@ class TokenRiskMonitor:
                     ranks[symbol] = int(rank) if old is None else min(old, int(rank))
             if len(rows) < per_page:
                 break
-        if symbols:
-            self._symbols = symbols
-            self._ranks = ranks
-            self._cache_loaded = True
-            self._save_cache(symbols, ranks)
+        return symbols, ranks, None
 
-    def ensure_cache(self) -> None:
+    def _background_refresh(self) -> None:
+        self._refresh_result = self._fetch_cache()
+
+    def maintain(self) -> None:
+        """Persist completed refreshes and start a stale refresh without blocking."""
         if not self.settings.token_risk_logging:
             return
-        refreshed_at, symbols, ranks = self._load_cache()
-        self._symbols = symbols
-        self._ranks = ranks
-        self._cache_loaded = bool(symbols)
-        if symbols and unix_now() - refreshed_at < self.settings.token_risk_refresh_seconds:
+        if not self._cache_initialized:
+            self._refreshed_at, self._symbols, self._ranks = self._load_cache()
+            self._cache_loaded = bool(self._symbols)
+            self._cache_initialized = True
+
+        completed = self._refresh_result
+        if completed is not None:
+            self._refresh_result = None
+            symbols, ranks, error = completed
+            if symbols:
+                self._symbols = symbols
+                self._ranks = ranks
+                self._cache_loaded = True
+                self._save_cache(symbols, ranks)
+                self._refreshed_at = unix_now()
+            if error is not None:
+                self.store.set_json(
+                    "token_risk_retry_after",
+                    {
+                        "ts": unix_now() + max(300, self.settings.token_risk_retry_seconds),
+                        "error": str(error),
+                    },
+                )
+                self.store.log_api_failure(
+                    "coingecko", "token_risk_cache", "", str(error)
+                )
+
+        if (
+            self._symbols
+            and unix_now() - self._refreshed_at < self.settings.token_risk_refresh_seconds
+        ):
+            return
+        if self._refresh_thread is not None and self._refresh_thread.is_alive():
             return
         retry_state = self.store.get_json("token_risk_retry_after", {})
         retry_after = float(retry_state.get("ts", 0) or 0)
         if retry_after and unix_now() < retry_after:
             return
-        try:
-            self._refresh_cache()
-        except Exception as exc:
-            self.store.set_json(
-                "token_risk_retry_after",
-                {"ts": unix_now() + max(300, self.settings.token_risk_retry_seconds), "error": str(exc)},
-            )
-            self.store.log_api_failure("coingecko", "token_risk_cache", "", str(exc))
+        self._refresh_thread = threading.Thread(
+            target=self._background_refresh,
+            name="token-risk-refresh",
+            daemon=True,
+        )
+        self._refresh_thread.start()
 
     def observe(self, event: CopyEvent) -> None:
         if not self.settings.token_risk_logging or event.kind not in {"ENTRY", "ADD"}:
             return
-        self.ensure_cache()
+        # This is intentionally cache-only. Network refreshes are advisory and
+        # must never delay a time-sensitive order.
+        self.maintain()
         if not self._symbols:
             return
         variants = self._coin_variants(event.coin)
@@ -4345,6 +4377,7 @@ class CopyTradingBot:
 
         while self.running:
             cycle_start = unix_now()
+            self.token_risk.maintain()
             paper_value = self.paper.value(self.platform.mid_price)
             risk_value = self.risk.current_value(self.paper, self.platform)
             if session_start is None and risk_value is not None:
