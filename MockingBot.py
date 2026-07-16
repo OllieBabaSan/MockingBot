@@ -262,6 +262,12 @@ class Settings:
         "SCORING_ENGINE_MAX_SLOT_MULT",
         env_float("MARSHAL_MAX_SLOT_MULT", 1.50),
     )
+    scoring_reference_margin_usd: float = env_float(
+        "SCORING_REFERENCE_MARGIN_USD", 1_000.0
+    )
+    scoring_reference_leverage: float = env_float(
+        "SCORING_REFERENCE_LEVERAGE", 3.0
+    )
     scoring_engine_candidate_max_allocations: int = env_int(
         "SCORING_ENGINE_CANDIDATE_MAX_ALLOCATIONS",
         env_int("MARSHAL_CANDIDATE_MAX_ALLOCATIONS", 1),
@@ -330,6 +336,8 @@ def settings_fingerprint(settings: Settings) -> str:
         "elite_multiplier": settings.scoring_engine_elite_multiplier,
         "candidate_max_allocations": settings.scoring_engine_candidate_max_allocations,
         "proven_candidate_max_allocations": settings.scoring_engine_proven_candidate_max_allocations,
+        "scoring_reference_margin_usd": settings.scoring_reference_margin_usd,
+        "scoring_reference_leverage": settings.scoring_reference_leverage,
         "warning_drawdown_pct": settings.warning_drawdown_pct,
         "max_drawdown_pct": settings.max_drawdown_pct,
     }
@@ -378,6 +386,8 @@ def validate_settings(settings: Settings) -> None:
     )
     if settings.scoring_engine_max_slot_multiplier <= 0:
         errors.append("maximum slot multiplier must be positive")
+    if settings.scoring_reference_margin_usd <= 0 or settings.scoring_reference_leverage <= 0:
+        errors.append("scoring reference margin and leverage must be positive")
     if any(value < 0 or value > settings.scoring_engine_max_slot_multiplier for value in multipliers):
         errors.append("tier allocation multipliers must be between 0 and the maximum slot multiplier")
     if settings.live and settings.db_path.resolve() == settings.scoring_seed_db_path.resolve():
@@ -3108,8 +3118,15 @@ class ScoringEngine:
                 explanation=explanation,
             )
 
-        realized = sum(float(row["paper_gain"] or 0.0) for row in rows)
+        actual_realized = sum(float(row["paper_gain"] or 0.0) for row in rows)
         pnls = [float(row["pnl_pct"]) for row in rows]
+        normalized_return_pct = sum(pnls)
+        realized = (
+            normalized_return_pct
+            / 100.0
+            * self.settings.scoring_reference_margin_usd
+            * self.settings.scoring_reference_leverage
+        )
         sample_weight = self._clamp(sample_size / 12.0, 0.0, 1.0)
 
         if sample_size:
@@ -3163,7 +3180,13 @@ class ScoringEngine:
         else:
             tier = "Bench"
 
-        parts = [f"sample={sample_size}", f"realized=${realized:.2f}", f"score={total:.1f}"]
+        parts = [
+            f"sample={sample_size}",
+            f"normalized=${realized:.2f}",
+            f"return={normalized_return_pct:+.3f}%",
+            f"actual=${actual_realized:.2f}",
+            f"score={total:.1f}",
+        ]
         if win_rate is not None:
             parts.append(f"win={win_rate:.0%}")
         if avg_pct is not None:

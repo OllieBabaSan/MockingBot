@@ -151,6 +151,13 @@ including gains observed after a restart. After an intentional deposit or
 withdrawal, explicitly rebase it to verified current equity with the no-order
 command `python .\MockingBot.py reset-live-risk-baseline`. The command is blocked
 while another live bot instance owns the data directory.
+Wallet quality is scored from allocation-independent percentage returns. Each
+copied exit is projected onto a fixed `$1,000` margin position at `3x` for the
+profitability component (`SCORING_REFERENCE_MARGIN_USD` and
+`SCORING_REFERENCE_LEVERAGE`). This preserves the original paper-test score
+scale while preventing Paper's `$10,000` account or larger tier allocations from
+mechanically overpowering outcomes from the `$500` Live account. Actual dollar
+PnL remains in the trade ledger and score explanation for reporting only.
 Leverage is also verified from live clearinghouse position state. New entries
 require a successful leverage-update response and post-fill confirmation;
 same-coin additions require the existing exchange leverage to match the local
