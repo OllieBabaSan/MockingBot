@@ -2255,6 +2255,10 @@ class HyperliquidAdapter(PlatformAdapter):
             "validate_live_credentials",
             signer,
         )
+        if role is None:
+            raise RuntimeError(
+                "Live startup blocked: unable to verify API wallet role"
+            )
         if not isinstance(role, dict) or role.get("role") != "agent":
             raise RuntimeError("Live startup blocked: configured API wallet is not an active agent")
         linked_user = role.get("data", {}).get("user")

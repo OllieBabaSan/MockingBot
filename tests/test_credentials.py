@@ -79,6 +79,25 @@ class CredentialTests(unittest.TestCase):
             finally:
                 store.conn.close()
 
+    def test_role_connectivity_failure_is_not_reported_as_inactive_agent(self) -> None:
+        fake_account = types.SimpleNamespace(
+            from_key=lambda _key: types.SimpleNamespace(address=TEST_AGENT)
+        )
+        with tempfile.TemporaryDirectory() as td:
+            configured = settings(Path(td), live=True)
+            store = core.Store(configured.db_path)
+            try:
+                adapter = core.HyperliquidAdapter(configured, store)
+                adapter._post_info = lambda *_args, **_kwargs: None
+                with patch.dict(
+                    sys.modules,
+                    {"eth_account": types.SimpleNamespace(Account=fake_account)},
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "unable to verify"):
+                        adapter.validate_live_credentials()
+            finally:
+                store.conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()
