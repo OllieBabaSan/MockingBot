@@ -3624,9 +3624,9 @@ class RiskManager:
         existing = paper.position(coin)
         if existing is not None and existing["side"] != side:
             return TradeDecision("SKIP", "opposite side already held")
-        if self.settings.live and existing is not None:
-            return TradeDecision("SKIP", "live slice close unsupported")
-        if coin in live_held:
+        if self.settings.live and existing is not None and coin not in live_held:
+            return TradeDecision("SKIP", "local position missing live")
+        if coin in live_held and existing is None:
             return TradeDecision("SKIP", "coin already held")
         if paper.owns_position(wallet, coin, side):
             allocation_count = paper.allocation_count_for_wallet_coin_side(wallet, coin, side)
@@ -4577,6 +4577,11 @@ class CopyTradingBot:
             for event in events:
                 if event.kind in {"ENTRY", "ADD"}:
                     self._handle_entry(event, wind_down, live_held)
+                    if (
+                        live_held is not None
+                        and self.paper.position(event.coin) is not None
+                    ):
+                        live_held.add(event.coin)
                 elif event.kind == "EXIT":
                     self._handle_exit(event)
                     # A flip is persisted as EXIT then ENTRY. Refresh the local

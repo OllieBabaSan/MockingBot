@@ -25,6 +25,7 @@ STATE_REASONS = {
     "opposite side already held",
     "wind-down",
     "live positions unknown",
+    "local position missing live",
 }
 STATE_REASON_PREFIXES = (
     "coin quarantined:",

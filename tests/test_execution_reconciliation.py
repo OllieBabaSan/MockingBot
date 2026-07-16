@@ -165,6 +165,30 @@ class ExecutionReconciliationTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual((audit["requested_leverage"], audit["leverage"]), (5.0, 3.0))
 
+    def test_live_risk_allows_only_synchronized_same_side_adds(self) -> None:
+        paper = core.PaperPortfolio(self.settings, self.store)
+        paper.open("wallet-a", "BTC", "LONG", 100.0, 10.0, leverage=3)
+        risk = core.RiskManager(self.settings, self.store, core.Notifier(""))
+
+        new_wallet = risk.allow_entry(
+            "wallet-b", "BTC", "LONG", paper, False, {"BTC"}
+        )
+        same_wallet_add = risk.allow_entry(
+            "wallet-a", "BTC", "LONG", paper, False, {"BTC"},
+            allow_same_wallet_add=True,
+        )
+        unsynchronized = risk.allow_entry(
+            "wallet-b", "BTC", "LONG", paper, False, set()
+        )
+        unowned = risk.allow_entry(
+            "wallet-b", "ETH", "LONG", paper, False, {"ETH"}
+        )
+
+        self.assertEqual(new_wallet.action, "EXECUTE")
+        self.assertEqual(same_wallet_add.action, "EXECUTE")
+        self.assertEqual(unsynchronized.reason, "local position missing live")
+        self.assertEqual(unowned.reason, "coin already held")
+
     def test_preflight_rejects_asset_leverage_above_exchange_maximum(self) -> None:
         exchange = FakeExchange([])
         self.adapter._exchange = exchange
