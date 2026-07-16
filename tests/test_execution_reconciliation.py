@@ -441,6 +441,30 @@ class ExecutionReconciliationTests(unittest.TestCase):
         bot._reconcile_live_book({"BTC": core.Position("BTC", "LONG", 0.30, 100.0, 3)})
         self.assertIsNone(self.store.coin_quarantine("SOL"))
 
+    def test_one_percent_size_tolerance_and_rounding_floor(self) -> None:
+        paper = core.PaperPortfolio(self.settings, self.store)
+        paper.open("wallet", "BTC", "LONG", 100.0, 10.0, leverage=3)
+        bot = core.CopyTradingBot.__new__(core.CopyTradingBot)
+        bot.settings = self.settings
+        bot.store = self.store
+        bot.paper = paper
+        bot.platform = self.adapter
+
+        bot._reconcile_live_book(
+            {"BTC": core.Position("BTC", "LONG", 0.302, 100.0, 3)}
+        )
+        self.assertIsNone(self.store.coin_quarantine("BTC"))
+        snapshot = self.store.get_json("live_position_snapshot", {})["BTC"]
+        self.assertAlmostEqual(snapshot["size_difference"], 0.002)
+        self.assertAlmostEqual(snapshot["size_tolerance"], 0.003)
+
+        bot._reconcile_live_book(
+            {"BTC": core.Position("BTC", "LONG", 0.304, 100.0, 3)}
+        )
+        quarantine = self.store.coin_quarantine("BTC")
+        self.assertEqual(quarantine["reason"], "live size mismatch")
+        self.assertIn("tolerance=0.003", quarantine["details"])
+
 
 if __name__ == "__main__":
     unittest.main()

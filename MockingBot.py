@@ -237,6 +237,7 @@ class Settings:
     min_slot_usd: float = env_float("MIN_SLOT_USD", 5.0)
     min_order_notional: float = env_float("MIN_ORDER_NOTIONAL", 11.0)
     live_margin_reserve_pct: float = env_float("LIVE_MARGIN_RESERVE_PCT", 0.05)
+    live_size_tolerance_pct: float = env_float("LIVE_SIZE_TOLERANCE_PCT", 0.01)
     slippage: float = env_float("SLIPPAGE", 0.01)
     scoring_engine_default_candidate_multiplier: float = env_float(
         "SCORING_ENGINE_DEFAULT_CANDIDATE_MULT",
@@ -323,6 +324,7 @@ def settings_fingerprint(settings: Settings) -> str:
         "elite_leverage": settings.scoring_engine_elite_leverage,
         "max_positions": settings.max_positions,
         "live_margin_reserve_pct": settings.live_margin_reserve_pct,
+        "live_size_tolerance_pct": settings.live_size_tolerance_pct,
         "max_slices_per_coin": settings.max_slices_per_coin,
         "max_coin_cost_multiplier": settings.max_coin_cost_multiplier,
         "max_allocations_per_wallet_coin_side": settings.max_allocations_per_wallet_coin_side,
@@ -371,6 +373,8 @@ def validate_settings(settings: Settings) -> None:
         errors.append("minimum order and slot values must be positive")
     if not 0 <= settings.live_margin_reserve_pct < 1:
         errors.append("LIVE_MARGIN_RESERVE_PCT must be between 0 and 1")
+    if not 0 < settings.live_size_tolerance_pct <= 0.01:
+        errors.append("LIVE_SIZE_TOLERANCE_PCT must be greater than 0 and at most 0.01")
     multipliers = (
         settings.scoring_engine_default_candidate_multiplier,
         settings.scoring_engine_candidate_multiplier,
@@ -3792,18 +3796,15 @@ class CopyTradingBot:
 
     def _reconcile_live_book(self, live_positions: dict[str, Position]) -> None:
         local_positions = self.paper.positions()
-        self.store.set_json(
-            "live_position_snapshot",
-            {
-                coin: {
-                    "side": position.side,
-                    "size": position.size,
-                    "entry_price": position.entry_price,
-                    "leverage": position.leverage,
-                }
-                for coin, position in live_positions.items()
-            },
-        )
+        live_snapshot = {
+            coin: {
+                "side": position.side,
+                "size": position.size,
+                "entry_price": position.entry_price,
+                "leverage": position.leverage,
+            }
+            for coin, position in live_positions.items()
+        }
         quarantined = {str(row["coin"]) for row in self.store.quarantined_coins()}
         for coin in sorted(set(local_positions) | set(live_positions) | quarantined):
             local = local_positions.get(coin)
@@ -3851,15 +3852,29 @@ class CopyTradingBot:
                 rounding_tolerance = 10 ** (-self.platform._sz_decimals.get(coin, 4)) * 2
             else:
                 rounding_tolerance = 0.0
-            tolerance = max(expected_size * 0.05, rounding_tolerance)
-            if expected_size > 0 and abs(live.size - expected_size) > tolerance:
+            tolerance = max(
+                expected_size * self.settings.live_size_tolerance_pct,
+                rounding_tolerance,
+            )
+            size_difference = abs(live.size - expected_size)
+            live_snapshot[coin].update(
+                {
+                    "expected_size": expected_size,
+                    "size_difference": size_difference,
+                    "size_tolerance": tolerance,
+                    "size_synchronized": size_difference <= tolerance,
+                }
+            )
+            if expected_size > 0 and size_difference > tolerance:
                 self.store.quarantine_coin(
                     coin,
                     "live size mismatch",
-                    f"local={expected_size:.10g} live={live.size:.10g}",
+                    f"local={expected_size:.10g} live={live.size:.10g} "
+                    f"difference={size_difference:.10g} tolerance={tolerance:.10g}",
                 )
                 continue
             self.store.clear_coin_quarantine(coin)
+        self.store.set_json("live_position_snapshot", live_snapshot)
 
     def _handle_entry(self, event: CopyEvent, wind_down: bool, live_held: set[str] | None) -> None:
         self.token_risk.observe(event)

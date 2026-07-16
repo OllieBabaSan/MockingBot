@@ -111,3 +111,8 @@ require a successful leverage-update response and post-fill confirmation;
 same-coin additions require the existing exchange leverage to match the local
 coin leverage. Mismatches quarantine that coin and are visible as local versus
 Hyperliquid leverage on the Live dashboard.
+Live size reconciliation starts at a 1% relative tolerance
+(`LIVE_SIZE_TOLERANCE_PCT=0.01`) with a floor of two exchange size increments.
+The setting cannot exceed 1%. The Live dashboard shows measured size difference
+and permitted tolerance; synchronized positions clear their quarantine
+automatically.

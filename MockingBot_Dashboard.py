@@ -335,6 +335,9 @@ def dashboard_data() -> dict[str, Any]:
         for position in positions:
             live_position = live_position_snapshot.get(position["coin"], {})
             position["exchange_leverage"] = live_position.get("leverage")
+            position["exchange_size"] = live_position.get("size")
+            position["size_difference"] = live_position.get("size_difference")
+            position["size_tolerance"] = live_position.get("size_tolerance")
         open_cost = sum(float(a["cost_basis"]) for a in allocations)
         open_pnl_known = all(a["pnl_usd"] is not None for a in allocations)
         open_pnl = sum(float(a["pnl_usd"] or 0.0) for a in allocations) if open_pnl_known else None
@@ -723,11 +726,14 @@ HTML = r"""<!doctype html>
           </tr>`), "No quarantined coins.");
       }
 
-      table(document.getElementById("positions"), ["Coin", "Side", "Alloc", "Local Lev", "HL Lev", "Cost", "Entry", "Last", "Open PnL", "Wallets", "Status"],
+      table(document.getElementById("positions"), ["Coin", "Side", "Alloc", "Local Lev", "HL Lev", "HL Size", "Δ / Tol", "Cost", "Entry", "Last", "Open PnL", "Wallets", "Status"],
         data.positions.map(p => `<tr>
           <td><strong>${esc(p.coin)}</strong></td><td><span class="pill">${esc(p.side)}</span></td>
           <td>${p.allocation_count}</td><td>${Number(p.leverage).toFixed(1)}x</td>
-          <td>${p.exchange_leverage ? `${Number(p.exchange_leverage).toFixed(1)}x` : "n/a"}</td><td>${fmtMoney(p.cost_basis)}</td>
+          <td>${p.exchange_leverage ? `${Number(p.exchange_leverage).toFixed(1)}x` : "n/a"}</td>
+          <td>${p.exchange_size === null || p.exchange_size === undefined ? "n/a" : Number(p.exchange_size).toLocaleString()}</td>
+          <td class="${p.size_difference > p.size_tolerance ? "bad" : "muted"}">${p.size_difference === null || p.size_difference === undefined ? "n/a" : `${Number(p.size_difference).toPrecision(3)} / ${Number(p.size_tolerance).toPrecision(3)}`}</td>
+          <td>${fmtMoney(p.cost_basis)}</td>
           <td>${Number(p.entry_price).toLocaleString(undefined, {maximumFractionDigits: 6})}</td>
           <td>${p.last_price ? Number(p.last_price).toLocaleString(undefined, {maximumFractionDigits: 6}) : "n/a"}</td>
           <td class="${clsNum(p.pnl_usd)}">${fmtMoney(p.pnl_usd)} <span class="muted">${fmtPct(p.pnl_pct)}</span></td>

@@ -58,6 +58,9 @@ class LeveragePolicyTests(unittest.TestCase):
                 core.validate_settings(replace(configured, slippage=0.021))
             with self.assertRaisesRegex(ValueError, "LIVE_MARGIN_RESERVE_PCT"):
                 core.validate_settings(replace(configured, live_margin_reserve_pct=1.0))
+            self.assertEqual(configured.live_size_tolerance_pct, 0.01)
+            with self.assertRaisesRegex(ValueError, "LIVE_SIZE_TOLERANCE_PCT"):
+                core.validate_settings(replace(configured, live_size_tolerance_pct=0.011))
 
     def test_position_pnl_uses_persisted_leverage(self) -> None:
         with tempfile.TemporaryDirectory() as td:
