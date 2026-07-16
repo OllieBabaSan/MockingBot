@@ -7,7 +7,7 @@ A clean, platform-aware copy-trading bot core.
 Design goals:
   - Platform agnostic engine: the bot talks to a PlatformAdapter interface.
   - Hyperliquid implementation: the current concrete adapter uses Hyperliquid APIs.
-  - Unattended safeguards: paper/live drawdown breakers, wind-down mode, wallet pause,
+  - Unattended safeguards: paper/live drawdown breakers, wind-down mode,
     position age limits, per-coin/per-wallet exposure limits, and API degradation checks.
   - Dropped API call recovery: bounded retries, stale snapshot handling, and periodic
     reconciliation against source wallets and local portfolio state.

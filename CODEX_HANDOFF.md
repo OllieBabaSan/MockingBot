@@ -1,6 +1,29 @@
 # MockingBot Codex Handoff
 
-Last updated: 2026-07-14
+Last updated: 2026-07-16
+
+## 2026-07-16 Live-Readiness Audit Update
+
+The earlier status below is retained as project history. The deep live audit has
+since implemented and tested:
+
+- 15% drawdown warning and persistent 25% high-water breaker.
+- Isolated live startup and no-order preflight for the four-slot test account.
+- Normalized Paper/Live wallet scoring with imported Paper score history.
+- Durable copy-event inbox and deterministic Hyperliquid client order IDs.
+- Crash recovery for entries, exits, rollbacks, and reconciliation closes.
+- Atomic local cash/allocation ledger updates.
+- Per-coin quarantine that leaves the remaining book operating.
+- Synchronized same-side live adds and allocation-specific partial exits.
+- Separate Paper and Live dashboards plus non-blocking parity comparison.
+- Breaker-aligned live equity reporting with stale-data refusal.
+- Non-blocking token-risk refresh.
+- Verified SQLite online backups with retention and dashboard status.
+
+The dormant wallet-pause subsystem was deliberately removed. Poor wallet
+performance is controlled by score demotion and Candidate allocation limits.
+Run the complete test suite and `python .\MockingBot.py preflight-live` immediately
+before any live launch. Preflight performs reads only and submits no orders.
 
 ## Project Goal
 
@@ -197,4 +220,3 @@ git add .
 git commit -m "message"
 git push
 ```
-

@@ -119,10 +119,13 @@ position leverage are both retained in the execution audit.
 Before submission, live orders are checked against Hyperliquid's per-asset
 maximum leverage and size precision. Notional is checked again after size
 rounding; predictable rejections are audited without quarantining the coin.
-Live entries also snapshot the coin position before submission. If an order
+Live entries also snapshot the coin position before submission and persist a
+deterministic Hyperliquid client order ID before placing the order. If an order
 response is lost, a measured position increase is recovered as the fill; an
 unchanged position is a clean failure, while unverifiable state quarantines only
-that coin. Ambiguous entries are never automatically resubmitted.
+that coin. A crash between journal write and submission is resubmitted only when
+Hyperliquid explicitly reports that client order ID as unknown, and the same ID
+is reused. Other ambiguous states are not resubmitted.
 Close responses receive the same state-based recovery. Verified flatness is
 required before the local allocation is cleared; a measured partial close gets
 one residual-close attempt, and unresolved residuals remain tracked and
@@ -131,6 +134,10 @@ When several wallets share a coin position, exits use Hyperliquid's reduce-only
 `market_close` size parameter for only the exiting wallet's reconstructed fill
 size. The measured reduction must match before that wallet's local slices are
 removed; unrelated wallet allocations remain open.
+Same-side live additions are supported only when the local and Hyperliquid books
+are synchronized. Adds inherit the coin's existing leverage, create a separate
+wallet allocation slice, and remain subject to wallet, slice, coin-cost, and
+buying-power limits.
 Confirmed average close fills drive live-ledger realized PnL and copied-wallet
 scoring. The execution audit retains the pre-order quote, adverse slippage in
 basis points, and whether pricing came from an exchange fill or a midpoint
@@ -179,3 +186,14 @@ gets one reduce-only rollback for exactly that fill size. Confirmed rollback
 restores the pre-entry size without retrying the entry. Failed or unverifiable
 rollback produces a prominent `ENTRY ROLLBACK FAILED` coin quarantine and
 notification while the remaining book continues.
+
+Live state is backed up at startup and every six hours by default using SQLite's
+online backup API (`BACKUP_INTERVAL_SECS`). A snapshot is published only after
+`PRAGMA integrity_check` succeeds, and the newest 14 copies are retained by
+default (`BACKUP_RETENTION_COUNT`, minimum 2). Backup files remain inside the
+ignored live data directory. The Live dashboard reports backup age and failures.
+
+The Live dashboard uses the exact equity observation used by the risk manager,
+including Unified Account handling. After 90 seconds without a fresh bot equity
+observation it displays live equity and drawdown as unavailable; the separately
+labeled local ledger estimate is never substituted for exchange equity.
