@@ -3,6 +3,12 @@
 MockingBot is a Hyperliquid copy-trading bot with isolated paper/live state,
 wallet scoring, and a local monitoring dashboard.
 
+Install the live-execution dependency once per Python environment:
+
+```powershell
+python -m pip install -r .\requirements.txt
+```
+
 ## Main Bot
 
 ```powershell
@@ -58,6 +64,19 @@ The tests use temporary databases and fake exchange responses. They do not use
 the network, submit orders, or print credential values.
 
 ## Live Test Checklist
+
+Run the no-order preflight immediately before starting the live bot:
+
+```powershell
+python .\MockingBot.py preflight-live
+```
+
+It validates credentials and account linkage, capital, asset metadata, database
+isolation, writable runtime paths, the duplicate-instance lock, circuit-breaker
+state, and exact local/exchange position synchronization. The configured slot
+count is a launch gate. Five- and six-slot sizing are also reported as
+informational expansion checks and cannot block an otherwise safe four-slot
+launch. The command makes information requests but never submits an order.
 
 - Use credentials for the intended small live-test account only.
 - Confirm no duplicate main bot process is running.

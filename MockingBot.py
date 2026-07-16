@@ -40,7 +40,7 @@ import time
 import traceback
 import uuid
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -4170,8 +4170,211 @@ def export_signals_csv(settings: Settings, output: Path) -> None:
     print(f"Exported {len(rows)} signal(s) to {output}")
 
 
+def live_command_settings() -> Settings:
+    base = Settings()
+    explicit_data_dir = os.getenv("MOCKINGBOT_DATA_DIR", "").strip()
+    explicit_slots = os.getenv("MAX_POSITIONS", "").strip()
+    return replace(
+        base,
+        live=True,
+        data_dir=(
+            Path(explicit_data_dir)
+            if explicit_data_dir
+            else ROOT / "MockingBot_Main_Live_Test_Data"
+        ),
+        instance_id="live-main",
+        max_positions=int(explicit_slots) if explicit_slots else 4,
+    )
+
+
+def run_live_preflight(
+    settings: Settings,
+    platform: HyperliquidAdapter | Any | None = None,
+) -> bool:
+    results: list[tuple[str, str, str]] = []
+
+    def record(ok: bool, name: str, detail: str, *, blocking: bool = True) -> None:
+        status = ("PASS" if ok else "FAIL") if blocking else "INFO"
+        results.append((status, name, detail))
+
+    try:
+        validate_settings(settings)
+        record(True, "configuration", "validated")
+    except Exception as exc:
+        record(False, "configuration", str(exc))
+
+    lock = InstanceLock(settings)
+    try:
+        lock.acquire()
+        record(True, "instance lock", "no duplicate live bot detected")
+    except Exception as exc:
+        record(False, "instance lock", str(exc))
+    finally:
+        lock.release()
+
+    try:
+        settings.data_dir.mkdir(parents=True, exist_ok=True)
+        probe = settings.data_dir / f".preflight-{uuid.uuid4().hex}.tmp"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        record(True, "runtime paths", f"writable: {settings.data_dir}")
+    except Exception as exc:
+        record(False, "runtime paths", str(exc))
+
+    record(
+        not settings.circuit_breaker_file.exists(),
+        "circuit breaker",
+        "clear" if not settings.circuit_breaker_file.exists() else "wind-down marker is active",
+    )
+
+    if settings.scoring_seed_db_path.resolve() == settings.db_path.resolve():
+        record(False, "database isolation", "live and scoring databases are identical")
+    elif not settings.scoring_seed_db_path.exists():
+        record(False, "scoring seed", f"missing: {settings.scoring_seed_db_path}")
+    else:
+        try:
+            source = sqlite3.connect(
+                f"file:{settings.scoring_seed_db_path.as_posix()}?mode=ro", uri=True
+            )
+            source.execute("SELECT COUNT(*) FROM signals").fetchone()
+            source.close()
+            record(True, "database isolation", "paper scoring seed readable and separate")
+        except Exception as exc:
+            record(False, "scoring seed", str(exc))
+
+    store: Store | None = None
+    try:
+        store = Store(settings.db_path)
+        adapter = platform or HyperliquidAdapter(settings, store)
+        adapter.validate_live_credentials()
+        record(
+            True,
+            "credentials",
+            f"account={settings.hl_wallet_address[:8]}...{settings.hl_wallet_address[-4:]} "
+            f"api_wallet={settings.hl_api_wallet_address[:8]}...{settings.hl_api_wallet_address[-4:]}",
+        )
+        adapter._init_sdk()
+        asset_count = len(adapter._sz_decimals)
+        record(asset_count > 0, "asset metadata", f"{asset_count} assets loaded")
+
+        capital = adapter.capital_snapshot()
+        if capital is None:
+            record(False, "capital", "account value / margin state unavailable")
+        else:
+            reserve = capital.account_value * settings.live_margin_reserve_pct
+            usable = max(0.0, capital.available_margin - reserve)
+            record(
+                usable > 0,
+                "capital",
+                f"equity=${capital.account_value:.2f} available=${capital.available_margin:.2f} "
+                f"usable=${usable:.2f} reserve=${reserve:.2f}",
+            )
+            multipliers = {
+                "default Candidate": settings.scoring_engine_default_candidate_multiplier,
+                "Candidate": settings.scoring_engine_candidate_multiplier,
+                "proven Candidate": settings.scoring_engine_proven_candidate_multiplier,
+                "Core": settings.scoring_engine_core_multiplier,
+                "Elite": settings.scoring_engine_elite_multiplier,
+            }
+            leverages = {
+                "default Candidate": settings.scoring_engine_default_candidate_leverage,
+                "Candidate": settings.scoring_engine_candidate_leverage,
+                "proven Candidate": settings.scoring_engine_proven_candidate_leverage,
+                "Core": settings.scoring_engine_core_leverage,
+                "Elite": settings.scoring_engine_elite_leverage,
+            }
+            for slots in sorted({settings.max_positions, 5, 6}):
+                base_slot = capital.account_value / slots
+                notionals = {
+                    tier: base_slot * multiplier * leverages[tier]
+                    for tier, multiplier in multipliers.items()
+                    if multiplier > 0
+                }
+                margins = {
+                    tier: base_slot * multiplier
+                    for tier, multiplier in multipliers.items()
+                    if multiplier > 0
+                }
+                viable = (
+                    min(notionals.values()) >= settings.min_order_notional
+                    and max(margins.values()) <= usable
+                )
+                configured = slots == settings.max_positions
+                record(
+                    viable,
+                    f"{slots}-slot sizing" + (" (configured)" if configured else " (expansion)"),
+                    f"{'viable; ' if viable else 'not viable; '}"
+                    f"notional range=${min(notionals.values()):.2f}-${max(notionals.values()):.2f}; "
+                    f"largest margin=${max(margins.values()):.2f}",
+                    blocking=configured,
+                )
+
+        live_positions = adapter.live_positions()
+        if live_positions is None:
+            record(False, "position state", "unable to read live positions")
+        else:
+            identity = store.get_json("live_account_identity", {})
+            local_slices = store.open_position_slices()
+            if not identity:
+                record(
+                    not live_positions and not local_slices,
+                    "position state",
+                    "first initialization is flat" if not live_positions and not local_slices
+                    else "first initialization requires both exchange and local state flat",
+                )
+            else:
+                identity_ok = str(identity.get("wallet", "")).lower() == settings.hl_wallet_address.lower()
+                record(identity_ok, "database account", "wallet matches" if identity_ok else "database belongs to another wallet")
+                local_coins = {str(row["coin"]) for row in local_slices}
+                synchronized = local_coins == set(live_positions)
+                details: list[str] = []
+                for coin in sorted(local_coins & set(live_positions)):
+                    rows = [row for row in local_slices if str(row["coin"]) == coin]
+                    sides = {str(row["side"]) for row in rows}
+                    leverages = {float(row["leverage"]) for row in rows}
+                    expected_size = sum(
+                        float(row["cost_basis"]) * float(row["leverage"]) / float(row["entry_price"])
+                        for row in rows
+                        if float(row["entry_price"]) > 0
+                    )
+                    live = live_positions[coin]
+                    rounding_tolerance = 2 * 10 ** (-adapter._sz_decimals.get(coin, 4))
+                    tolerance = max(expected_size * settings.live_size_tolerance_pct, rounding_tolerance)
+                    coin_ok = (
+                        sides == {live.side}
+                        and len(leverages) == 1
+                        and live.leverage is not None
+                        and abs(next(iter(leverages)) - live.leverage) <= 1e-8
+                        and abs(expected_size - live.size) <= tolerance
+                    )
+                    synchronized = synchronized and coin_ok
+                    if not coin_ok:
+                        details.append(
+                            f"{coin}: expected side={sorted(sides)} size={expected_size:.10g} "
+                            f"leverage={sorted(leverages)}; live side={live.side} size={live.size:.10g} "
+                            f"leverage={live.leverage}"
+                        )
+                if local_coins != set(live_positions):
+                    details.append(f"local coins={sorted(local_coins)} live coins={sorted(live_positions)}")
+                record(synchronized, "position state", "synchronized" if synchronized else "; ".join(details))
+    except Exception as exc:
+        record(False, "live connectivity", str(exc))
+    finally:
+        if store is not None:
+            store.conn.close()
+
+    print("\n=== MOCKINGBOT LIVE PREFLIGHT ===\n")
+    for status, name, detail in results:
+        print(f"[{status}] {name}: {detail}")
+    passed = bool(results) and not any(status == "FAIL" for status, _, _ in results)
+    print(f"\nRESULT: {'PASS - no orders submitted' if passed else 'FAIL - live start blocked'}\n")
+    return passed
+
+
 def main(argv: list[str]) -> int:
     settings = Settings()
+    if len(argv) > 1 and argv[1] == "preflight-live":
+        return 0 if run_live_preflight(live_command_settings()) else 2
     if len(argv) > 1 and argv[1] == "status":
         print_status(settings)
         return 0
