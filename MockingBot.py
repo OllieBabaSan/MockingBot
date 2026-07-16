@@ -530,6 +530,7 @@ class Position:
     side: str
     size: float
     entry_price: float
+    leverage: float | None = None
 
 
 @dataclass(frozen=True)
@@ -2026,6 +2027,7 @@ class HyperliquidAdapter(PlatformAdapter):
                     side="LONG" if size > 0 else "SHORT",
                     size=abs(size),
                     entry_price=float(pos.get("entryPx") or 0),
+                    leverage=float(pos.get("leverage", {}).get("value") or 0) or None,
                 )
             return result
         except Exception as exc:
@@ -2136,6 +2138,7 @@ class HyperliquidAdapter(PlatformAdapter):
                     side="LONG" if size > 0 else "SHORT",
                     size=abs(size),
                     entry_price=float(pos.get("entryPx") or 0),
+                    leverage=float(pos.get("leverage", {}).get("value") or 0) or None,
                 )
         except Exception as exc:
             self.store.log_api_failure(self.name, "parse_live_positions", "", str(exc))
@@ -2277,10 +2280,27 @@ class HyperliquidAdapter(PlatformAdapter):
             detail = f"pre-order live side={before.side} expected={side}; no order submitted"
             self.store.quarantine_coin(coin, "pre-order side mismatch", detail)
             return reject(detail, requested_size=size, status="state_mismatch")
+        if before is not None and (
+            before.leverage is None or abs(before.leverage - leverage) > 1e-8
+        ):
+            detail = (
+                f"pre-order exchange leverage={before.leverage}x "
+                f"local={leverage}x; no order submitted"
+            )
+            self.store.quarantine_coin(coin, "exchange leverage mismatch", detail)
+            return reject(detail, requested_size=size, status="leverage_mismatch")
 
         try:
             if existing_leverage is None:
-                self._exchange.update_leverage(leverage, coin, is_cross=True)  # type: ignore[union-attr]
+                leverage_response = self._exchange.update_leverage(  # type: ignore[union-attr]
+                    leverage, coin, is_cross=True
+                )
+                if not isinstance(leverage_response, dict) or leverage_response.get("status") != "ok":
+                    return reject(
+                        f"Hyperliquid leverage update rejected: {str(leverage_response)[:300]}",
+                        requested_size=size,
+                        status="leverage_update_rejected",
+                    )
             result = self._exchange.market_open(  # type: ignore[union-attr]
                 coin, side == "LONG", size, slippage=self.settings.slippage
             )
@@ -2297,7 +2317,24 @@ class HyperliquidAdapter(PlatformAdapter):
             else:
                 fill_size, fill_price, detail = self._entry_position_delta(before, confirmed, side)
                 tolerance = 10 ** (-decimals) / 2
-                if fill_size > tolerance:
+                leverage_confirmed = (
+                    confirmed is not None
+                    and confirmed.leverage is not None
+                    and abs(confirmed.leverage - leverage) <= 1e-8
+                )
+                if fill_size > tolerance and not leverage_confirmed:
+                    leverage_detail = (
+                        f"exchange leverage={confirmed.leverage if confirmed else None}x "
+                        f"expected={leverage}x after measured fill={fill_size:g}"
+                    )
+                    execution = ExecutionResult(
+                        True, size, fill_size, fill_price or execution.avg_fill_price or price,
+                        execution.order_id, "leverage_mismatch", False, leverage_detail,
+                    )
+                    self.store.quarantine_coin(
+                        coin, "post-entry leverage mismatch", leverage_detail
+                    )
+                elif fill_size > tolerance:
                     execution = ExecutionResult(
                         True, size, fill_size, fill_price or execution.avg_fill_price or price,
                         execution.order_id,
@@ -2323,7 +2360,24 @@ class HyperliquidAdapter(PlatformAdapter):
             else:
                 fill_size, fill_price, delta_detail = self._entry_position_delta(before, confirmed, side)
                 tolerance = 10 ** (-decimals) / 2
-                if fill_size > tolerance:
+                leverage_confirmed = (
+                    confirmed is not None
+                    and confirmed.leverage is not None
+                    and abs(confirmed.leverage - leverage) <= 1e-8
+                )
+                if fill_size > tolerance and not leverage_confirmed:
+                    detail = (
+                        f"recovered fill after error but exchange leverage="
+                        f"{confirmed.leverage if confirmed else None}x expected={leverage}x"
+                    )
+                    self.store.quarantine_coin(
+                        coin, "post-entry leverage mismatch", detail
+                    )
+                    result = ExecutionResult(
+                        True, size, fill_size, fill_price or price,
+                        status="leverage_mismatch", confirmed=False, detail=detail,
+                    )
+                elif fill_size > tolerance:
                     detail = f"recovered after submission error: {exc}; {delta_detail}"
                     result = ExecutionResult(
                         True, size, fill_size, fill_price or price,
@@ -3738,6 +3792,18 @@ class CopyTradingBot:
 
     def _reconcile_live_book(self, live_positions: dict[str, Position]) -> None:
         local_positions = self.paper.positions()
+        self.store.set_json(
+            "live_position_snapshot",
+            {
+                coin: {
+                    "side": position.side,
+                    "size": position.size,
+                    "entry_price": position.entry_price,
+                    "leverage": position.leverage,
+                }
+                for coin, position in live_positions.items()
+            },
+        )
         quarantined = {str(row["coin"]) for row in self.store.quarantined_coins()}
         for coin in sorted(set(local_positions) | set(live_positions) | quarantined):
             local = local_positions.get(coin)
@@ -3760,6 +3826,18 @@ class CopyTradingBot:
                     coin,
                     "live side mismatch",
                     f"local={local['side']} live={live.side}",
+                )
+                continue
+            local_leverage = self.store.position_leverage(coin)
+            if (
+                local_leverage is None
+                or live.leverage is None
+                or abs(local_leverage - live.leverage) > 1e-8
+            ):
+                self.store.quarantine_coin(
+                    coin,
+                    "exchange leverage mismatch",
+                    f"local={local_leverage}x live={live.leverage}x",
                 )
                 continue
             expected_size = sum(

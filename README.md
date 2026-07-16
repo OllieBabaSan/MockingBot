@@ -106,3 +106,8 @@ the smaller available amount after a default 5% equity reserve
 (`LIVE_MARGIN_RESERVE_PCT`). If the snapshot is unavailable, entries stop while
 exits continue. The Live dashboard reports available/usable margin and the
 variance between exchange equity and the local comparison ledger.
+Leverage is also verified from live clearinghouse position state. New entries
+require a successful leverage-update response and post-fill confirmation;
+same-coin additions require the existing exchange leverage to match the local
+coin leverage. Mismatches quarantine that coin and are visible as local versus
+Hyperliquid leverage on the Live dashboard.

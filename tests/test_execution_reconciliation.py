@@ -34,7 +34,7 @@ class ExecutionReconciliationTests(unittest.TestCase):
         self.adapter._exchange = FakeExchange([unclear])
         states = iter([
             (True, None),
-            (True, core.Position("BTC", "LONG", 0.12, 101.0)),
+            (True, core.Position("BTC", "LONG", 0.12, 101.0, 3)),
         ])
         self.adapter._confirmed_position = lambda _coin: next(states)
         result = self.adapter.open_position("BTC", "LONG", 12.0, 100.0, 3)
@@ -62,8 +62,8 @@ class ExecutionReconciliationTests(unittest.TestCase):
         exchange = FakeExchange([fill_response()])
         self.adapter._exchange = exchange
         states = iter([
-            (True, core.Position("BTC", "LONG", 0.30, 100.0)),
-            (True, core.Position("BTC", "LONG", 0.42, 100.0)),
+            (True, core.Position("BTC", "LONG", 0.30, 100.0, 3)),
+            (True, core.Position("BTC", "LONG", 0.42, 100.0, 3)),
         ])
         self.adapter._confirmed_position = lambda _coin: next(states)
 
@@ -88,6 +88,57 @@ class ExecutionReconciliationTests(unittest.TestCase):
         self.assertIn("exceeds BTC maximum 2x", result.detail)
         self.assertEqual(exchange.opens, 0)
         self.assertIsNone(self.store.coin_quarantine("BTC"))
+
+    def test_rejected_leverage_update_blocks_order_submission(self) -> None:
+        exchange = FakeExchange([])
+        exchange.leverage_response = {"status": "err", "response": "rejected"}
+        self.adapter._exchange = exchange
+        self.adapter._confirmed_position = lambda _coin: (True, None)
+
+        result = self.adapter.open_position("BTC", "LONG", 12.0, 100.0, 3)
+
+        self.assertFalse(result)
+        self.assertEqual(result.status, "leverage_update_rejected")
+        self.assertEqual(exchange.opens, 0)
+        self.assertEqual(exchange.leverages, [3])
+
+    def test_existing_exchange_leverage_mismatch_blocks_add(self) -> None:
+        paper = core.PaperPortfolio(self.settings, self.store)
+        paper.open("wallet", "BTC", "LONG", 100, 10, leverage=3)
+        exchange = FakeExchange([])
+        self.adapter._exchange = exchange
+        self.adapter._confirmed_position = lambda _coin: (
+            True, core.Position("BTC", "LONG", 0.30, 100, 2)
+        )
+
+        result = self.adapter.open_position("BTC", "LONG", 12.0, 100.0, 3)
+
+        self.assertFalse(result)
+        self.assertEqual(result.status, "leverage_mismatch")
+        self.assertEqual(exchange.opens, 0)
+        self.assertEqual(
+            self.store.coin_quarantine("BTC")["reason"], "exchange leverage mismatch"
+        )
+
+    def test_post_fill_exchange_leverage_mismatch_quarantines_coin(self) -> None:
+        exchange = FakeExchange([fill_response()])
+        self.adapter._exchange = exchange
+        states = iter([
+            (True, None),
+            (True, core.Position("BTC", "LONG", 0.12, 100, 2)),
+        ])
+        self.adapter._confirmed_position = lambda _coin: next(states)
+
+        result = self.adapter.open_position("BTC", "LONG", 12.0, 100.0, 3)
+
+        self.assertFalse(result)
+        self.assertTrue(result.accepted)
+        self.assertFalse(result.confirmed)
+        self.assertEqual(result.status, "leverage_mismatch")
+        self.assertEqual(
+            self.store.coin_quarantine("BTC")["reason"],
+            "post-entry leverage mismatch",
+        )
 
     def test_preflight_checks_notional_after_size_rounding(self) -> None:
         exchange = FakeExchange([])
@@ -157,7 +208,7 @@ class ExecutionReconciliationTests(unittest.TestCase):
         self.adapter._exchange = exchange
         states = iter([
             (True, None),
-            (True, core.Position("BTC", "LONG", 0.12, 101.0)),
+            (True, core.Position("BTC", "LONG", 0.12, 101.0, 3)),
         ])
         self.adapter._confirmed_position = lambda _coin: next(states)
 
@@ -380,14 +431,14 @@ class ExecutionReconciliationTests(unittest.TestCase):
         self.store.quarantine_coin("BTC", "temporary")
         bot._reconcile_live_book(
             {
-                "BTC": core.Position("BTC", "LONG", 0.30, 100.0),
-                "SOL": core.Position("SOL", "SHORT", 0.20, 50.0),
+                "BTC": core.Position("BTC", "LONG", 0.30, 100.0, 3),
+                "SOL": core.Position("SOL", "SHORT", 0.20, 50.0, 3),
             }
         )
         self.assertIsNone(self.store.coin_quarantine("BTC"))
         self.assertEqual(self.store.coin_quarantine("SOL")["reason"], "unowned live position")
 
-        bot._reconcile_live_book({"BTC": core.Position("BTC", "LONG", 0.30, 100.0)})
+        bot._reconcile_live_book({"BTC": core.Position("BTC", "LONG", 0.30, 100.0, 3)})
         self.assertIsNone(self.store.coin_quarantine("SOL"))
 
 

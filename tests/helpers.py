@@ -45,9 +45,11 @@ class FakeExchange:
         self.closes = 0
         self.close_sizes: list[float | None] = []
         self.leverages: list[int] = []
+        self.leverage_response: dict[str, Any] = {"status": "ok", "response": {"type": "default"}}
 
-    def update_leverage(self, leverage: int, *_args: Any, **_kwargs: Any) -> None:
+    def update_leverage(self, leverage: int, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
         self.leverages.append(leverage)
+        return self.leverage_response
 
     def market_open(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
         self.opens += 1
