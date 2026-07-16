@@ -36,22 +36,13 @@ the bot for these unless a critical issue appears.
   once. This could support faster effective polling, such as 15-second cadence,
   without hammering the API as the roster grows.
 
-## Pause Logic Follow-Up
+## Wallet Pause Decision
 
-- Current pause behavior is likely too blunt for a top-200 wallet cohort.
-  Evidence: a paused wallet is carrying a large share of current unrealized
-  upside.
-- Mature design stance: Scoring Engine ranking/allocation should be the normal
-  intervention. A wallet that loses its edge should organically receive less
-  allocation and move from Elite/Core toward Candidate or Bench.
-- Do not add or preserve separate pause/circuit breaker/stop-loss behavior unless future
-  data proves it is necessary. These were short-term safety concepts, not the
-  preferred mature architecture.
-- At the next planned maintenance stop, remove or disable normal wallet pause
-  enforcement unless a critical safety issue appears first.
-- Discard stop-loss behavior for now. Continue observing future data to decide
-  whether copied trades experience drawdowns that justify a separate stop-loss
-  mechanism.
+- Wallet pausing was retired before live launch. Scoring Engine demotion and
+  reduced Candidate allocation are the deliberate response to deteriorating
+  wallet performance.
+- Do not reintroduce wallet pausing or stop-loss behavior without new evidence
+  and a separately reviewed design.
 
 ## Allocation Follow-Up
 
@@ -160,7 +151,7 @@ the bot for these unless a critical issue appears.
 
 - Create a mobile-optimized dashboard for operating a profitable copy-trading bot.
 - Include paper equity curve, open positions, realized and unrealized PnL,
-  recent signals, skipped signal reasons, wallet roster health, paused wallets,
+  recent signals, skipped signal reasons, wallet roster health,
   API failures, cash reserve, and exposure.
 - Regular checkups should include the operating-risk cluster:
   cash reserve percentage, open position count, open cost basis, notional
@@ -171,8 +162,8 @@ the bot for these unless a critical issue appears.
   per-wallet contribution, per-wallet skipped signals, per-coin exposure,
   concentration by wallet and coin, realized win/loss count, average realized
   exit PnL, largest realized loss, largest open unrealized loss, API failure
-  rate, time since last signal, time since last successful scan, current roster
-  size, and paused-wallet count.
+  rate, time since last signal, time since last successful scan, and current
+  roster size.
 - Every fifth checkup should include a direct activity verification pass:
   inspect the latest monitor log lines, confirm the Python process is alive,
   query the SQLite database directly, compare latest log paper value against

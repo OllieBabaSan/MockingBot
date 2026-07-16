@@ -218,7 +218,6 @@ class Settings:
     min_sample: int = env_int("MIN_SAMPLE", 20)
     min_win_rate: float = env_float("MIN_WIN_RATE", 0.55)
     min_profit_factor: float = env_float("MIN_PF", 1.50)
-    min_pause_hours: int = env_int("MIN_PAUSE_HOURS", 48)
     scoring_engine_active: bool = env_bool("SCORING_ENGINE_ACTIVE", env_bool("MARSHAL_ACTIVE", True))
 
     paper_starting_cash: float = env_float("PAPER_STARTING_CASH", 10_000.0)
@@ -276,11 +275,6 @@ class Settings:
     wind_down: bool = env_bool("WIND_DOWN", False)
     max_drawdown_pct: float = env_float("MAX_DRAWDOWN_PCT", 0.25)
     warning_drawdown_pct: float = env_float("WARNING_DRAWDOWN_PCT", 0.15)
-    min_loss_pct_to_pause: float = env_float("MIN_LOSS_PCT_TO_PAUSE", 1.0)
-    pause_recent_exits: int = env_int("PAUSE_RECENT_EXITS", 3)
-    pause_loss_count: int = env_int("PAUSE_LOSS_COUNT", 2)
-    pause_cumulative_loss_pct: float = env_float("PAUSE_CUMULATIVE_LOSS_PCT", 2.0)
-    pause_emergency_loss_pct: float = env_float("PAUSE_EMERGENCY_LOSS_PCT", 5.0)
     max_position_days: int = env_int("MAX_POSITION_DAYS", 7)
 
     hl_api_key: str = MAIN_CREDENTIALS["api_key"] or env_str("HL_API_KEY", "")
@@ -711,14 +705,6 @@ class Store:
                 exit_price REAL,
                 paper_gain REAL,
                 pnl_pct REAL
-            );
-
-            CREATE TABLE IF NOT EXISTS paused_wallets (
-                wallet TEXT PRIMARY KEY,
-                paused_at TEXT NOT NULL,
-                coin TEXT,
-                pnl_pct REAL,
-                reason TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS signals (
@@ -1287,32 +1273,6 @@ class Store:
     def delete_paper_position(self, coin: str) -> None:
         self.conn.execute("DELETE FROM paper_positions WHERE coin = ?", (coin,))
         self.conn.commit()
-
-    def pause_wallet(self, wallet: str, coin: str, pnl_pct: float, reason: str) -> None:
-        self.conn.execute(
-            """
-            INSERT INTO paused_wallets(wallet, paused_at, coin, pnl_pct, reason)
-            VALUES(?, ?, ?, ?, ?)
-            ON CONFLICT(wallet) DO UPDATE SET
-                paused_at = excluded.paused_at,
-                coin = excluded.coin,
-                pnl_pct = excluded.pnl_pct,
-                reason = excluded.reason
-            """,
-            (wallet, utc_now(), coin, pnl_pct, reason),
-        )
-        self.conn.commit()
-
-    def unpause_wallet(self, wallet: str) -> None:
-        self.conn.execute("DELETE FROM paused_wallets WHERE wallet = ?", (wallet,))
-        self.conn.commit()
-
-    def paused_wallets(self) -> dict[str, sqlite3.Row]:
-        rows = self.conn.execute("SELECT * FROM paused_wallets").fetchall()
-        return {r["wallet"]: r for r in rows}
-
-    def is_paused(self, wallet: str) -> bool:
-        return wallet in self.paused_wallets()
 
     def log_signal(
         self,
@@ -2953,16 +2913,6 @@ class RiskManager:
             self.notifier.send(msg)
         self._warning_active = warning
 
-    def effective_loss_pct(self, drawdown: float) -> float:
-        if drawdown >= self.settings.warning_drawdown_pct:
-            return self.settings.min_loss_pct_to_pause / 2
-        return self.settings.min_loss_pct_to_pause
-
-    def effective_pause_hours(self, drawdown: float) -> int:
-        if drawdown >= self.settings.warning_drawdown_pct:
-            return self.settings.min_pause_hours * 2
-        return self.settings.min_pause_hours
-
     def check_circuit_breaker(self, start_value: float, current_value: float) -> bool:
         dd = self.drawdown(start_value, current_value)
         if dd < self.settings.max_drawdown_pct:
@@ -3015,47 +2965,6 @@ class RiskManager:
         if existing is None and len(paper.positions()) >= self.settings.max_positions:
             return TradeDecision("SKIP", "position cap")
         return TradeDecision("EXECUTE")
-
-    def maybe_pause_wallet(self, wallet: str, coin: str, pnl_pct: float | None, threshold: float) -> None:
-        return
-        if pnl_pct is None:
-            return
-        emergency_threshold = max(threshold, self.settings.pause_emergency_loss_pct)
-        if pnl_pct <= -emergency_threshold:
-            reason = f"emergency loss {pnl_pct:+.2f}%"
-            self.store.pause_wallet(wallet, coin, pnl_pct, reason)
-            print(f"[PAUSE] {wallet[:16]} paused after {coin} {reason}")
-            return
-
-        rows = self.store.conn.execute(
-            """
-            SELECT coin, pnl_pct
-            FROM signals
-            WHERE wallet = ?
-              AND signal = 'EXIT'
-              AND action = 'EXECUTED'
-              AND pnl_pct IS NOT NULL
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (wallet, self.settings.pause_recent_exits),
-        ).fetchall()
-        if len(rows) < self.settings.pause_recent_exits:
-            return
-
-        pnls = [float(row["pnl_pct"]) for row in rows]
-        loss_count = sum(1 for value in pnls if value < 0)
-        cumulative = sum(pnls)
-        if (
-            loss_count >= self.settings.pause_loss_count
-            and cumulative <= -self.settings.pause_cumulative_loss_pct
-        ):
-            reason = (
-                f"{loss_count}/{len(pnls)} recent exits lost; "
-                f"cumulative {cumulative:+.2f}%"
-            )
-            self.store.pause_wallet(wallet, coin, cumulative, reason)
-            print(f"[PAUSE] {wallet[:16]} paused: {reason}")
 
 
 # ---------------------------------------------------------------------------
@@ -3450,7 +3359,7 @@ class RosterService:
         cursor = int(cycle.get("cursor", 0) or 0)
         return bool(candidates) and cursor < len(candidates)
 
-    def load_or_refresh(self, force: bool = False, pause_hours: int | None = None) -> list[str]:
+    def load_or_refresh(self, force: bool = False) -> list[str]:
         last = float(self.store.get_json("last_roster_refresh", 0))
         cached = self.store.roster()
         config_changed = self.store.get_json("last_roster_config", {}) != self._config_signature()
@@ -3464,9 +3373,9 @@ class RosterService:
             return cached
         if cached and config_changed:
             print("[ROSTER] Settings changed; rebuilding roster")
-        return self.refresh(pause_hours=pause_hours)
+        return self.refresh()
 
-    def refresh(self, pause_hours: int | None = None) -> list[str]:
+    def refresh(self) -> list[str]:
         follow_limit = self.settings.max_follow if self.settings.max_follow > 0 else self.settings.roster_size
         cached_roster = self.store.roster()
         signature = self._config_signature()
@@ -3620,7 +3529,7 @@ class Reconciler:
         self.paper = paper
         self.risk = risk
 
-    def run(self, wallets: list[str], loss_threshold: float) -> None:
+    def run(self, wallets: list[str]) -> None:
         slices = self.store.open_position_slices()
         if not slices:
             return
@@ -3634,7 +3543,7 @@ class Reconciler:
             except Exception:
                 age_days = 0
             if age_days > self.settings.max_position_days:
-                self._force_close(coin, pos["source_wallet"], pos["side"], "position timeout", loss_threshold)
+                self._force_close(coin, pos["source_wallet"], pos["side"], "position timeout")
 
         for wallet in wallets:
             current = self.platform.positions(wallet)
@@ -3648,9 +3557,9 @@ class Reconciler:
                 if source and source.side == pos["side"]:
                     continue
                 reason = "source closed" if source is None else "source flipped"
-                self._force_close(coin, wallet, pos["side"], f"reconcile: {reason}", loss_threshold)
+                self._force_close(coin, wallet, pos["side"], f"reconcile: {reason}")
 
-    def _force_close(self, coin: str, wallet: str, side: str, reason: str, loss_threshold: float) -> None:
+    def _force_close(self, coin: str, wallet: str, side: str, reason: str) -> None:
         if self.settings.live:
             quarantine = self.store.coin_quarantine(coin)
             if quarantine is not None:
@@ -3696,7 +3605,6 @@ class Reconciler:
                 wallet, coin, side, "EXIT", exit_price, "EXECUTED",
                 f"{reason}; price_source={price_source} quote={price:g}", gain, pnl_pct
             )
-        self.risk.maybe_pause_wallet(wallet, coin, last_pnl_pct, loss_threshold)
         print(f"[RECONCILE] Closed {coin} {side}: {reason}")
 
 
@@ -3821,8 +3729,6 @@ class CopyTradingBot:
             self.risk.live_equity_available(equity_available)
             dd = self.risk.drawdown(session_start, risk_value) if equity_available else 0.0
             self.risk.check_warning(dd)
-            loss_threshold = self.risk.effective_loss_pct(dd)
-            pause_hours = self.risk.effective_pause_hours(dd)
             breaker_tripped = (
                 self.risk.check_circuit_breaker(session_start, risk_value)
                 if equity_available
@@ -3838,7 +3744,7 @@ class CopyTradingBot:
                 else self.settings.roster_refresh_seconds
             )
             if unix_now() - last_roster_check >= roster_check_interval:
-                wallets = self.roster.load_or_refresh(force=True, pause_hours=pause_hours)
+                wallets = self.roster.load_or_refresh(force=True)
                 last_roster_check = unix_now()
 
             scan_wallets = self._effective_wallets(wallets)
@@ -3856,7 +3762,7 @@ class CopyTradingBot:
                     live_held = set(live_positions.keys())
             if unix_now() - last_reconcile >= self.settings.reconcile_seconds:
                 if not self.settings.live or live_held is not None:
-                    self.reconciler.run(scan_wallets, loss_threshold)
+                    self.reconciler.run(scan_wallets)
                 else:
                     print("[RECONCILE] Skipped: live book unavailable")
                 last_reconcile = unix_now()
@@ -3871,7 +3777,7 @@ class CopyTradingBot:
                 if event.kind in {"ENTRY", "ADD"}:
                     self._handle_entry(event, wind_down, live_held)
                 elif event.kind == "EXIT":
-                    self._handle_exit(event, loss_threshold)
+                    self._handle_exit(event)
 
             tag = f" dd={dd:.1%}" if dd >= 0.01 else ""
             live_tag = f" live=${risk_value:,.2f}" if self.settings.live and risk_value is not None else ""
@@ -4159,7 +4065,7 @@ class CopyTradingBot:
         print(f"[ALERT] {event.coin} {event.side}: ENTRY ROLLBACK FAILED - {detail}")
         return "; AUTOMATIC ROLLBACK FAILED; coin quarantined"
 
-    def _handle_exit(self, event: CopyEvent, loss_threshold: float) -> None:
+    def _handle_exit(self, event: CopyEvent) -> None:
         if self.settings.live:
             quarantine = self.store.coin_quarantine(event.coin)
             if quarantine is not None:
@@ -4223,7 +4129,6 @@ class CopyTradingBot:
             close_reason = f"price_source={price_source} quote={price:g}"
             signal_id = self.store.log_signal(event.wallet, event.coin, side, "EXIT", exit_price, "EXECUTED", close_reason, gain, pnl_pct)
             self.scoring_engine.observe_signal(event, signal_id, "EXECUTED", close_reason, exit_price)
-            self.risk.maybe_pause_wallet(event.wallet, event.coin, pnl_pct, loss_threshold)
 
         if not closed_any:
             signal_id = self.store.log_signal(event.wallet, event.coin, side, "EXIT", price, "SKIPPED", "not tracked")
@@ -4253,7 +4158,6 @@ def print_status(settings: Settings) -> None:
     print("\n=== MOCKINGBOT CODEX STATUS ===\n")
     print(f"Database: {settings.db_path}")
     print(f"Roster:   {len(store.roster())} wallet(s)")
-    print(f"Paused:   {len(store.paused_wallets())} wallet(s)")
     print(f"Quarantine: {len(store.quarantined_coins())} coin(s)")
     acct = paper.account()
     print(f"Cash:     ${float(acct['cash']):,.2f}")

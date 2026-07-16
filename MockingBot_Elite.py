@@ -152,7 +152,7 @@ class EliteRosterService(core.RosterService):
         signature["elite_recent_fill_days"] = ELITE_RECENT_FILL_DAYS
         return signature
 
-    def refresh(self, pause_hours: int | None = None) -> list[str]:
+    def refresh(self) -> list[str]:
         follow_limit = self.settings.max_follow if self.settings.max_follow > 0 else self.settings.roster_size
         print(f"[ROSTER] Refreshing up to {follow_limit} active qualifying wallets")
         candidates = self.platform.candidate_wallets(self.settings.roster_size)
@@ -251,7 +251,7 @@ class EliteBot:
 
             scan_wallets = self._effective_wallets(wallets)
             if core.unix_now() - last_reconcile >= self.settings.reconcile_seconds:
-                self.reconciler.run(scan_wallets, 999.0)
+                self.reconciler.run(scan_wallets)
                 last_reconcile = core.unix_now()
 
             events, fail_ratio = self.monitor.scan(scan_wallets)

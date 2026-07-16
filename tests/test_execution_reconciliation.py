@@ -417,7 +417,7 @@ class ExecutionReconciliationTests(unittest.TestCase):
             self.settings, self.store, FillPlatform(), paper, risk
         )
 
-        reconciler._force_close("BTC", "wallet-a", "LONG", "test exit", 0.50)
+        reconciler._force_close("BTC", "wallet-a", "LONG", "test exit")
 
         signal = self.store.conn.execute(
             "SELECT price, paper_gain, reason FROM signals ORDER BY id DESC LIMIT 1"
@@ -447,7 +447,7 @@ class ExecutionReconciliationTests(unittest.TestCase):
             core.RiskManager(self.settings, self.store, core.Notifier("")),
         )
 
-        reconciler._force_close("BTC", "wallet-a", "LONG", "source closed", 0.50)
+        reconciler._force_close("BTC", "wallet-a", "LONG", "source closed")
 
         self.assertEqual(platform.closes, 0)
         self.assertTrue(paper.owns_position("wallet-a", "BTC", "LONG"))

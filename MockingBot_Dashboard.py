@@ -356,7 +356,6 @@ def dashboard_data() -> dict[str, Any]:
             """
             SELECT
                 (SELECT COUNT(*) FROM roster WHERE status = 'follow') AS roster,
-                (SELECT COUNT(*) FROM paused_wallets) AS paused,
                 (SELECT COUNT(*) FROM signals) AS signals,
                 (SELECT COUNT(*) FROM signals WHERE signal = 'EXIT' AND action = 'EXECUTED') AS exits,
                 (SELECT COUNT(*) FROM api_failures) AS api_failures,
