@@ -3593,6 +3593,10 @@ class RiskManager:
         dd = self.drawdown(start_value, current_value)
         if dd < self.settings.max_drawdown_pct:
             return False
+        # The marker is a durable latch. Preserve the original trip evidence and
+        # avoid repeating the same notification on every subsequent poll cycle.
+        if self.settings.circuit_breaker_file.exists():
+            return True
         self.settings.data_dir.mkdir(parents=True, exist_ok=True)
         payload = {
             "tripped_at": utc_now(),
@@ -4384,6 +4388,23 @@ class CopyTradingBot:
         self.running = False
         print("\n[BOOT] Stop requested; finishing current cycle.")
 
+    @staticmethod
+    def _degraded_exit_events(events: list[CopyEvent]) -> list[CopyEvent]:
+        """Return safe risk-reducing events without violating local causality.
+
+        An EXIT must not leapfrog an older deferred ENTRY/ADD for the same source
+        allocation. Events for unrelated allocations remain independent.
+        """
+        blocked: set[tuple[str, str]] = set()
+        exits: list[CopyEvent] = []
+        for event in events:
+            key = (event.wallet.lower(), event.coin)
+            if event.kind != "EXIT":
+                blocked.add(key)
+            elif key not in blocked:
+                exits.append(event)
+        return exits
+
     def run_forever(self) -> None:
         signal.signal(signal.SIGTERM, self.stop)
         signal.signal(signal.SIGINT, self.stop)
@@ -4579,9 +4600,14 @@ class CopyTradingBot:
 
             events, fail_ratio = self.monitor.scan(scan_wallets)
             if fail_ratio > self.settings.api_degraded_max_fail_ratio:
-                print(f"[API] Degraded scan ({fail_ratio:.0%} failed); skipping signal execution this cycle")
-                self._sleep_remaining(cycle_start)
-                continue
+                retained = len(events)
+                events = self._degraded_exit_events(events)
+                deferred = retained - len(events)
+                print(
+                    f"[API] Degraded scan ({fail_ratio:.0%} failed); "
+                    f"processing {len(events)} risk-reducing exit(s), "
+                    f"deferring {deferred} entry/add event(s)"
+                )
 
             for event in events:
                 if event.kind in {"ENTRY", "ADD"}:

@@ -48,6 +48,12 @@ class RiskAndIsolationTests(unittest.TestCase):
                 payload = json.loads(configured.circuit_breaker_file.read_text(encoding="utf-8"))
                 self.assertEqual(payload["mode"], "live")
                 self.assertEqual(payload["drawdown_pct"], 25.0)
+                first_marker = configured.circuit_breaker_file.read_text(encoding="utf-8")
+                self.assertTrue(risk.check_circuit_breaker(baseline, 350.0))
+                self.assertEqual(
+                    configured.circuit_breaker_file.read_text(encoding="utf-8"),
+                    first_marker,
+                )
                 platform.value = 700.0
                 self.assertEqual(risk.session_start_value(FakePortfolio(), platform), 700.0)
                 self.assertEqual(
