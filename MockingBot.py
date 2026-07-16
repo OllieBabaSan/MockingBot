@@ -4310,7 +4310,12 @@ class Reconciler:
         else:
             execution = self.platform.close_position(coin, close_size, price)
         if not execution:
-            if recovering:
+            current_intent = (
+                self.store.execution_intent(intent_key) if intent_key is not None else None
+            )
+            if current_intent is not None and current_intent["state"] in {
+                "PREPARED", "SUBMITTING", "AMBIGUOUS",
+            }:
                 raise RuntimeError(
                     f"reconciliation intent {intent_key} remains unresolved: "
                     f"{execution.detail or execution.status}"
@@ -5039,7 +5044,13 @@ class CopyTradingBot:
         else:
             execution = self.platform.close_position(event.coin, close_size, price)
         if not execution:
-            if recovering_close:
+            current_intent = (
+                self.store.execution_intent(close_intent_key)
+                if close_intent_key is not None else None
+            )
+            if current_intent is not None and current_intent["state"] in {
+                "PREPARED", "SUBMITTING", "AMBIGUOUS",
+            }:
                 raise RuntimeError(
                     f"execution intent {close_intent_key} remains unresolved: "
                     f"{execution.detail or execution.status}"

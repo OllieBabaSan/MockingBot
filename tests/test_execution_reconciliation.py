@@ -662,6 +662,31 @@ class ExecutionReconciliationTests(unittest.TestCase):
             self.store.coin_quarantine("BTC")["reason"], "ambiguous close state"
         )
 
+    def test_newly_ambiguous_copy_exit_is_not_treated_as_handled(self) -> None:
+        paper = core.PaperPortfolio(self.settings, self.store)
+        paper.open("wallet", "BTC", "LONG", 100.0, 10.0, leverage=3)
+        self.adapter._exchange = FakeExchange([fill_response("0.30", "99")])
+        states = iter([
+            (True, core.Position("BTC", "LONG", 0.30, 100.0, 3)),
+            (False, None),
+        ])
+        self.adapter._confirmed_position = lambda _coin: next(states)
+        self.adapter.mid_price = lambda _coin: 100.0
+        bot = core.CopyTradingBot.__new__(core.CopyTradingBot)
+        bot.settings = self.settings
+        bot.store = self.store
+        bot.platform = self.adapter
+        bot.paper = paper
+        bot.scoring_engine = core.ScoringEngine(self.settings, self.store)
+        event = core.CopyEvent("EXIT", "wallet", "BTC", "LONG", event_id=99)
+
+        with self.assertRaisesRegex(RuntimeError, "remains unresolved"):
+            bot._handle_exit(event)
+
+        intent = self.store.execution_intent("copy-event:99:close")
+        self.assertIn(intent["state"], {"SUBMITTING", "AMBIGUOUS"})
+        self.assertTrue(paper.owns_position("wallet", "BTC", "LONG"))
+
     def test_unresolved_normal_close_residual_is_not_reported_successful(self) -> None:
         exchange = FakeExchange(
             [fill_response("0.06", "99", 8), fill_response("0.01", "98", 9)]
