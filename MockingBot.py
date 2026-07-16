@@ -307,8 +307,8 @@ class Settings:
 CODE_FINGERPRINT = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
 
 
-def settings_fingerprint(settings: Settings) -> str:
-    values = {
+def settings_signature(settings: Settings) -> dict[str, Any]:
+    return {
         "platform": settings.platform,
         "poll_seconds": settings.poll_seconds,
         "roster_size": settings.roster_size,
@@ -342,8 +342,40 @@ def settings_fingerprint(settings: Settings) -> str:
         "warning_drawdown_pct": settings.warning_drawdown_pct,
         "max_drawdown_pct": settings.max_drawdown_pct,
     }
+
+
+PARITY_ENVIRONMENT_FIELDS = {
+    "platform",
+    "poll_seconds",
+    "roster_size",
+    "max_follow",
+    "max_positions",
+    "live_margin_reserve_pct",
+    "live_size_tolerance_pct",
+}
+
+
+def _fingerprint(values: dict[str, Any]) -> str:
     encoded = json.dumps(values, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def settings_fingerprint(settings: Settings) -> str:
+    return _fingerprint(settings_signature(settings))
+
+
+def parity_policy_fingerprint(settings: Settings) -> str:
+    values = settings_signature(settings)
+    return _fingerprint(
+        {key: value for key, value in values.items() if key not in PARITY_ENVIRONMENT_FIELDS}
+    )
+
+
+def parity_environment_fingerprint(settings: Settings) -> str:
+    values = settings_signature(settings)
+    return _fingerprint(
+        {key: values[key] for key in sorted(PARITY_ENVIRONMENT_FIELDS)}
+    )
 
 
 def validate_settings(settings: Settings) -> None:
@@ -873,6 +905,8 @@ class Store:
                 previous_size REAL,
                 current_size REAL,
                 config_fingerprint TEXT NOT NULL,
+                policy_fingerprint TEXT,
+                environment_fingerprint TEXT,
                 code_fingerprint TEXT NOT NULL,
                 scoring_seed_fingerprint TEXT
             );
@@ -916,6 +950,8 @@ class Store:
         self._ensure_column("execution_audit", "reference_price", "REAL")
         self._ensure_column("execution_audit", "slippage_bps", "REAL")
         self._ensure_column("execution_intents", "leverage", "REAL")
+        self._ensure_column("decision_audit", "policy_fingerprint", "TEXT")
+        self._ensure_column("decision_audit", "environment_fingerprint", "TEXT")
         self._ensure_column("execution_audit", "price_source", "TEXT")
         self._migrate_legacy_paper_positions()
 
@@ -1759,8 +1795,8 @@ class Store:
                 ts, instance_id, signal_id, wallet, coin, side, signal, action, reason,
                 wallet_tier, wallet_score, sample_size, observed_price,
                 previous_size, current_size, config_fingerprint, code_fingerprint,
-                scoring_seed_fingerprint
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                scoring_seed_fingerprint, policy_fingerprint, environment_fingerprint
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 utc_now(),
@@ -1781,6 +1817,8 @@ class Store:
                 settings_fingerprint(settings),
                 CODE_FINGERPRINT,
                 self.scoring_seed_fingerprint(),
+                parity_policy_fingerprint(settings),
+                parity_environment_fingerprint(settings),
             ),
         )
         self.conn.commit()

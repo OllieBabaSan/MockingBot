@@ -26,6 +26,13 @@ STATE_REASONS = {
     "wind-down",
     "live positions unknown",
 }
+STATE_REASON_PREFIXES = (
+    "coin quarantined:",
+    "required margin ",
+    "live buying power unavailable",
+    "Scoring Engine Candidate concentration cap:",
+)
+NON_ISSUE_CLASSIFICATIONS = {"MATCH", "EXPECTED_ENVIRONMENT_VARIANCE"}
 
 
 def parse_ts(value: str) -> datetime:
@@ -52,8 +59,15 @@ def read_audit(path: Path, since: datetime) -> list[dict[str, Any]]:
 
 
 def classify(paper: dict[str, Any], live: dict[str, Any], delta_seconds: float) -> tuple[str, str]:
-    if paper["config_fingerprint"] != live["config_fingerprint"]:
-        return "CONFIG_DIVERGENCE", "decision parameters differ"
+    paper_policy = paper.get("policy_fingerprint") or paper["config_fingerprint"]
+    live_policy = live.get("policy_fingerprint") or live["config_fingerprint"]
+    environment_differs = (
+        bool(paper.get("environment_fingerprint"))
+        and bool(live.get("environment_fingerprint"))
+        and paper["environment_fingerprint"] != live["environment_fingerprint"]
+    )
+    if paper_policy != live_policy:
+        return "CONFIG_DIVERGENCE", "shared decision policy differs"
     if paper["code_fingerprint"] != live["code_fingerprint"]:
         return "CODE_DIVERGENCE", "source versions differ"
     if paper["wallet_tier"] != live["wallet_tier"] or abs(
@@ -62,7 +76,9 @@ def classify(paper: dict[str, Any], live: dict[str, Any], delta_seconds: float) 
         return "SCORE_DIVERGENCE", "wallet tier or score differs"
     if paper["action"] != live["action"] or (paper.get("reason") or "") != (live.get("reason") or ""):
         reasons = {(paper.get("reason") or ""), (live.get("reason") or "")}
-        if reasons & STATE_REASONS:
+        if reasons & STATE_REASONS or any(
+            reason.startswith(STATE_REASON_PREFIXES) for reason in reasons
+        ):
             return "STATE_DIVERGENCE", "capacity, holdings, or risk state differs"
         return "LOGIC_DIVERGENCE", "same inputs produced a different decision"
     if delta_seconds > 45:
@@ -73,6 +89,11 @@ def classify(paper: dict[str, Any], live: dict[str, Any], delta_seconds: float) 
         variance = abs(float(paper_price) - float(live_price)) / float(paper_price)
         if variance > 0.002:
             return "EXECUTION_VARIANCE", f"observed prices differ by {variance:.2%}"
+    if environment_differs:
+        return (
+            "EXPECTED_ENVIRONMENT_VARIANCE",
+            "same decision chain; capacity or runtime environment differs",
+        )
     return "MATCH", "same decision chain"
 
 
@@ -141,7 +162,10 @@ def main() -> int:
         "paper_events": len(paper_rows),
         "live_events": len(live_rows),
         "counts": dict(sorted(counts.items())),
-        "divergences": [r for r in results if r["classification"] != "MATCH"],
+        "divergences": [
+            r for r in results
+            if r["classification"] not in NON_ISSUE_CLASSIFICATIONS
+        ],
     }
     args.log.parent.mkdir(parents=True, exist_ok=True)
     with args.log.open("a", encoding="utf-8") as handle:

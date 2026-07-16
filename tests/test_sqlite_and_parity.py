@@ -5,6 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 import MockingBot as core
@@ -72,6 +73,8 @@ class ParityTests(unittest.TestCase):
             "sample_size": 5,
             "observed_price": 100.0,
             "config_fingerprint": "config",
+            "policy_fingerprint": "policy",
+            "environment_fingerprint": "environment",
             "code_fingerprint": "code",
         }
 
@@ -86,11 +89,40 @@ class ParityTests(unittest.TestCase):
             compare.compare([paper], [live], 180)[0]["classification"],
             "STATE_DIVERGENCE",
         )
-        live["config_fingerprint"] = "different"
+        live["policy_fingerprint"] = "different"
         self.assertEqual(
             compare.compare([paper], [live], 180)[0]["classification"],
             "CONFIG_DIVERGENCE",
         )
+
+    def test_intentional_environment_difference_is_not_config_divergence(self) -> None:
+        paper = self.row(1, "paper-main", "2026-07-15 01:00:00")
+        live = self.row(2, "live-main", "2026-07-15 01:00:10")
+        live["environment_fingerprint"] = "live-four-slots"
+
+        result = compare.compare([paper], [live], 180)[0]
+
+        self.assertEqual(result["classification"], "EXPECTED_ENVIRONMENT_VARIANCE")
+        self.assertIn(result["classification"], compare.NON_ISSUE_CLASSIFICATIONS)
+
+    def test_policy_fingerprint_excludes_slots_but_includes_leverage(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = settings(Path(td), max_positions=10)
+            four_slots = replace(base, max_positions=4, live_margin_reserve_pct=0.10)
+            changed_leverage = replace(base, scoring_engine_core_leverage=4)
+
+            self.assertEqual(
+                core.parity_policy_fingerprint(base),
+                core.parity_policy_fingerprint(four_slots),
+            )
+            self.assertNotEqual(
+                core.parity_environment_fingerprint(base),
+                core.parity_environment_fingerprint(four_slots),
+            )
+            self.assertNotEqual(
+                core.parity_policy_fingerprint(base),
+                core.parity_policy_fingerprint(changed_leverage),
+            )
 
     def test_missing_signal(self) -> None:
         paper = self.row(1, "paper-main", "2026-07-15 01:00:00")
