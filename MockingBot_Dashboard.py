@@ -548,7 +548,7 @@ HTML = r"""<!doctype html>
       letter-spacing: .12em;
     }
     .mode-badge.live { color: var(--bad); border-color: var(--bad); }
-    main { max-width: 1040px; margin: 0 auto; padding: 12px; }
+    main { max-width: 1560px; margin: 0 auto; padding: 12px; }
     .stats {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -624,6 +624,12 @@ HTML = r"""<!doctype html>
     @media (min-width: 760px) {
       .stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
       .value { font-size: 1.28rem; }
+    }
+    @media (min-width: 1100px) {
+      .stats { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+      .stat { min-height: 62px; padding: 9px 10px; }
+      .label { font-size: .67rem; }
+      .value { font-size: 1.16rem; }
     }
     @media (max-width: 640px) {
       header { padding: 8px 10px; }
