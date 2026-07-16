@@ -35,13 +35,13 @@ PORT = int(os.getenv("MOCKINGBOT_DASHBOARD_PORT", "8766" if MODE == "live" else 
 HL_INFO_URL = os.getenv("HL_INFO_URL", "https://api.hyperliquid.xyz/info")
 LEVERAGE = float(os.getenv("HL_LEVERAGE", "3"))
 PRICE_CACHE_SECONDS = int(os.getenv("MOCKINGBOT_DASHBOARD_PRICE_CACHE_SECS", "15"))
+EQUITY_MAX_AGE_SECONDS = int(
+    os.getenv("MOCKINGBOT_DASHBOARD_EQUITY_MAX_AGE_SECS", "90")
+)
 
 _PRICE_CACHE: dict[str, float] = {}
 _PRICE_CACHE_TS = 0.0
 _PRICE_CACHE_ERROR = ""
-_ACCOUNT_VALUE_CACHE: float | None = None
-_ACCOUNT_VALUE_CACHE_TS = 0.0
-_ACCOUNT_VALUE_CACHE_ERROR = ""
 
 
 def money(value: float | None) -> str:
@@ -128,35 +128,18 @@ def live_prices() -> tuple[dict[str, float], str]:
     return _PRICE_CACHE, "cached-live" if _PRICE_CACHE else "stored"
 
 
-def live_account_value(wallet: str) -> tuple[float | None, str]:
-    global _ACCOUNT_VALUE_CACHE, _ACCOUNT_VALUE_CACHE_TS, _ACCOUNT_VALUE_CACHE_ERROR
-    if not wallet:
-        return None, "missing-wallet"
-    now = time.time()
-    if _ACCOUNT_VALUE_CACHE is not None and now - _ACCOUNT_VALUE_CACHE_TS < PRICE_CACHE_SECONDS:
-        return _ACCOUNT_VALUE_CACHE, "live"
-    payload = json.dumps({"type": "clearinghouseState", "user": wallet}).encode("utf-8")
-    request = Request(
-        HL_INFO_URL,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+def bot_live_equity(conn: sqlite3.Connection) -> tuple[float | None, str, float | None]:
+    snapshot = get_json(conn, "live_equity_snapshot", {})
+    observed = float(snapshot.get("observed_unix", 0) or 0)
+    age = max(0.0, time.time() - observed) if observed else None
+    if not snapshot.get("available") or snapshot.get("account_value") is None:
+        return None, "unavailable", age
+    if age is None or age > EQUITY_MAX_AGE_SECONDS:
+        return None, "stale-bot-snapshot", age
     try:
-        with urlopen(request, timeout=6) as response:
-            body = json.loads(response.read().decode("utf-8"))
-        value = float(body.get("marginSummary", {}).get("accountValue") or 0)
-        if value >= 0:
-            _ACCOUNT_VALUE_CACHE = value
-            _ACCOUNT_VALUE_CACHE_TS = now
-            _ACCOUNT_VALUE_CACHE_ERROR = ""
-            return value, "live"
-    except Exception as exc:
-        _ACCOUNT_VALUE_CACHE_ERROR = str(exc)
-    return (
-        _ACCOUNT_VALUE_CACHE,
-        "cached-live" if _ACCOUNT_VALUE_CACHE is not None else "local-estimate",
-    )
+        return float(snapshot["account_value"]), "bot-risk-feed", age
+    except (TypeError, ValueError):
+        return None, "invalid-bot-snapshot", age
 
 
 def wallet_statuses(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
@@ -315,14 +298,21 @@ def dashboard_data() -> dict[str, Any]:
         if MODE == "live":
             risk_baseline = get_json(conn, "live_risk_baseline", {})
             baseline = float(
-                risk_baseline.get("start_value")
+                risk_baseline.get("high_water_value")
+                or risk_baseline.get("start_value")
                 or identity.get("initial_account_value")
                 or acct.get("cash")
                 or 0.0
             )
+            baseline_source = (
+                "risk-high-water"
+                if risk_baseline.get("high_water_value") is not None
+                else "live-start"
+            )
         else:
             session = get_json(conn, "session", {})
             baseline = float(session.get("paper_start") or 10_000.0)
+            baseline_source = "paper-session"
         stored_prices = latest_prices(conn)
         live_price_map, price_source = live_prices()
         prices = dict(stored_prices)
@@ -346,11 +336,18 @@ def dashboard_data() -> dict[str, Any]:
         realized = float(acct.get("realized_pnl", 0.0))
         local_estimate = cash + open_cost + (open_pnl or 0.0)
         account_wallet = str(identity.get("wallet", ""))
-        live_value, equity_source = (
-            live_account_value(account_wallet) if MODE == "live" else (None, "paper-ledger")
+        if MODE == "live":
+            live_value, equity_source, equity_age_seconds = bot_live_equity(conn)
+            estimated_value = live_value
+        else:
+            equity_source = "paper-ledger"
+            equity_age_seconds = None
+            estimated_value = local_estimate
+        drawdown = (
+            ((baseline - estimated_value) / baseline * 100.0)
+            if baseline and estimated_value is not None
+            else None
         )
-        estimated_value = live_value if live_value is not None else local_estimate
-        drawdown = ((baseline - estimated_value) / baseline * 100.0) if baseline else 0.0
 
         counts = conn.execute(
             """
@@ -467,9 +464,14 @@ def dashboard_data() -> dict[str, Any]:
             "estimated_value": estimated_value,
             "local_estimate": local_estimate,
             "equity_source": equity_source,
-            "equity_error": _ACCOUNT_VALUE_CACHE_ERROR if MODE == "live" else "",
-            "drawdown_pct": max(0.0, drawdown),
+            "equity_age_seconds": equity_age_seconds,
+            "equity_error": (
+                "Bot risk equity is unavailable or stale"
+                if MODE == "live" and estimated_value is None else ""
+            ),
+            "drawdown_pct": None if drawdown is None else max(0.0, drawdown),
             "baseline": baseline,
+            "baseline_source": baseline_source,
             "counts": dict(counts) if counts else {},
             "positions": positions,
             "allocations": allocations,
@@ -701,12 +703,17 @@ HTML = r"""<!doctype html>
       badge.className = `mode-badge ${data.mode === "live" ? "live" : "paper"}`;
       const accountLabel = data.account_wallet ? ` | account ${data.account_wallet}` : "";
       document.title = `MockingBot ${data.instance_label} Dashboard`;
-      document.getElementById("updated").textContent = `Updated ${data.generated_at} | read-only | ${priceLabel}${accountLabel}`;
+      const equityLabel = data.mode === "live"
+        ? ` | equity ${data.equity_source}${data.equity_age_seconds === null || data.equity_age_seconds === undefined ? "" : ` (${Math.round(data.equity_age_seconds)}s old)`}`
+        : "";
+      document.getElementById("updated").textContent = `Updated ${data.generated_at} | read-only | ${priceLabel}${accountLabel}${equityLabel}`;
       const c = data.counts || {};
       const capital = data.capital || {};
       const rollback = data.last_entry_rollback || {};
       const cards = [
-        ["Est. Value", fmtMoney(data.estimated_value), clsNum(data.estimated_value - data.baseline)],
+        [data.mode === "live" ? "Live Equity" : "Paper Value", fmtMoney(data.estimated_value), data.estimated_value === null || data.estimated_value === undefined ? "bad" : clsNum(data.estimated_value - data.baseline)],
+        [data.mode === "live" ? "Breaker High-Water" : "Session Baseline", fmtMoney(data.baseline), ""],
+        ["Drawdown", fmtPct(data.drawdown_pct === null || data.drawdown_pct === undefined ? null : -data.drawdown_pct), data.drawdown_pct > 0 ? "bad" : ""],
         ["Cash", fmtMoney(data.cash), ""],
         ["Realized PnL", fmtMoney(data.realized_pnl), clsNum(data.realized_pnl)],
         ["Positions", String(data.positions.length), ""],
@@ -715,6 +722,7 @@ HTML = r"""<!doctype html>
         ["Quarantined", String(c.quarantined ?? 0), (c.quarantined ?? 0) > 0 ? "bad" : ""],
         ["Unresolved Intents", String(c.unresolved_intents ?? 0), (c.unresolved_intents ?? 0) > 0 ? "bad" : ""],
         ...(data.mode === "live" ? [
+          ["Local Ledger Estimate", fmtMoney(data.local_estimate), ""],
           ["Available Margin", fmtMoney(capital.available_margin), ""],
           ["Usable Margin", fmtMoney(capital.usable_margin), ""],
           ["Ledger Variance", fmtMoney(capital.equity_variance), clsNum(-(capital.equity_variance || 0))],

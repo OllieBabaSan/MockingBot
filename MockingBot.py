@@ -4380,6 +4380,17 @@ class CopyTradingBot:
             self.token_risk.maintain()
             paper_value = self.paper.value(self.platform.mid_price)
             risk_value = self.risk.current_value(self.paper, self.platform)
+            if self.settings.live:
+                self.store.set_json(
+                    "live_equity_snapshot",
+                    {
+                        "observed_at": utc_now(),
+                        "observed_unix": unix_now(),
+                        "account_value": risk_value,
+                        "available": risk_value is not None,
+                        "source": "risk-manager",
+                    },
+                )
             if session_start is None and risk_value is not None:
                 session_start = self.risk.session_start_value(self.paper, self.platform)
             if self.settings.live and risk_value is not None:
