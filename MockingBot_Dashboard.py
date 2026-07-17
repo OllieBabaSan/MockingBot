@@ -626,7 +626,7 @@ HTML = r"""<!doctype html>
       .value { font-size: 1.28rem; }
     }
     @media (min-width: 1100px) {
-      .stats { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+      .stats { grid-template-columns: repeat(4, minmax(0, 1fr)); }
       .stat { min-height: 62px; padding: 9px 10px; }
       .label { font-size: .67rem; }
       .value { font-size: 1.16rem; }
