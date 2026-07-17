@@ -733,8 +733,6 @@ HTML = r"""<!doctype html>
         ["Realized PnL", fmtMoney(data.realized_pnl), clsNum(data.realized_pnl)],
         ["Open PnL", fmtMoney(data.open_pnl), clsNum(data.open_pnl)],
         ["Closed Trades", String(c.exits ?? 0), ""],
-        ["Quarantined", String(c.quarantined ?? 0), (c.quarantined ?? 0) > 0 ? "bad" : ""],
-        ["Unresolved Intents", String(c.unresolved_intents ?? 0), (c.unresolved_intents ?? 0) > 0 ? "bad" : ""],
         ...(data.mode === "live" ? [
           ["Local Ledger Estimate", fmtMoney(data.local_estimate), ""],
           ["Available Margin", fmtMoney(capital.available_margin), ""],
