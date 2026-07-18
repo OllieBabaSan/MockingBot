@@ -234,6 +234,7 @@ class Settings:
     max_positions: int = env_int("MAX_POSITIONS", 4 if env_bool("HL_LIVE", False) else 10)
     max_slices_per_coin: int = env_int("MAX_SLICES_PER_COIN", 5)
     max_coin_cost_multiplier: float = env_float("MAX_COIN_COST_MULT", 2.0)
+    max_wallet_margin_pct: float = env_float("MAX_WALLET_MARGIN_PCT", 0.35)
     max_allocations_per_wallet_coin_side: int = env_int("MAX_ALLOCATIONS_PER_WALLET_COIN_SIDE", 2)
     same_wallet_add_threshold_pct: float = env_float("SAME_WALLET_ADD_THRESHOLD_PCT", 25.0)
     min_slot_usd: float = env_float("MIN_SLOT_USD", 5.0)
@@ -330,6 +331,7 @@ def settings_signature(settings: Settings) -> dict[str, Any]:
         "core_leverage": settings.scoring_engine_core_leverage,
         "elite_leverage": settings.scoring_engine_elite_leverage,
         "max_positions": settings.max_positions,
+        "max_wallet_margin_pct": settings.max_wallet_margin_pct,
         "live_margin_reserve_pct": settings.live_margin_reserve_pct,
         "live_size_tolerance_pct": settings.live_size_tolerance_pct,
         "max_slices_per_coin": settings.max_slices_per_coin,
@@ -388,6 +390,8 @@ def validate_settings(settings: Settings) -> None:
     errors: list[str] = []
     if settings.max_positions <= 0:
         errors.append("MAX_POSITIONS must be positive")
+    if not 0 < settings.max_wallet_margin_pct <= 1:
+        errors.append("MAX_WALLET_MARGIN_PCT must be greater than 0 and at most 1")
     if settings.max_slices_per_coin <= 0:
         errors.append("MAX_SLICES_PER_COIN must be positive")
     if not 0.001 <= settings.slippage <= 0.02:
@@ -3387,6 +3391,13 @@ class PaperPortfolio:
             and float(row["entry_price"]) > 0
         )
 
+    def wallet_cost_basis(self, wallet: str) -> float:
+        return sum(
+            float(row["cost_basis"])
+            for row in self.store.open_position_slices()
+            if str(row["source_wallet"]).lower() == wallet.lower()
+        )
+
     def held_coins(self) -> set[str]:
         return set(self.positions().keys())
 
@@ -3420,7 +3431,15 @@ class PaperPortfolio:
                 total += cost
         return round(total, 2)
 
-    def available_slot(self, coin: str, price: float, multiplier: float = 1.0, side: str | None = None) -> float | None:
+    def available_slot(
+        self,
+        coin: str,
+        price: float,
+        multiplier: float = 1.0,
+        side: str | None = None,
+        wallet: str | None = None,
+        wallet_equity: float | None = None,
+    ) -> float | None:
         if not price or price <= 0:
             return None
         positions = self.positions()
@@ -3442,6 +3461,11 @@ class PaperPortfolio:
         max_coin_cost = base_slot * self.settings.max_coin_cost_multiplier
         remaining_coin_capacity = max_coin_cost - current_coin_cost
         slot = min(slot, remaining_coin_capacity, float(acct["cash"]))
+        if wallet:
+            equity_basis = float(wallet_equity) if wallet_equity is not None else total_value
+            wallet_cap = max(0.0, equity_basis * self.settings.max_wallet_margin_pct)
+            remaining_wallet_capacity = wallet_cap - self.wallet_cost_basis(wallet)
+            slot = min(slot, remaining_wallet_capacity)
         if slot < self.settings.min_slot_usd:
             return None
         return round(slot, 2)
@@ -3456,7 +3480,9 @@ class PaperPortfolio:
         allow_same_wallet_add: bool = False,
         leverage: float | None = None,
     ) -> float | None:
-        slot = cost_basis if cost_basis is not None else self.available_slot(coin, price, side=side)
+        slot = cost_basis if cost_basis is not None else self.available_slot(
+            coin, price, side=side, wallet=wallet
+        )
         if slot is None:
             return None
 
@@ -4825,7 +4851,28 @@ class CopyTradingBot:
                 f"; requested={tier_leverage}x inherited={effective_leverage}x"
             )
         confirming = self.paper.position_side(event.coin, event.side) is not None
-        cost = self.paper.available_slot(event.coin, price, multiplier, event.side)
+        wallet_equity: float | None = None
+        if self.settings.live and isinstance(self.platform, HyperliquidAdapter):
+            capital = self.platform.capital_snapshot()
+            if capital is None:
+                reason = "live wallet exposure basis unavailable"
+                signal_id = self.store.log_signal(
+                    event.wallet, event.coin, event.side, event.kind, price, "SKIPPED", reason
+                )
+                self.scoring_engine.observe_signal(
+                    event, signal_id, "SKIPPED", reason, price
+                )
+                print(f"[SKIP] {event.kind} {event.coin}: {reason}")
+                return
+            wallet_equity = capital.account_value
+        cost = self.paper.available_slot(
+            event.coin,
+            price,
+            multiplier,
+            event.side,
+            wallet=event.wallet,
+            wallet_equity=wallet_equity,
+        )
         if cost is None:
             signal_id = self.store.log_signal(event.wallet, event.coin, event.side, event.kind, price, "SKIPPED", "paper rejected")
             self.scoring_engine.observe_signal(event, signal_id, "SKIPPED", "paper rejected", price)
