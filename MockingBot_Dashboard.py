@@ -464,7 +464,7 @@ def dashboard_data() -> dict[str, Any]:
             "capital": capital,
             "backup_status": backup_status,
             "last_entry_rollback": last_entry_rollback,
-            "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "db_path": str(DB_PATH),
             "price_source": price_source,
             "price_error": _PRICE_CACHE_ERROR,
@@ -541,6 +541,22 @@ HTML = r"""<!doctype html>
       object-fit: contain;
     }
     .updated { color: var(--muted); font-size: .78rem; }
+    .timezone-control {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--muted);
+      font-size: .72rem;
+    }
+    .timezone-control select {
+      max-width: min(310px, 70vw);
+      background: var(--panel);
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 4px 7px;
+      font: inherit;
+    }
     .mode-badge {
       display: inline-block;
       border: 1px solid var(--accent);
@@ -659,6 +675,9 @@ HTML = r"""<!doctype html>
       <img src="/header.png" alt="MockingBot">
       <div class="mode-badge" id="mode-badge">...</div>
       <div class="updated" id="updated">Loading...</div>
+      <label class="timezone-control">Timezone
+        <select id="timezone"></select>
+      </label>
     </div>
   </header>
   <main>
@@ -705,6 +724,38 @@ HTML = r"""<!doctype html>
     const shortWallet = w => !w ? "unknown" : (w.length > 14 ? `${w.slice(0, 8)}...${w.slice(-4)}` : w);
     const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const listCell = values => `<div class="cell-list">${(Array.isArray(values) ? values : [values]).map(v => `<span>${esc(v)}</span>`).join("")}</div>`;
+    const timezoneSelect = document.getElementById("timezone");
+    const browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+    const availableTimezones = typeof Intl.supportedValuesOf === "function"
+      ? Intl.supportedValuesOf("timeZone")
+      : [browserTimezone, "UTC"];
+    const savedTimezone = localStorage.getItem("mockingbot-timezone") || browserTimezone;
+    [...new Set([browserTimezone, "UTC", ...availableTimezones])].forEach(zone => {
+      const option = document.createElement("option");
+      option.value = zone;
+      option.textContent = zone.replaceAll("_", " ");
+      option.selected = zone === savedTimezone;
+      timezoneSelect.appendChild(option);
+    });
+    if (![...timezoneSelect.options].some(option => option.selected)) {
+      timezoneSelect.value = browserTimezone;
+    }
+    const fmtTime = value => {
+      if (!value || value === "...") return value || "";
+      let raw = String(value).trim();
+      if (!/[zZ]$|[+-]\d\d:?\d\d$/.test(raw)) raw = `${raw.replace(" ", "T")}Z`;
+      const parsed = new Date(raw);
+      if (Number.isNaN(parsed.getTime())) return String(value);
+      return new Intl.DateTimeFormat(undefined, {
+        timeZone: timezoneSelect.value || browserTimezone,
+        month: "short", day: "numeric", year: "numeric",
+        hour: "numeric", minute: "2-digit", second: "2-digit", hour12: true,
+      }).format(parsed);
+    };
+    timezoneSelect.addEventListener("change", () => {
+      localStorage.setItem("mockingbot-timezone", timezoneSelect.value);
+      load();
+    });
 
     function table(el, headers, rows, emptyText) {
       if (!rows.length) {
@@ -734,7 +785,7 @@ HTML = r"""<!doctype html>
       const equityLabel = data.mode === "live"
         ? ` | equity ${data.equity_source}${data.equity_age_seconds === null || data.equity_age_seconds === undefined ? "" : ` (${Math.round(data.equity_age_seconds)}s old)`}`
         : "";
-      document.getElementById("updated").textContent = `Updated ${data.generated_at} | read-only | ${priceLabel}${accountLabel}${equityLabel}`;
+      document.getElementById("updated").textContent = `Updated ${fmtTime(data.generated_at)} | read-only | ${priceLabel}${accountLabel}${equityLabel}`;
       const c = data.counts || {};
       const capital = data.capital || {};
       const rollback = data.last_entry_rollback || {};
@@ -771,7 +822,7 @@ HTML = r"""<!doctype html>
       if (tokenRisk.length) {
         table(document.getElementById("token-risk"), ["Time", "Coin", "Side", "Signal", "Wallet", "Reason"],
           tokenRisk.map(t => `<tr>
-            <td class="muted">${esc((t.ts || "").replace("T", " ").slice(5, 19))}</td>
+            <td class="muted">${esc(fmtTime(t.ts))}</td>
             <td><strong>${esc(t.coin)}</strong></td><td>${esc(t.side)}</td><td>${esc(t.signal)}</td>
             <td class="muted">${esc(shortWallet(t.wallet))}</td>
             <td class="warn">${esc(t.reason || "")}</td>
@@ -786,7 +837,7 @@ HTML = r"""<!doctype html>
           quarantines.map(q => `<tr>
             <td><strong>${esc(q.coin)}</strong></td><td class="bad">${esc(q.reason)}</td>
             <td class="warn">${esc(q.details || "")}</td>
-            <td class="muted">${esc(q.quarantined_at || "")}</td><td class="muted">${esc(q.updated_at || "")}</td>
+            <td class="muted">${esc(fmtTime(q.quarantined_at))}</td><td class="muted">${esc(fmtTime(q.updated_at))}</td>
           </tr>`), "No quarantined coins.");
       }
 
@@ -794,7 +845,7 @@ HTML = r"""<!doctype html>
         data.positions.map(p => `<tr>
           <td><strong>${esc(p.coin)}</strong></td><td><span class="pill">${esc(p.side)}</span></td>
           <td>${p.allocation_count}</td>
-          <td class="muted">${listCell((p.opened_times || []).map(ts => ts === "..." ? ts : String(ts || "").replace("T", " ").slice(5, 19)))}</td>
+          <td class="muted">${listCell((p.opened_times || []).map(fmtTime))}</td>
           <td>${fmtMoney(p.cost_basis)}</td>
           <td>${Number(p.entry_price).toLocaleString(undefined, {maximumFractionDigits: 6})}</td>
           <td>${p.last_price ? Number(p.last_price).toLocaleString(undefined, {maximumFractionDigits: 6}) : "n/a"}</td>
@@ -805,7 +856,7 @@ HTML = r"""<!doctype html>
 
       table(document.getElementById("closes"), ["Time", "Coin", "Side", "Wallet", "Status", "Lev", "Cost", "Result"],
         data.recent_closes.map(s => `<tr>
-          <td class="muted">${esc((s.ts || "").replace("T", " ").slice(5, 19))}</td>
+          <td class="muted">${esc(fmtTime(s.ts))}</td>
           <td><strong>${esc(s.coin)}</strong></td><td>${esc(s.side)}</td>
           <td class="muted">${esc(shortWallet(s.wallet))}</td>
           <td class="muted">${esc(s.wallet_tier === "Unscored" ? "Unscored" : `${s.wallet_tier} ${Number(s.wallet_score).toFixed(1)}`)}</td>
@@ -816,7 +867,7 @@ HTML = r"""<!doctype html>
 
       table(document.getElementById("executions"), ["Time", "Coin", "Op", "Req Lev", "Effective", "Requested", "Filled", "Avg Fill", "Quote", "Slip", "Source", "Order", "Confirmed", "Detail"],
         (data.recent_executions || []).map(x => `<tr>
-          <td class="muted">${esc((x.ts || "").slice(5, 19))}</td><td><strong>${esc(x.coin)}</strong></td>
+          <td class="muted">${esc(fmtTime(x.ts))}</td><td><strong>${esc(x.coin)}</strong></td>
           <td>${esc(x.operation)}</td>
           <td>${x.requested_leverage ? `${Number(x.requested_leverage).toFixed(1)}x` : "n/a"}</td>
           <td>${x.leverage ? `${Number(x.leverage).toFixed(1)}x` : "n/a"}</td><td>${Number(x.requested_size || 0).toLocaleString()}</td>
@@ -832,7 +883,7 @@ HTML = r"""<!doctype html>
 
       table(document.getElementById("execution-intents"), ["Updated", "Coin", "Side", "Op", "Requested", "Leverage", "Client Order ID", "State"],
         (data.execution_intents || []).map(x => `<tr>
-          <td class="muted">${esc(x.updated_at || "")}</td><td><strong>${esc(x.coin)}</strong></td>
+          <td class="muted">${esc(fmtTime(x.updated_at))}</td><td><strong>${esc(x.coin)}</strong></td>
           <td>${esc(x.side || "")}</td><td>${esc(x.operation)}</td>
           <td>${Number(x.requested_size || 0).toLocaleString()}</td>
           <td>${x.leverage ? `${Number(x.leverage).toFixed(1)}x` : "n/a"}</td>
@@ -845,7 +896,7 @@ HTML = r"""<!doctype html>
         failures.innerHTML = `<div class="empty">No API failures recorded.</div>`;
       } else {
         failures.innerHTML = `<div class="table-wrap"><table><thead><tr><th>Time</th><th>Operation</th><th>Subject</th><th>Error</th></tr></thead><tbody>${data.recent_failures.map(f => `<tr>
-          <td class="muted">${esc((f.ts || "").replace("T", " ").slice(5, 19))}</td><td>${esc(f.operation)}</td><td>${esc(f.subject || "")}</td><td class="warn">${esc(f.error || "")}</td>
+          <td class="muted">${esc(fmtTime(f.ts))}</td><td>${esc(f.operation)}</td><td>${esc(f.subject || "")}</td><td class="warn">${esc(f.error || "")}</td>
         </tr>`).join("")}</tbody></table></div>`;
       }
     }
