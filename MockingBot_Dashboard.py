@@ -554,6 +554,12 @@ HTML = r"""<!doctype html>
       grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 8px;
     }
+    .ops-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      padding: 8px;
+    }
     .stat, section {
       background: var(--panel);
       border: 1px solid var(--line);
@@ -623,6 +629,7 @@ HTML = r"""<!doctype html>
     .empty { color: var(--muted); padding: 14px; }
     @media (min-width: 760px) {
       .stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .ops-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
       .value { font-size: 1.28rem; }
     }
     @media (min-width: 1100px) {
@@ -667,6 +674,10 @@ HTML = r"""<!doctype html>
     <section>
       <h2>Recent Closes</h2>
       <div class="table-wrap"><table id="closes"></table></div>
+    </section>
+    <section id="live-operations-section" hidden>
+      <h2>Live Account Operations</h2>
+      <div class="ops-grid" id="live-operations"></div>
     </section>
     <section>
       <h2>Execution Confirmations</h2>
@@ -733,16 +744,22 @@ HTML = r"""<!doctype html>
         ["Realized PnL", fmtMoney(data.realized_pnl), clsNum(data.realized_pnl)],
         ["Open PnL", fmtMoney(data.open_pnl), clsNum(data.open_pnl)],
         ["Closed Trades", String(c.exits ?? 0), ""],
-        ...(data.mode === "live" ? [
+      ];
+      document.getElementById("stats").innerHTML = cards.map(([label, value, klass]) => `<div class="stat"><div class="label">${label}</div><div class="value ${klass}">${value}</div></div>`).join("");
+
+      const liveOperationsSection = document.getElementById("live-operations-section");
+      liveOperationsSection.hidden = data.mode !== "live";
+      if (data.mode === "live") {
+        const liveOperations = [
           ["Local Ledger Estimate", fmtMoney(data.local_estimate), ""],
           ["Available Margin", fmtMoney(capital.available_margin), ""],
           ["Usable Margin", fmtMoney(capital.usable_margin), ""],
           ["Ledger Variance", fmtMoney(capital.equity_variance), clsNum(-(capital.equity_variance || 0))],
           ["Last Rollback", !rollback.ts ? "none" : (rollback.rollback_confirmed ? "confirmed" : "FAILED"), rollback.ts && !rollback.rollback_confirmed ? "bad" : ""],
           ["Last Backup", !backup.successful_at ? "none" : `${Math.round((backup.age_seconds || 0) / 60)}m ago`, !backup.successful_at || backup.error ? "bad" : "good"],
-        ] : []),
-      ];
-      document.getElementById("stats").innerHTML = cards.map(([label, value, klass]) => `<div class="stat"><div class="label">${label}</div><div class="value ${klass}">${value}</div></div>`).join("");
+        ];
+        document.getElementById("live-operations").innerHTML = liveOperations.map(([label, value, klass]) => `<div class="stat"><div class="label">${label}</div><div class="value ${klass}">${value}</div></div>`).join("");
+      }
 
       const tokenRiskSection = document.getElementById("token-risk-section");
       const tokenRisk = data.token_risk_alerts || [];
