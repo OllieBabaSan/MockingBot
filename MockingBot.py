@@ -1819,13 +1819,18 @@ class Store:
         would_execute: bool,
         reason: str,
     ) -> None:
+        score_columns = {str(row["name"]) for row in self.conn.execute(
+            "PRAGMA table_info(marshal_signal_journal)"
+        )}
+        legacy_column = ", scoring_score" if "scoring_score" in score_columns else ""
+        legacy_value = ", ?" if legacy_column else ""
         self.conn.execute(
-            """
+            f"""
             INSERT INTO marshal_signal_journal(
                 ts, signal_id, wallet, coin, side, signal, actual_action, actual_reason,
-                marshal_tier, marshal_score, recommendation, would_execute, reason
+                marshal_tier, marshal_score{legacy_column}, recommendation, would_execute, reason
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?{legacy_value}, ?, ?, ?)
             """,
             (
                 utc_now(),
@@ -1838,6 +1843,7 @@ class Store:
                 actual_reason,
                 score.tier,
                 score.total_score,
+                *((score.total_score,) if legacy_column else ()),
                 recommendation,
                 1 if would_execute else 0,
                 reason,
@@ -1905,13 +1911,18 @@ class Store:
         ).fetchone()
         if existing:
             return
+        score_columns = {str(row["name"]) for row in self.conn.execute(
+            "PRAGMA table_info(marshal_shadow_positions)"
+        )}
+        legacy_column = ", scoring_score" if "scoring_score" in score_columns else ""
+        legacy_value = ", ?" if legacy_column else ""
         self.conn.execute(
-            """
+            f"""
             INSERT INTO marshal_shadow_positions(
                 wallet, coin, side, entry_price, opened_at, source_signal_id,
-                marshal_score, marshal_tier, status
+                marshal_score{legacy_column}, marshal_tier, status
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')
+            VALUES(?, ?, ?, ?, ?, ?, ?{legacy_value}, ?, 'OPEN')
             """,
             (
                 event.wallet,
@@ -1921,6 +1932,7 @@ class Store:
                 utc_now(),
                 signal_id,
                 score.total_score,
+                *((score.total_score,) if legacy_column else ()),
                 score.tier,
             ),
         )

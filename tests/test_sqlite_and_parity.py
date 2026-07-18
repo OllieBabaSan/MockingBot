@@ -21,18 +21,36 @@ class SQLiteTests(unittest.TestCase):
             conn = sqlite3.connect(path)
             try:
                 conn.execute(
-                    "CREATE TABLE marshal_signal_journal "
-                    "(id INTEGER PRIMARY KEY, scoring_score REAL)"
+                    """CREATE TABLE marshal_signal_journal (
+                    id INTEGER PRIMARY KEY, ts TEXT NOT NULL, signal_id INTEGER,
+                    wallet TEXT NOT NULL, coin TEXT NOT NULL, side TEXT NOT NULL,
+                    signal TEXT NOT NULL, actual_action TEXT NOT NULL,
+                    actual_reason TEXT, marshal_tier TEXT NOT NULL,
+                    scoring_score REAL NOT NULL, recommendation TEXT NOT NULL,
+                    would_execute INTEGER NOT NULL, reason TEXT NOT NULL)"""
                 )
                 conn.execute(
-                    "CREATE TABLE marshal_shadow_positions "
-                    "(id INTEGER PRIMARY KEY, scoring_score REAL)"
+                    """CREATE TABLE marshal_shadow_positions (
+                    id INTEGER PRIMARY KEY, wallet TEXT NOT NULL, coin TEXT NOT NULL,
+                    side TEXT NOT NULL, entry_price REAL NOT NULL, opened_at TEXT NOT NULL,
+                    source_signal_id INTEGER, scoring_score REAL NOT NULL,
+                    marshal_tier TEXT NOT NULL, status TEXT NOT NULL, exit_price REAL,
+                    closed_at TEXT, paper_gain REAL, pnl_pct REAL, close_signal_id INTEGER,
+                    close_reason TEXT)"""
                 )
                 conn.execute(
-                    "INSERT INTO marshal_signal_journal(id, scoring_score) VALUES(1, 71.5)"
+                    """INSERT INTO marshal_signal_journal
+                    (id, ts, wallet, coin, side, signal, actual_action, marshal_tier,
+                     scoring_score, recommendation, would_execute, reason)
+                    VALUES(1, 'old', 'old-wallet', 'BTC', 'LONG', 'ENTRY', 'SKIPPED',
+                           'Core', 71.5, 'hold', 0, 'old')"""
                 )
                 conn.execute(
-                    "INSERT INTO marshal_shadow_positions(id, scoring_score) VALUES(1, 68.25)"
+                    """INSERT INTO marshal_shadow_positions
+                    (id, wallet, coin, side, entry_price, opened_at, scoring_score,
+                     marshal_tier, status)
+                    VALUES(1, 'old-wallet', 'ETH', 'LONG', 100, 'old', 68.25,
+                           'Core', 'CLOSED')"""
                 )
                 conn.commit()
             finally:
@@ -53,6 +71,25 @@ class SQLiteTests(unittest.TestCase):
                         f"SELECT marshal_score FROM {table} WHERE id = 1"
                     ).fetchone()[0]
                     self.assertEqual(actual, expected)
+
+                event = core.CopyEvent("ENTRY", "new-wallet", "SOL", "LONG", 50.0)
+                score = core.ScoringEngine(settings(Path(td)), store).score_wallet(
+                    event.wallet
+                )
+                store.log_scoring_engine_signal(
+                    None, event, "SKIPPED", "test", score, "watch", False, "test"
+                )
+                store.open_scoring_engine_shadow_position(event, 50.0, None, score)
+                journal = store.conn.execute(
+                    "SELECT marshal_score, scoring_score FROM marshal_signal_journal "
+                    "WHERE wallet = 'new-wallet'"
+                ).fetchone()
+                shadow = store.conn.execute(
+                    "SELECT marshal_score, scoring_score FROM marshal_shadow_positions "
+                    "WHERE wallet = 'new-wallet'"
+                ).fetchone()
+                self.assertEqual(tuple(journal), (score.total_score, score.total_score))
+                self.assertEqual(tuple(shadow), (score.total_score, score.total_score))
             finally:
                 store.conn.close()
 
