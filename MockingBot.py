@@ -237,6 +237,7 @@ class Settings:
     max_wallet_margin_pct: float = env_float("MAX_WALLET_MARGIN_PCT", 0.35)
     max_allocations_per_wallet_coin_side: int = env_int("MAX_ALLOCATIONS_PER_WALLET_COIN_SIDE", 2)
     same_wallet_add_threshold_pct: float = env_float("SAME_WALLET_ADD_THRESHOLD_PCT", 25.0)
+    live_entry_event_max_age_seconds: int = env_int("LIVE_ENTRY_EVENT_MAX_AGE_SECS", 300)
     min_slot_usd: float = env_float("MIN_SLOT_USD", 5.0)
     min_order_notional: float = env_float("MIN_ORDER_NOTIONAL", 11.0)
     live_margin_reserve_pct: float = env_float("LIVE_MARGIN_RESERVE_PCT", 0.05)
@@ -338,6 +339,7 @@ def settings_signature(settings: Settings) -> dict[str, Any]:
         "max_coin_cost_multiplier": settings.max_coin_cost_multiplier,
         "max_allocations_per_wallet_coin_side": settings.max_allocations_per_wallet_coin_side,
         "same_wallet_add_threshold_pct": settings.same_wallet_add_threshold_pct,
+        "live_entry_event_max_age_seconds": settings.live_entry_event_max_age_seconds,
         "scoring_engine_active": settings.scoring_engine_active,
         "candidate_multiplier": settings.scoring_engine_candidate_multiplier,
         "proven_candidate_multiplier": settings.scoring_engine_proven_candidate_multiplier,
@@ -360,6 +362,7 @@ PARITY_ENVIRONMENT_FIELDS = {
     "max_positions",
     "live_margin_reserve_pct",
     "live_size_tolerance_pct",
+    "live_entry_event_max_age_seconds",
 }
 
 
@@ -390,6 +393,8 @@ def validate_settings(settings: Settings) -> None:
     errors: list[str] = []
     if settings.max_positions <= 0:
         errors.append("MAX_POSITIONS must be positive")
+    if settings.live_entry_event_max_age_seconds <= 0:
+        errors.append("LIVE_ENTRY_EVENT_MAX_AGE_SECS must be positive")
     if not 0 < settings.max_wallet_margin_pct <= 1:
         errors.append("MAX_WALLET_MARGIN_PCT must be greater than 0 and at most 1")
     if settings.max_slices_per_coin <= 0:
@@ -606,6 +611,7 @@ class CopyEvent:
     previous_size: float | None = None
     current_size: float | None = None
     event_id: int | None = None
+    detected_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1299,7 +1305,8 @@ class Store:
     def pending_copy_events(self) -> list[CopyEvent]:
         rows = self.conn.execute(
             """
-            SELECT id, wallet, coin, side, kind, entry_price, previous_size, current_size
+            SELECT id, detected_at, wallet, coin, side, kind, entry_price,
+                   previous_size, current_size
             FROM pending_copy_events
             WHERE status = 'PENDING'
             ORDER BY id
@@ -1315,6 +1322,7 @@ class Store:
                 previous_size=None if row["previous_size"] is None else float(row["previous_size"]),
                 current_size=None if row["current_size"] is None else float(row["current_size"]),
                 event_id=int(row["id"]),
+                detected_at=str(row["detected_at"]),
             )
             for row in rows
         ]
@@ -4783,6 +4791,80 @@ class CopyTradingBot:
             self.store.clear_coin_quarantine(coin)
         self.store.set_json("live_position_snapshot", live_snapshot)
 
+    @staticmethod
+    def _event_age_seconds(event: CopyEvent) -> float:
+        if not event.detected_at:
+            return 0.0
+        try:
+            detected = datetime.strptime(
+                event.detected_at, "%Y-%m-%d %H:%M:%S"
+            ).replace(tzinfo=timezone.utc)
+            return max(
+                0.0,
+                (datetime.now(timezone.utc) - detected).total_seconds(),
+            )
+        except (TypeError, ValueError):
+            return float("inf")
+
+    @staticmethod
+    def _tier_rank(tier: str) -> int:
+        return {"Bench": 0, "Candidate": 1, "Core": 2, "Elite": 3}.get(tier, 0)
+
+    def _apply_ranked_opposite_override(
+        self,
+        event: CopyEvent,
+        incoming_score: ScoringEngineScore,
+        live_held: set[str] | None,
+    ) -> bool:
+        existing = self.paper.position(event.coin)
+        if existing is None or str(existing["side"]) == event.side:
+            return True
+
+        slices = list(self.store.open_position_slices(event.coin))
+        incumbent_wallets = sorted({str(row["source_wallet"]) for row in slices})
+        incumbent_scores = [
+            self.scoring_engine.score_wallet(wallet) for wallet in incumbent_wallets
+        ]
+        highest_rank = max(
+            (self._tier_rank(score.tier) for score in incumbent_scores), default=0
+        )
+        incoming_rank = self._tier_rank(incoming_score.tier)
+        if incoming_rank <= highest_rank:
+            return False
+
+        incumbent_summary = ", ".join(
+            f"{score.tier} {score.total_score:.1f}" for score in incumbent_scores
+        ) or "Unscored"
+        print(
+            f"[RANKED-REVERSAL] {event.coin}: incoming {incoming_score.tier} "
+            f"{incoming_score.total_score:.1f} outranks {incumbent_summary}; "
+            "closing incumbent side first"
+        )
+        for row in slices:
+            self.reconciler._force_close(
+                event.coin,
+                str(row["source_wallet"]),
+                str(row["side"]),
+                (
+                    f"ranked reversal by {event.wallet}: {incoming_score.tier} "
+                    f"{incoming_score.total_score:.1f}"
+                ),
+                (
+                    f"ranked-reversal:event:{event.event_id}:slice:{int(row['id'])}:close"
+                    if event.event_id is not None
+                    else None
+                ),
+            )
+        if self.paper.position(event.coin) is not None:
+            print(
+                f"[RANKED-REVERSAL] {event.coin}: incumbent close incomplete; "
+                "replacement blocked"
+            )
+            return False
+        if live_held is not None:
+            live_held.discard(event.coin)
+        return True
+
     def _handle_entry(self, event: CopyEvent, wind_down: bool, live_held: set[str] | None) -> None:
         self.token_risk.observe(event)
         recovery_key = (
@@ -4794,6 +4876,22 @@ class CopyTradingBot:
         if recovery_intent is not None:
             self._recover_entry_event(event, recovery_key, recovery_intent)
             return
+        if self.settings.live:
+            event_age = self._event_age_seconds(event)
+            if event_age > self.settings.live_entry_event_max_age_seconds:
+                reason = (
+                    f"stale live {event.kind.lower()} expired at {event_age:.0f}s; "
+                    f"limit={self.settings.live_entry_event_max_age_seconds}s"
+                )
+                signal_id = self.store.log_signal(
+                    event.wallet, event.coin, event.side, event.kind,
+                    event.entry_price, "SKIPPED", reason,
+                )
+                self.scoring_engine.observe_signal(
+                    event, signal_id, "SKIPPED", reason, event.entry_price
+                )
+                print(f"[STALE] {event.coin} {event.side}: {reason}")
+                return
         if live_held is None:
             signal_id = self.store.log_signal(event.wallet, event.coin, event.side, event.kind, None, "SKIPPED", "live positions unknown")
             self.scoring_engine.observe_signal(event, signal_id, "SKIPPED", "live positions unknown", event.entry_price)
@@ -4805,6 +4903,51 @@ class CopyTradingBot:
             signal_id = self.store.log_signal(event.wallet, event.coin, event.side, event.kind, None, "SKIPPED", scoring_decision.reason)
             self.scoring_engine.observe_signal(event, signal_id, "SKIPPED", scoring_decision.reason, event.entry_price)
             print(f"[SCORING] {event.kind} {event.coin} {event.side}: {scoring_decision.reason}")
+            return
+
+        if wind_down:
+            reason = "wind-down"
+            signal_id = self.store.log_signal(
+                event.wallet, event.coin, event.side, event.kind,
+                event.entry_price, "SKIPPED", reason,
+            )
+            self.scoring_engine.observe_signal(
+                event, signal_id, "SKIPPED", reason, event.entry_price
+            )
+            print(f"[SKIP] {event.kind} {event.coin} {event.side}: {reason}")
+            return
+
+        if not self._apply_ranked_opposite_override(
+            event, scoring_score, live_held
+        ):
+            existing = self.paper.position(event.coin)
+            incumbent_wallets = sorted({
+                str(row["source_wallet"])
+                for row in self.store.open_position_slices(event.coin)
+            })
+            incumbent_scores = [
+                self.scoring_engine.score_wallet(wallet)
+                for wallet in incumbent_wallets
+            ]
+            incumbent = max(
+                incumbent_scores,
+                key=lambda score: self._tier_rank(score.tier),
+                default=None,
+            )
+            reason = (
+                f"opposite side held by equal/superior wallet "
+                f"{incumbent.tier} {incumbent.total_score:.1f}"
+                if existing is not None and incumbent is not None
+                else "ranked reversal close incomplete"
+            )
+            signal_id = self.store.log_signal(
+                event.wallet, event.coin, event.side, event.kind,
+                event.entry_price, "SKIPPED", reason,
+            )
+            self.scoring_engine.observe_signal(
+                event, signal_id, "SKIPPED", reason, event.entry_price
+            )
+            print(f"[SKIP] {event.kind} {event.coin} {event.side}: {reason}")
             return
 
         is_add = event.kind == "ADD"

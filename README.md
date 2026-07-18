@@ -138,6 +138,14 @@ Same-side live additions are supported only when the local and Hyperliquid books
 are synchronized. Adds inherit the coin's existing leverage, create a separate
 wallet allocation slice, and remain subject to wallet, slice, coin-cost, and
 buying-power limits.
+Live `ENTRY` and `ADD` events expire after five minutes by default
+(`LIVE_ENTRY_EVENT_MAX_AGE_SECS`). Durable exchange intents are recovered even
+after that limit because an order may already have reached Hyperliquid, and
+`EXIT` events never expire. An incoming opposite-side signal may replace an
+existing position only when its wallet tier is strictly higher than every
+incumbent wallet tier (Elite over Core, Core over Candidate). The incumbent
+side must close successfully before the replacement order is considered;
+numeric score differences within the same tier do not trigger reversals.
 Confirmed average close fills drive live-ledger realized PnL and copied-wallet
 scoring. The execution audit retains the pre-order quote, adverse slippage in
 basis points, and whether pricing came from an exchange fill or a midpoint
