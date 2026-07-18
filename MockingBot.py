@@ -863,7 +863,7 @@ class Store:
                 actual_action TEXT NOT NULL,
                 actual_reason TEXT,
                 marshal_tier TEXT NOT NULL,
-                scoring_score REAL NOT NULL,
+                marshal_score REAL NOT NULL,
                 recommendation TEXT NOT NULL,
                 would_execute INTEGER NOT NULL,
                 reason TEXT NOT NULL
@@ -877,7 +877,7 @@ class Store:
                 entry_price REAL NOT NULL,
                 opened_at TEXT NOT NULL,
                 source_signal_id INTEGER,
-                scoring_score REAL NOT NULL,
+                marshal_score REAL NOT NULL,
                 marshal_tier TEXT NOT NULL,
                 status TEXT NOT NULL,
                 exit_price REAL,
@@ -963,6 +963,7 @@ class Store:
         self._ensure_column("decision_audit", "policy_fingerprint", "TEXT")
         self._ensure_column("decision_audit", "environment_fingerprint", "TEXT")
         self._ensure_column("execution_audit", "price_source", "TEXT")
+        self._migrate_scoring_journal_score_columns()
         self._migrate_legacy_paper_positions()
 
     def _ensure_column(self, table: str, column: str, declaration: str) -> None:
@@ -970,6 +971,23 @@ class Store:
         if column not in columns:
             self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
             self.conn.commit()
+
+    def _migrate_scoring_journal_score_columns(self) -> None:
+        """Normalize databases created during the scoring_score naming window."""
+        for table in ("marshal_signal_journal", "marshal_shadow_positions"):
+            columns = {
+                str(row["name"])
+                for row in self.conn.execute(f"PRAGMA table_info({table})")
+            }
+            if "marshal_score" not in columns:
+                self._ensure_column(table, "marshal_score", "REAL")
+                columns.add("marshal_score")
+            if "scoring_score" in columns:
+                with self.conn:
+                    self.conn.execute(
+                        f"UPDATE {table} SET marshal_score = scoring_score "
+                        "WHERE marshal_score IS NULL"
+                    )
 
     def bootstrap_scoring_history(self, source_path: Path) -> dict[str, Any]:
         existing = self.get_json("scoring_bootstrap", {})

@@ -15,6 +15,47 @@ from tests.helpers import settings
 
 
 class SQLiteTests(unittest.TestCase):
+    def test_scoring_journal_column_name_is_migrated(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "legacy.sqlite3"
+            conn = sqlite3.connect(path)
+            try:
+                conn.execute(
+                    "CREATE TABLE marshal_signal_journal "
+                    "(id INTEGER PRIMARY KEY, scoring_score REAL)"
+                )
+                conn.execute(
+                    "CREATE TABLE marshal_shadow_positions "
+                    "(id INTEGER PRIMARY KEY, scoring_score REAL)"
+                )
+                conn.execute(
+                    "INSERT INTO marshal_signal_journal(id, scoring_score) VALUES(1, 71.5)"
+                )
+                conn.execute(
+                    "INSERT INTO marshal_shadow_positions(id, scoring_score) VALUES(1, 68.25)"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            store = core.Store(path)
+            try:
+                for table, expected in (
+                    ("marshal_signal_journal", 71.5),
+                    ("marshal_shadow_positions", 68.25),
+                ):
+                    columns = {
+                        row["name"]
+                        for row in store.conn.execute(f"PRAGMA table_info({table})")
+                    }
+                    self.assertIn("marshal_score", columns)
+                    actual = store.conn.execute(
+                        f"SELECT marshal_score FROM {table} WHERE id = 1"
+                    ).fetchone()[0]
+                    self.assertEqual(actual, expected)
+            finally:
+                store.conn.close()
+
     def test_wal_reader_and_locked_writer_retry(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db = Path(td) / "contention.sqlite3"
