@@ -236,6 +236,7 @@ def aggregate_positions(allocations: list[dict[str, Any]]) -> list[dict[str, Any
                 "allocation_count": 0,
                 "wallets": [],
                 "wallet_statuses": [],
+                "opened_times": [],
                 "last_price": alloc["last_price"],
             },
         )
@@ -248,6 +249,7 @@ def aggregate_positions(allocations: list[dict[str, Any]]) -> list[dict[str, Any
         group["allocation_count"] += 1
         group["wallets"].append(alloc["wallet_short"])
         group["wallet_statuses"].append(alloc["wallet_status"])
+        group["opened_times"].append(alloc["opened_at"])
         group["last_price"] = alloc["last_price"] or group["last_price"]
         if alloc["pnl_usd"] is None:
             group["pnl_known"] = False
@@ -277,6 +279,8 @@ def aggregate_positions(allocations: list[dict[str, Any]]) -> list[dict[str, Any
                 "wallets": group["wallets"][:4] + (["..."] if len(group["wallets"]) > 4 else []),
                 "wallet_statuses": group["wallet_statuses"][:4]
                 + (["..."] if len(group["wallet_statuses"]) > 4 else []),
+                "opened_times": group["opened_times"][:4]
+                + (["..."] if len(group["opened_times"]) > 4 else []),
             }
         )
     return sorted(positions, key=lambda p: (p["coin"], p["side"]))
@@ -786,13 +790,11 @@ HTML = r"""<!doctype html>
           </tr>`), "No quarantined coins.");
       }
 
-      table(document.getElementById("positions"), ["Coin", "Side", "Alloc", "Local Lev", "HL Lev", "HL Size", "Δ / Tol", "Cost", "Entry", "Last", "Open PnL", "Wallets", "Status"],
+      table(document.getElementById("positions"), ["Coin", "Side", "Alloc", "Opened", "Cost", "Entry", "Last", "Open PnL", "Wallets", "Status"],
         data.positions.map(p => `<tr>
           <td><strong>${esc(p.coin)}</strong></td><td><span class="pill">${esc(p.side)}</span></td>
-          <td>${p.allocation_count}</td><td>${Number(p.leverage).toFixed(1)}x</td>
-          <td>${p.exchange_leverage ? `${Number(p.exchange_leverage).toFixed(1)}x` : "n/a"}</td>
-          <td>${p.exchange_size === null || p.exchange_size === undefined ? "n/a" : Number(p.exchange_size).toLocaleString()}</td>
-          <td class="${p.size_difference > p.size_tolerance ? "bad" : "muted"}">${p.size_difference === null || p.size_difference === undefined ? "n/a" : `${Number(p.size_difference).toPrecision(3)} / ${Number(p.size_tolerance).toPrecision(3)}`}</td>
+          <td>${p.allocation_count}</td>
+          <td class="muted">${listCell((p.opened_times || []).map(ts => ts === "..." ? ts : String(ts || "").replace("T", " ").slice(5, 19)))}</td>
           <td>${fmtMoney(p.cost_basis)}</td>
           <td>${Number(p.entry_price).toLocaleString(undefined, {maximumFractionDigits: 6})}</td>
           <td>${p.last_price ? Number(p.last_price).toLocaleString(undefined, {maximumFractionDigits: 6}) : "n/a"}</td>
