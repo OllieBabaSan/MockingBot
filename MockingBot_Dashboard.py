@@ -181,7 +181,7 @@ def open_allocations(
         SELECT id, coin, side, source_wallet, entry_price, cost_basis, leverage, opened_at
         FROM paper_position_slices
         WHERE status = 'OPEN'
-        ORDER BY coin, side, opened_at, id
+        ORDER BY opened_at DESC, id DESC
         """
     ).fetchall()
     allocations: list[dict[str, Any]] = []
@@ -283,7 +283,16 @@ def aggregate_positions(allocations: list[dict[str, Any]]) -> list[dict[str, Any
                 + (["..."] if len(group["opened_times"]) > 4 else []),
             }
         )
-    return sorted(positions, key=lambda p: (p["coin"], p["side"]))
+    # Keep the most recently opened position at the top.  A position can have
+    # multiple wallet allocations, so its newest allocation controls the row's
+    # recency and the allocation timestamps are newest-first as well.
+    for position in positions:
+        position["opened_times"].sort(reverse=True)
+    return sorted(
+        positions,
+        key=lambda p: max(p["opened_times"], default=""),
+        reverse=True,
+    )
 
 
 def recent_rows(conn: sqlite3.Connection, table_sql: str, limit: int = 12) -> list[dict[str, Any]]:
