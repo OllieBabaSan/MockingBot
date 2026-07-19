@@ -412,7 +412,7 @@ def dashboard_data() -> dict[str, Any]:
             ORDER BY slices.id DESC
             LIMIT ?
             """,
-            20,
+            10,
         )
         recent_failures = recent_rows(
             conn,
@@ -442,7 +442,7 @@ def dashboard_data() -> dict[str, Any]:
             ORDER BY updated_at DESC
             LIMIT ?
             """,
-            20,
+            8,
         )
         recent_executions = recent_rows(
             conn,
@@ -454,7 +454,7 @@ def dashboard_data() -> dict[str, Any]:
             ORDER BY id DESC
             LIMIT ?
             """,
-            20,
+            8,
         )
         execution_intents = recent_rows(
             conn,
@@ -462,6 +462,7 @@ def dashboard_data() -> dict[str, Any]:
             SELECT updated_at, coin, side, operation, requested_size, leverage,
                    cloid, state
             FROM execution_intents
+            WHERE state IN ('PREPARED', 'SUBMITTING', 'AMBIGUOUS')
             ORDER BY id DESC
             LIMIT ?
             """,
@@ -608,7 +609,7 @@ HTML = r"""<!doctype html>
       padding: 10px;
       border-bottom: 1px solid var(--line);
     }
-    details { margin-top: 10px; }
+    details { margin: 0; }
     summary {
       cursor: pointer;
       list-style: none;
@@ -677,8 +678,38 @@ HTML = r"""<!doctype html>
       .stats { gap: 7px; }
       .stat { min-height: 58px; padding: 8px; }
       .value { font-size: 1rem; }
-      table { min-width: 640px; }
+      .compact-table { min-width: 0; }
+      .compact-table thead { display: none; }
+      .compact-table, .compact-table tbody, .compact-table tr,
+      .compact-table td { display: block; width: 100%; }
+      .compact-table tr {
+        padding: 7px 9px;
+        border-bottom: 1px solid var(--line);
+      }
+      .compact-table tr:last-child { border-bottom: 0; }
+      .compact-table td {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 14px;
+        padding: 4px 0;
+        border: 0;
+        text-align: right;
+        white-space: normal;
+        font-size: .8rem;
+      }
+      .compact-table td::before {
+        content: attr(data-label);
+        color: var(--muted);
+        flex: 0 0 auto;
+        font-size: .65rem;
+        font-weight: 700;
+        text-transform: uppercase;
+      }
+      .compact-table .cell-list { justify-items: end; }
+      table:not(.compact-table) { min-width: 620px; }
       th, td { padding: 8px; font-size: .78rem; }
+      .updated { max-width: 94vw; line-height: 1.35; }
     }
   </style>
 </head>
@@ -705,23 +736,25 @@ HTML = r"""<!doctype html>
     </section>
     <section>
       <h2>Open Positions</h2>
-      <div class="table-wrap"><table id="positions"></table></div>
+      <div class="table-wrap"><table class="compact-table" id="positions"></table></div>
     </section>
     <section>
       <h2>Recent Closes</h2>
-      <div class="table-wrap"><table id="closes"></table></div>
+      <div class="table-wrap"><table class="compact-table" id="closes"></table></div>
     </section>
     <section id="live-operations-section" hidden>
-      <h2>Live Account Operations</h2>
-      <div class="ops-grid" id="live-operations"></div>
+      <details>
+        <summary>Live Diagnostics</summary>
+        <div class="ops-grid" id="live-operations"></div>
+      </details>
     </section>
     <section>
       <h2>Execution Confirmations</h2>
-      <div class="table-wrap"><table id="executions"></table></div>
+      <div class="table-wrap"><table class="compact-table" id="executions"></table></div>
     </section>
-    <section>
-      <h2>Durable Exchange Intents</h2>
-      <div class="table-wrap"><table id="execution-intents"></table></div>
+    <section class="alert-panel" id="execution-intents-section" hidden>
+      <h2>Execution Attention Required</h2>
+      <div class="table-wrap"><table class="compact-table" id="execution-intents"></table></div>
     </section>
     <section class="api-panel">
       <details>
@@ -753,7 +786,7 @@ HTML = r"""<!doctype html>
     if (![...timezoneSelect.options].some(option => option.selected)) {
       timezoneSelect.value = browserTimezone;
     }
-    const fmtTime = value => {
+    const fmtTime = (value, compact = false) => {
       if (!value || value === "...") return value || "";
       let raw = String(value).trim();
       if (!/[zZ]$|[+-]\d\d:?\d\d$/.test(raw)) raw = `${raw.replace(" ", "T")}Z`;
@@ -761,10 +794,12 @@ HTML = r"""<!doctype html>
       if (Number.isNaN(parsed.getTime())) return String(value);
       return new Intl.DateTimeFormat(undefined, {
         timeZone: timezoneSelect.value || browserTimezone,
-        month: "short", day: "numeric", year: "numeric",
-        hour: "numeric", minute: "2-digit", second: "2-digit", hour12: true,
+        month: "short", day: "numeric",
+        ...(compact ? {} : {year: "numeric", second: "2-digit"}),
+        hour: "numeric", minute: "2-digit", hour12: true,
       }).format(parsed);
     };
+    const fmtTradeTime = value => fmtTime(value, true);
     timezoneSelect.addEventListener("change", () => {
       localStorage.setItem("mockingbot-timezone", timezoneSelect.value);
       load();
@@ -854,55 +889,45 @@ HTML = r"""<!doctype html>
           </tr>`), "No quarantined coins.");
       }
 
-      table(document.getElementById("positions"), ["Coin", "Side", "Alloc", "Opened", "Cost", "Entry", "Last", "Open PnL", "Wallets", "Status"],
+      table(document.getElementById("positions"), ["Market", "Opened", "Margin", "Entry", "Last", "Open PnL", "Source"],
         data.positions.map(p => `<tr>
-          <td><strong>${esc(p.coin)}</strong></td><td><span class="pill">${esc(p.side)}</span></td>
-          <td>${p.allocation_count}</td>
-          <td class="muted">${listCell((p.opened_times || []).map(fmtTime))}</td>
-          <td>${fmtMoney(p.cost_basis)}</td>
-          <td>${Number(p.entry_price).toLocaleString(undefined, {maximumFractionDigits: 6})}</td>
-          <td>${p.last_price ? Number(p.last_price).toLocaleString(undefined, {maximumFractionDigits: 6}) : "n/a"}</td>
-          <td class="${clsNum(p.pnl_usd)}">${fmtMoney(p.pnl_usd)} <span class="muted">${fmtPct(p.pnl_pct)}</span></td>
-          <td class="muted">${listCell(p.wallets)}</td>
-          <td class="muted">${listCell(p.wallet_statuses)}</td>
+          <td data-label="Market"><strong>${esc(p.coin)}</strong> <span class="pill">${esc(p.side)}</span>${p.allocation_count > 1 ? ` <span class="muted">×${p.allocation_count}</span>` : ""}</td>
+          <td data-label="Opened" class="muted">${listCell((p.opened_times || []).map(fmtTradeTime))}</td>
+          <td data-label="Margin">${fmtMoney(p.cost_basis)}</td>
+          <td data-label="Entry">${Number(p.entry_price).toLocaleString(undefined, {maximumFractionDigits: 6})}</td>
+          <td data-label="Last">${p.last_price ? Number(p.last_price).toLocaleString(undefined, {maximumFractionDigits: 6}) : "n/a"}</td>
+          <td data-label="Open PnL" class="${clsNum(p.pnl_usd)}">${fmtMoney(p.pnl_usd)} <span class="muted">${fmtPct(p.pnl_pct)}</span></td>
+          <td data-label="Source" class="muted">${listCell((p.wallets || []).map((wallet, index) => `${wallet}${p.wallet_statuses?.[index] ? ` · ${p.wallet_statuses[index]}` : ""}`))}</td>
         </tr>`), "No open positions.");
 
-      table(document.getElementById("closes"), ["Time", "Coin", "Side", "Wallet", "Status", "Lev", "Cost", "Result"],
+      table(document.getElementById("closes"), ["Closed", "Market", "Margin", "Result", "Source"],
         data.recent_closes.map(s => `<tr>
-          <td class="muted">${esc(fmtTime(s.ts))}</td>
-          <td><strong>${esc(s.coin)}</strong></td><td>${esc(s.side)}</td>
-          <td class="muted">${esc(shortWallet(s.wallet))}</td>
-          <td class="muted">${esc(s.wallet_tier === "Unscored" ? "Unscored" : `${s.wallet_tier} ${Number(s.wallet_score).toFixed(1)}`)}</td>
-          <td>${Number(s.leverage).toFixed(1)}x</td>
-          <td>${fmtMoney(s.cost_basis)}</td>
-          <td class="${clsNum(s.paper_gain)}">${fmtMoney(s.paper_gain)} <span class="muted">${fmtPct(s.pnl_pct)}</span></td>
+          <td data-label="Closed" class="muted">${esc(fmtTradeTime(s.ts))}</td>
+          <td data-label="Market"><strong>${esc(s.coin)}</strong> <span class="pill">${esc(s.side)}</span></td>
+          <td data-label="Margin">${fmtMoney(s.cost_basis)}</td>
+          <td data-label="Result" class="${clsNum(s.paper_gain)}">${fmtMoney(s.paper_gain)} <span class="muted">${fmtPct(s.pnl_pct)}</span></td>
+          <td data-label="Source" class="muted">${esc(shortWallet(s.wallet))} · ${esc(s.wallet_tier === "Unscored" ? "Unscored" : `${s.wallet_tier} ${Number(s.wallet_score).toFixed(1)}`)}</td>
         </tr>`), "No executed closes yet.");
 
-      table(document.getElementById("executions"), ["Time", "Coin", "Op", "Req Lev", "Effective", "Requested", "Filled", "Avg Fill", "Quote", "Slip", "Source", "Order", "Confirmed", "Detail"],
+      table(document.getElementById("executions"), ["Time", "Market", "Action", "Filled", "Avg Fill", "Status"],
         (data.recent_executions || []).map(x => `<tr>
-          <td class="muted">${esc(fmtTime(x.ts))}</td><td><strong>${esc(x.coin)}</strong></td>
-          <td>${esc(x.operation)}</td>
-          <td>${x.requested_leverage ? `${Number(x.requested_leverage).toFixed(1)}x` : "n/a"}</td>
-          <td>${x.leverage ? `${Number(x.leverage).toFixed(1)}x` : "n/a"}</td><td>${Number(x.requested_size || 0).toLocaleString()}</td>
-          <td>${Number(x.filled_size || 0).toLocaleString()}</td>
-          <td>${x.avg_fill_price ? Number(x.avg_fill_price).toLocaleString(undefined, {maximumFractionDigits: 6}) : "n/a"}</td>
-          <td>${x.reference_price ? Number(x.reference_price).toLocaleString(undefined, {maximumFractionDigits: 6}) : "n/a"}</td>
-          <td class="${clsNum(-(x.slippage_bps || 0))}">${x.slippage_bps === null || x.slippage_bps === undefined ? "n/a" : `${Number(x.slippage_bps).toFixed(1)} bp`}</td>
-          <td class="muted">${esc(x.price_source || "")}</td>
-          <td class="muted">${esc(x.order_id || "")}</td>
-          <td class="${x.confirmed ? "good" : "bad"}">${x.confirmed ? "yes" : "no"}</td>
-          <td class="muted">${esc(x.detail || x.exchange_status || "")}</td>
+          <td data-label="Time" class="muted">${esc(fmtTradeTime(x.ts))}</td>
+          <td data-label="Market"><strong>${esc(x.coin)}</strong> <span class="pill">${esc(x.side || "")}</span></td>
+          <td data-label="Action">${esc(x.operation)}</td>
+          <td data-label="Filled">${Number(x.filled_size || 0).toLocaleString(undefined, {maximumFractionDigits: 8})}</td>
+          <td data-label="Avg Fill">${x.avg_fill_price ? Number(x.avg_fill_price).toLocaleString(undefined, {maximumFractionDigits: 6}) : "n/a"}</td>
+          <td data-label="Status" class="${x.confirmed ? "good" : "bad"}">${x.confirmed ? "Confirmed" : `FAILED${x.detail ? ` · ${esc(x.detail)}` : ""}`}</td>
         </tr>`), "No execution records yet.");
 
-      table(document.getElementById("execution-intents"), ["Updated", "Coin", "Side", "Op", "Requested", "Leverage", "Client Order ID", "State"],
-        (data.execution_intents || []).map(x => `<tr>
-          <td class="muted">${esc(fmtTime(x.updated_at))}</td><td><strong>${esc(x.coin)}</strong></td>
-          <td>${esc(x.side || "")}</td><td>${esc(x.operation)}</td>
-          <td>${Number(x.requested_size || 0).toLocaleString()}</td>
-          <td>${x.leverage ? `${Number(x.leverage).toFixed(1)}x` : "n/a"}</td>
-          <td class="muted">${esc(x.cloid)}</td>
-          <td class="${["PREPARED", "SUBMITTING", "AMBIGUOUS"].includes(x.state) ? "bad" : "good"}">${esc(x.state)}</td>
-        </tr>`), "No durable exchange intents yet.");
+      const unresolvedIntents = data.execution_intents || [];
+      document.getElementById("execution-intents-section").hidden = unresolvedIntents.length === 0;
+      table(document.getElementById("execution-intents"), ["Updated", "Market", "Action", "State"],
+        unresolvedIntents.map(x => `<tr>
+          <td data-label="Updated" class="muted">${esc(fmtTradeTime(x.updated_at))}</td>
+          <td data-label="Market"><strong>${esc(x.coin)}</strong> <span class="pill">${esc(x.side || "")}</span></td>
+          <td data-label="Action">${esc(x.operation)}</td>
+          <td data-label="State" class="bad">${esc(x.state)}</td>
+        </tr>`), "No unresolved exchange intents.");
 
       const failures = document.getElementById("failures");
       if (!data.recent_failures.length) {
