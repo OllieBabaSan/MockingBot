@@ -447,11 +447,53 @@ def dashboard_data() -> dict[str, Any]:
         recent_executions = recent_rows(
             conn,
             """
-            SELECT ts, coin, side, operation, requested_leverage, leverage, requested_size, filled_size,
-                   avg_fill_price, reference_price, slippage_bps, price_source,
-                   order_id, exchange_status, confirmed, detail
-            FROM execution_audit
-            ORDER BY id DESC
+            SELECT
+                executions.ts,
+                executions.coin,
+                executions.side,
+                executions.operation,
+                executions.requested_leverage,
+                executions.leverage,
+                executions.requested_size,
+                executions.filled_size,
+                executions.avg_fill_price,
+                executions.reference_price,
+                executions.slippage_bps,
+                executions.price_source,
+                executions.order_id,
+                executions.exchange_status,
+                executions.confirmed,
+                executions.detail,
+                COALESCE((
+                    SELECT decisions.wallet_tier
+                    FROM decision_audit decisions
+                    WHERE decisions.coin = executions.coin
+                      AND (executions.side IS NULL OR decisions.side = executions.side)
+                      AND decisions.action = 'EXECUTED'
+                      AND (
+                        (executions.operation = 'OPEN' AND decisions.signal IN ('ENTRY', 'ADD'))
+                        OR (executions.operation = 'CLOSE' AND decisions.signal = 'EXIT')
+                      )
+                      AND ABS(strftime('%s', decisions.ts) - strftime('%s', executions.ts)) <= 120
+                    ORDER BY decisions.id DESC
+                    LIMIT 1
+                ), 'System') AS wallet_tier,
+                (
+                    SELECT decisions.wallet_score
+                    FROM decision_audit decisions
+                    WHERE decisions.coin = executions.coin
+                      AND (executions.side IS NULL OR decisions.side = executions.side)
+                      AND decisions.action = 'EXECUTED'
+                      AND (
+                        (executions.operation = 'OPEN' AND decisions.signal IN ('ENTRY', 'ADD'))
+                        OR (executions.operation = 'CLOSE' AND decisions.signal = 'EXIT')
+                      )
+                      AND ABS(strftime('%s', decisions.ts) - strftime('%s', executions.ts)) <= 120
+                    ORDER BY decisions.id DESC
+                    LIMIT 1
+                ) AS wallet_score
+            FROM execution_audit executions
+            ORDER BY executions.id DESC
             LIMIT ?
             """,
             8,
@@ -911,11 +953,12 @@ HTML = r"""<!doctype html>
           <td data-label="Tier" class="muted">${esc(s.wallet_tier === "Unscored" ? "Unscored" : `${s.wallet_tier} ${Number(s.wallet_score).toFixed(1)}`)}</td>
         </tr>`), "No executed closes yet.");
 
-      table(document.getElementById("executions"), ["Time", "Market", "Action", "Filled", "Avg Fill", "Status"],
+      table(document.getElementById("executions"), ["Time", "Market", "Action", "Tier", "Filled", "Avg Fill", "Status"],
         (data.recent_executions || []).map(x => `<tr>
           <td data-label="Time" class="muted">${esc(fmtTradeTime(x.ts))}</td>
           <td data-label="Market"><strong>${esc(x.coin)}</strong> <span class="pill">${esc(x.side || "")}</span></td>
           <td data-label="Action">${esc(x.operation)}</td>
+          <td data-label="Tier" class="muted">${esc(x.wallet_tier === "System" ? "System" : `${x.wallet_tier} ${Number(x.wallet_score).toFixed(1)}`)}</td>
           <td data-label="Filled">${Number(x.filled_size || 0).toLocaleString(undefined, {maximumFractionDigits: 8})}</td>
           <td data-label="Avg Fill">${x.avg_fill_price ? Number(x.avg_fill_price).toLocaleString(undefined, {maximumFractionDigits: 6}) : "n/a"}</td>
           <td data-label="Status" class="${x.confirmed ? "good" : "bad"}">${x.confirmed ? "Confirmed" : `FAILED${x.detail ? ` · ${esc(x.detail)}` : ""}`}</td>
