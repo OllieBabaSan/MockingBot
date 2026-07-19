@@ -889,7 +889,7 @@ HTML = r"""<!doctype html>
           </tr>`), "No quarantined coins.");
       }
 
-      table(document.getElementById("positions"), ["Market", "Opened", "Margin", "Entry", "Last", "Open PnL", "Source"],
+      table(document.getElementById("positions"), ["Market", "Opened", "Margin", "Entry", "Last", "Open PnL", "Source", "Tier"],
         data.positions.map(p => `<tr>
           <td data-label="Market"><strong>${esc(p.coin)}</strong> <span class="pill">${esc(p.side)}</span>${p.allocation_count > 1 ? ` <span class="muted">×${p.allocation_count}</span>` : ""}</td>
           <td data-label="Opened" class="muted">${listCell((p.opened_times || []).map(fmtTradeTime))}</td>
@@ -897,16 +897,18 @@ HTML = r"""<!doctype html>
           <td data-label="Entry">${Number(p.entry_price).toLocaleString(undefined, {maximumFractionDigits: 6})}</td>
           <td data-label="Last">${p.last_price ? Number(p.last_price).toLocaleString(undefined, {maximumFractionDigits: 6}) : "n/a"}</td>
           <td data-label="Open PnL" class="${clsNum(p.pnl_usd)}">${fmtMoney(p.pnl_usd)} <span class="muted">${fmtPct(p.pnl_pct)}</span></td>
-          <td data-label="Source" class="muted">${listCell((p.wallets || []).map((wallet, index) => `${wallet}${p.wallet_statuses?.[index] ? ` · ${p.wallet_statuses[index]}` : ""}`))}</td>
+          <td data-label="Source" class="muted">${listCell(p.wallets || [])}</td>
+          <td data-label="Tier" class="muted">${listCell(p.wallet_statuses || [])}</td>
         </tr>`), "No open positions.");
 
-      table(document.getElementById("closes"), ["Closed", "Market", "Margin", "Result", "Source"],
+      table(document.getElementById("closes"), ["Closed", "Market", "Margin", "Result", "Source", "Tier"],
         data.recent_closes.map(s => `<tr>
           <td data-label="Closed" class="muted">${esc(fmtTradeTime(s.ts))}</td>
           <td data-label="Market"><strong>${esc(s.coin)}</strong> <span class="pill">${esc(s.side)}</span></td>
           <td data-label="Margin">${fmtMoney(s.cost_basis)}</td>
           <td data-label="Result" class="${clsNum(s.paper_gain)}">${fmtMoney(s.paper_gain)} <span class="muted">${fmtPct(s.pnl_pct)}</span></td>
-          <td data-label="Source" class="muted">${esc(shortWallet(s.wallet))} · ${esc(s.wallet_tier === "Unscored" ? "Unscored" : `${s.wallet_tier} ${Number(s.wallet_score).toFixed(1)}`)}</td>
+          <td data-label="Source" class="muted">${esc(shortWallet(s.wallet))}</td>
+          <td data-label="Tier" class="muted">${esc(s.wallet_tier === "Unscored" ? "Unscored" : `${s.wallet_tier} ${Number(s.wallet_score).toFixed(1)}`)}</td>
         </tr>`), "No executed closes yet.");
 
       table(document.getElementById("executions"), ["Time", "Market", "Action", "Filled", "Avg Fill", "Status"],
