@@ -38,6 +38,7 @@ PRICE_CACHE_SECONDS = int(os.getenv("MOCKINGBOT_DASHBOARD_PRICE_CACHE_SECS", "15
 EQUITY_MAX_AGE_SECONDS = int(
     os.getenv("MOCKINGBOT_DASHBOARD_EQUITY_MAX_AGE_SECS", "90")
 )
+PAPER_STARTING_EQUITY = float(os.getenv("PAPER_STARTING_CASH", "10000"))
 
 _PRICE_CACHE: dict[str, float] = {}
 _PRICE_CACHE_TS = 0.0
@@ -316,22 +317,24 @@ def dashboard_data() -> dict[str, Any]:
         last_entry_rollback = get_json(conn, "last_entry_rollback", {}) if MODE == "live" else {}
         if MODE == "live":
             risk_baseline = get_json(conn, "live_risk_baseline", {})
-            baseline = float(
-                risk_baseline.get("high_water_value")
+            starting_equity = float(
+                identity.get("initial_account_value")
                 or risk_baseline.get("start_value")
-                or identity.get("initial_account_value")
                 or acct.get("cash")
                 or 0.0
             )
-            baseline_source = (
-                "risk-high-water"
-                if risk_baseline.get("high_water_value") is not None
-                else "live-start"
+            risk_reference = float(
+                risk_baseline.get("high_water_value")
+                or risk_baseline.get("start_value")
+                or starting_equity
+                or acct.get("cash")
+                or 0.0
             )
+            baseline_source = "live-initial-equity"
         else:
-            session = get_json(conn, "session", {})
-            baseline = float(session.get("paper_start") or 10_000.0)
-            baseline_source = "paper-session"
+            starting_equity = PAPER_STARTING_EQUITY
+            risk_reference = starting_equity
+            baseline_source = "paper-starting-equity"
         stored_prices = latest_prices(conn)
         live_price_map, price_source = live_prices()
         prices = dict(stored_prices)
@@ -363,8 +366,8 @@ def dashboard_data() -> dict[str, Any]:
             equity_age_seconds = None
             estimated_value = local_estimate
         drawdown = (
-            ((baseline - estimated_value) / baseline * 100.0)
-            if baseline and estimated_value is not None
+            ((risk_reference - estimated_value) / risk_reference * 100.0)
+            if risk_reference and estimated_value is not None
             else None
         )
 
@@ -490,8 +493,9 @@ def dashboard_data() -> dict[str, Any]:
                 if MODE == "live" and estimated_value is None else ""
             ),
             "drawdown_pct": None if drawdown is None else max(0.0, drawdown),
-            "baseline": baseline,
+            "baseline": starting_equity,
             "baseline_source": baseline_source,
+            "risk_reference": risk_reference,
             "counts": dict(counts) if counts else {},
             "positions": positions,
             "allocations": allocations,
@@ -801,7 +805,7 @@ HTML = r"""<!doctype html>
       const backup = data.backup_status || {};
       const cards = [
         [data.mode === "live" ? "Live Equity" : "Paper Value", fmtMoney(data.estimated_value), data.estimated_value === null || data.estimated_value === undefined ? "bad" : clsNum(data.estimated_value - data.baseline)],
-        [data.mode === "live" ? "Breaker High-Water" : "Session Baseline", fmtMoney(data.baseline), ""],
+        ["Starting Equity", fmtMoney(data.baseline), ""],
         ["Drawdown", fmtPct(data.drawdown_pct === null || data.drawdown_pct === undefined ? null : -data.drawdown_pct), data.drawdown_pct > 0 ? "bad" : ""],
         ["Cash", fmtMoney(data.cash), ""],
         ["Positions", String(data.positions.length), ""],

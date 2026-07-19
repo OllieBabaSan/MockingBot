@@ -19,7 +19,7 @@ class DashboardModeTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def test_paper_dashboard_uses_paper_session_baseline(self) -> None:
+    def test_paper_dashboard_uses_fixed_starting_equity(self) -> None:
         configured = settings(self.root / "paper")
         store = core.Store(configured.db_path)
         try:
@@ -34,7 +34,9 @@ class DashboardModeTests(unittest.TestCase):
             data = dashboard.dashboard_data()
         self.assertTrue(data["ok"])
         self.assertEqual(data["instance_label"], "PAPER")
-        self.assertEqual(data["baseline"], 10_025.0)
+        self.assertEqual(data["baseline"], 10_000.0)
+        self.assertEqual(data["baseline_source"], "paper-starting-equity")
+        self.assertEqual(data["risk_reference"], 10_000.0)
         self.assertEqual(data["estimated_value"], 10_050.0)
         self.assertEqual(data["equity_source"], "paper-ledger")
 
@@ -76,8 +78,9 @@ class DashboardModeTests(unittest.TestCase):
             data = dashboard.dashboard_data()
         self.assertTrue(data["ok"])
         self.assertEqual(data["instance_label"], "LIVE")
-        self.assertEqual(data["baseline"], 510.0)
-        self.assertEqual(data["baseline_source"], "risk-high-water")
+        self.assertEqual(data["baseline"], 500.0)
+        self.assertEqual(data["baseline_source"], "live-initial-equity")
+        self.assertEqual(data["risk_reference"], 510.0)
         self.assertEqual(data["estimated_value"], 475.0)
         self.assertEqual(data["equity_source"], "bot-risk-feed")
         self.assertAlmostEqual(data["drawdown_pct"], 35 / 510 * 100)
