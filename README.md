@@ -183,6 +183,12 @@ Live size reconciliation starts at a 1% relative tolerance
 The setting cannot exceed 1%. The Live dashboard shows measured size difference
 and permitted tolerance; synchronized positions clear their quarantine
 automatically.
+Each live allocation also records its authoritative exchange-filled quantity;
+partial wallet exits close that exact quantity instead of reconstructing units
+from cent-rounded margin. When the exiting wallet owns every remaining slice for
+a coin, the bot requests the complete verified exchange position and requires a
+flat terminal state. Any measured whole-unit dust is retried once before local
+ownership is cleared.
 Each live cycle validates the exchange book before source-wallet reconciliation.
 Source-driven and signal-driven closes are skipped for quarantined coins until
 side, leverage, and size synchronization clears the quarantine; unrelated coins

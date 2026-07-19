@@ -530,6 +530,21 @@ class ExecutionReconciliationTests(unittest.TestCase):
             paper.allocation_position_size("wallet-b", "BTC", "LONG"), 0.60
         )
 
+    def test_wallet_allocation_uses_exact_exchange_fill_size(self) -> None:
+        paper = core.PaperPortfolio(self.settings, self.store)
+        paper.open(
+            "wallet-a", "kPEPE", "LONG", 0.002832260029209785,
+            30.381633, leverage=3, filled_size=32181.0,
+        )
+
+        row = self.store.open_position_slices("kPEPE")[0]
+        self.assertEqual(row["cost_basis"], 30.38)
+        self.assertEqual(row["filled_size"], 32181.0)
+        self.assertEqual(
+            paper.allocation_position_size("wallet-a", "kPEPE", "LONG"),
+            32181.0,
+        )
+
     def test_reconciler_uses_confirmed_fill_price_for_local_pnl(self) -> None:
         paper = core.PaperPortfolio(self.settings, self.store)
         paper.open("wallet-a", "BTC", "LONG", 100, 10, leverage=3)
@@ -557,6 +572,39 @@ class ExecutionReconciliationTests(unittest.TestCase):
         self.assertEqual(signal["price"], 90.0)
         self.assertEqual(signal["paper_gain"], -3.0)
         self.assertIn("price_source=exchange_fill", signal["reason"])
+
+    def test_reconciler_uses_exact_partial_size_then_full_final_close(self) -> None:
+        paper = core.PaperPortfolio(self.settings, self.store)
+        paper.open(
+            "wallet-a", "BTC", "LONG", 100, 10,
+            leverage=3, filled_size=0.301,
+        )
+        paper.open(
+            "wallet-b", "BTC", "LONG", 100, 20,
+            leverage=3, filled_size=0.602,
+        )
+        requested_sizes: list[float | None] = []
+
+        self.adapter.mid_price = lambda _coin: 100.0
+
+        def close_position(_coin, size=None, _price=None, _intent_key=None):
+            requested_sizes.append(size)
+            return core.ExecutionResult(
+                True, size or 0.602, size or 0.602, 100.0,
+                status="filled", confirmed=True,
+            )
+
+        self.adapter.close_position = close_position
+        reconciler = core.Reconciler(
+            self.settings, self.store, self.adapter, paper,
+            core.RiskManager(self.settings, self.store, core.Notifier("")),
+        )
+
+        reconciler._force_close("BTC", "wallet-a", "LONG", "test partial")
+        reconciler._force_close("BTC", "wallet-b", "LONG", "test final")
+
+        self.assertEqual(requested_sizes, [0.301, None])
+        self.assertIsNone(paper.position("BTC"))
 
     def test_reconciler_does_not_close_quarantined_live_coin(self) -> None:
         paper = core.PaperPortfolio(self.settings, self.store)
@@ -644,6 +692,27 @@ class ExecutionReconciliationTests(unittest.TestCase):
         self.assertEqual(result.status, "recovered")
         self.assertEqual(exchange.closes, 2)
         self.assertIsNone(self.store.coin_quarantine("BTC"))
+
+    def test_full_close_retries_whole_unit_dust_before_success(self) -> None:
+        self.adapter._sz_decimals["kPEPE"] = 0
+        exchange = FakeExchange([
+            fill_response("184716", "0.002824", 8),
+            fill_response("2", "0.002824", 9),
+        ])
+        self.adapter._exchange = exchange
+        states = iter([
+            (True, core.Position("kPEPE", "LONG", 184718.0, 0.002837, 3)),
+            (True, core.Position("kPEPE", "LONG", 2.0, 0.002837, 3)),
+            (True, None),
+        ])
+        self.adapter._confirmed_position = lambda _coin: next(states)
+
+        result = self.adapter.close_position("kPEPE")
+
+        self.assertTrue(result)
+        self.assertTrue(result.confirmed)
+        self.assertEqual(exchange.close_sizes, [184718.0, 2.0])
+        self.assertIsNone(self.store.coin_quarantine("kPEPE"))
 
     def test_lost_close_response_with_unavailable_state_quarantines_coin(self) -> None:
         exchange = FakeExchange([])

@@ -763,6 +763,7 @@ class Store:
                 entry_price REAL NOT NULL,
                 cost_basis REAL NOT NULL,
                 leverage REAL NOT NULL DEFAULT 3,
+                filled_size REAL,
                 opened_at TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'OPEN',
                 closed_at TEXT,
@@ -965,6 +966,7 @@ class Store:
         )
         self.conn.commit()
         self._ensure_column("paper_position_slices", "leverage", "REAL NOT NULL DEFAULT 3")
+        self._ensure_column("paper_position_slices", "filled_size", "REAL")
         self._ensure_column("execution_audit", "leverage", "REAL")
         self._ensure_column("execution_audit", "requested_leverage", "REAL")
         self._ensure_column("execution_audit", "reference_price", "REAL")
@@ -1514,15 +1516,20 @@ class Store:
         cost_basis: float,
         source_wallet: str,
         leverage: float,
+        filled_size: float | None = None,
     ) -> None:
         self.conn.execute(
             """
             INSERT INTO paper_position_slices(
-                coin, side, source_wallet, entry_price, cost_basis, leverage, opened_at, status
+                coin, side, source_wallet, entry_price, cost_basis, leverage,
+                filled_size, opened_at, status
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, 'OPEN')
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')
             """,
-            (coin, side, source_wallet, entry_price, cost_basis, leverage, utc_now()),
+            (
+                coin, side, source_wallet, entry_price, cost_basis, leverage,
+                filled_size, utc_now(),
+            ),
         )
         self.conn.commit()
 
@@ -1535,6 +1542,7 @@ class Store:
         cost_basis: float,
         source_wallet: str,
         leverage: float,
+        filled_size: float | None = None,
     ) -> None:
         """Commit cash, allocation slice, and aggregate position as one ledger change."""
         with self.conn:
@@ -1546,10 +1554,14 @@ class Store:
             self.conn.execute(
                 """
                 INSERT INTO paper_position_slices(
-                    coin, side, source_wallet, entry_price, cost_basis, leverage, opened_at, status
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, 'OPEN')
+                    coin, side, source_wallet, entry_price, cost_basis, leverage,
+                    filled_size, opened_at, status
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')
                 """,
-                (coin, side, source_wallet, entry_price, cost_basis, leverage, utc_now()),
+                (
+                    coin, side, source_wallet, entry_price, cost_basis, leverage,
+                    filled_size, utc_now(),
+                ),
             )
             self._sync_paper_position_tx(coin)
 
@@ -3120,6 +3132,7 @@ class HyperliquidAdapter(PlatformAdapter):
 
         decimals = self._sz_decimals.get(coin, 4)
         tolerance = 10 ** (-decimals) * 1.5
+        close_all = size is None
         requested_size = before.size if size is None else round(float(size), decimals)
         requested_size = min(requested_size, before.size)
         if requested_size <= 0:
@@ -3231,8 +3244,18 @@ class HyperliquidAdapter(PlatformAdapter):
             self._log_close_execution(coin, before.side, result, reference_price)
             return result
 
-        if tolerance < reduction < requested_size - tolerance:
-            retry_size = round(requested_size - reduction, decimals)
+        should_retry = (
+            close_all and remaining is not None and reduction > tolerance
+        ) or (
+            not close_all and tolerance < reduction < requested_size - tolerance
+        )
+        if should_retry:
+            retry_size = round(
+                remaining.size
+                if close_all and remaining is not None
+                else requested_size - reduction,
+                decimals,
+            )
             retry_error = ""
             try:
                 retry_response = self._exchange.market_close(  # type: ignore[union-attr]
@@ -3273,8 +3296,13 @@ class HyperliquidAdapter(PlatformAdapter):
                 self._log_close_execution(coin, before.side, result, reference_price)
                 return result
             reduction, state_detail = measure(final_remaining)
+            remaining = final_remaining
 
-        success = abs(reduction - requested_size) <= tolerance
+        success = (
+            remaining is None
+            if close_all
+            else abs(reduction - requested_size) <= tolerance
+        )
         if success:
             detail = (
                 f"verified reduction={reduction:g}; "
@@ -3388,15 +3416,32 @@ class PaperPortfolio:
     def allocation_count_for_wallet_coin_side(self, wallet: str, coin: str, side: str) -> int:
         return self.store.paper_position_slice_count(wallet, coin, side)
 
-    def allocation_position_size(self, wallet: str, coin: str, side: str) -> float:
-        return sum(
+    @staticmethod
+    def slice_position_size(row: sqlite3.Row) -> float:
+        if "filled_size" in row.keys() and row["filled_size"] is not None:
+            return float(row["filled_size"])
+        entry_price = float(row["entry_price"])
+        if entry_price <= 0:
+            return 0.0
+        return (
             float(row["cost_basis"])
             * float(row["leverage"])
-            / float(row["entry_price"])
+            / entry_price
+        )
+
+    def allocation_position_size(self, wallet: str, coin: str, side: str) -> float:
+        return sum(
+            self.slice_position_size(row)
             for row in self.store.open_position_slices(coin)
             if row["source_wallet"] == wallet
             and row["side"] == side
-            and float(row["entry_price"]) > 0
+        )
+
+    def exclusively_owned_by(self, wallet: str, coin: str, side: str) -> bool:
+        rows = self.store.open_position_slices(coin)
+        return bool(rows) and all(
+            str(row["source_wallet"]) == wallet and str(row["side"]) == side
+            for row in rows
         )
 
     def wallet_cost_basis(self, wallet: str) -> float:
@@ -3487,6 +3532,7 @@ class PaperPortfolio:
         cost_basis: float | None = None,
         allow_same_wallet_add: bool = False,
         leverage: float | None = None,
+        filled_size: float | None = None,
     ) -> float | None:
         slot = cost_basis if cost_basis is not None else self.available_slot(
             coin, price, side=side, wallet=wallet
@@ -3525,7 +3571,8 @@ class PaperPortfolio:
             else requested_position_leverage
         )
         self.store.commit_paper_open(
-            acct, coin, side, price, round(slot, 2), wallet, position_leverage
+            acct, coin, side, price, round(slot, 2), wallet, position_leverage,
+            filled_size,
         )
         return round(slot, 2)
 
@@ -4374,7 +4421,11 @@ class Reconciler:
             print(f"[RECONCILE] Close skipped {coin} {side}: no price")
             return
 
-        close_size = self.paper.allocation_position_size(wallet, coin, side)
+        close_size = (
+            None
+            if self.paper.exclusively_owned_by(wallet, coin, side)
+            else self.paper.allocation_position_size(wallet, coin, side)
+        )
         if isinstance(self.platform, HyperliquidAdapter):
             execution = self.platform.close_position(
                 coin, close_size, price, intent_key
@@ -4757,11 +4808,8 @@ class CopyTradingBot:
                 )
                 continue
             expected_size = sum(
-                float(row["cost_basis"])
-                * float(row["leverage"])
-                / float(row["entry_price"])
+                self.paper.slice_position_size(row)
                 for row in self.store.open_position_slices(coin)
-                if float(row["entry_price"]) > 0
             )
             if isinstance(self.platform, HyperliquidAdapter):
                 rounding_tolerance = 10 ** (-self.platform._sz_decimals.get(coin, 4)) * 2
@@ -5084,6 +5132,11 @@ class CopyTradingBot:
             actual_cost,
             allow_same_wallet_add=is_add,
             leverage=effective_leverage,
+            filled_size=(
+                execution.filled_size
+                if self.settings.live and execution.filled_size > 0
+                else None
+            ),
         )
         if opened_cost is None:
             signal_id = self.store.log_signal(event.wallet, event.coin, event.side, event.kind, price, "SKIPPED", "paper commit failed")
@@ -5161,6 +5214,7 @@ class CopyTradingBot:
         opened = self.paper.open(
             event.wallet, event.coin, event.side, actual_price, actual_cost,
             allow_same_wallet_add=event.kind == "ADD", leverage=leverage,
+            filled_size=execution.filled_size if execution.filled_size > 0 else None,
         )
         if opened is None:
             self.store.quarantine_coin(
@@ -5281,8 +5335,14 @@ class CopyTradingBot:
             print(f"[EXIT] {event.coin} {side}: no price")
             return
 
-        close_size = self.paper.allocation_position_size(
-            event.wallet, event.coin, event.side
+        close_size = (
+            None
+            if self.paper.exclusively_owned_by(
+                event.wallet, event.coin, event.side
+            )
+            else self.paper.allocation_position_size(
+                event.wallet, event.coin, event.side
+            )
         )
         execution_key = (
             f"copy-event:{event.event_id}:close" if event.event_id is not None else None
@@ -5548,9 +5608,8 @@ def run_live_preflight(
                     sides = {str(row["side"]) for row in rows}
                     leverages = {float(row["leverage"]) for row in rows}
                     expected_size = sum(
-                        float(row["cost_basis"]) * float(row["leverage"]) / float(row["entry_price"])
+                        PaperPortfolio.slice_position_size(row)
                         for row in rows
-                        if float(row["entry_price"]) > 0
                     )
                     live = live_positions[coin]
                     rounding_tolerance = 2 * 10 ** (-adapter._sz_decimals.get(coin, 4))
