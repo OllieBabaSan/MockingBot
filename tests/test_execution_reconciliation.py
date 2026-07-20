@@ -545,6 +545,25 @@ class ExecutionReconciliationTests(unittest.TestCase):
             32181.0,
         )
 
+    def test_confirmed_exchange_fill_below_minimum_is_committed(self) -> None:
+        paper = core.PaperPortfolio(self.settings, self.store)
+
+        rejected = paper.open(
+            "wallet-a", "ETH", "SHORT", 1863.36, 0.68,
+            leverage=3, filled_size=0.0011,
+        )
+        committed = paper.open(
+            "wallet-a", "ETH", "SHORT", 1863.36, 0.68,
+            leverage=3, filled_size=0.0011,
+            confirmed_exchange_fill=True,
+        )
+
+        self.assertIsNone(rejected)
+        self.assertEqual(committed, 0.68)
+        row = self.store.open_position_slices("ETH")[0]
+        self.assertEqual(row["filled_size"], 0.0011)
+        self.assertEqual(row["cost_basis"], 0.68)
+
     def test_reconciler_uses_confirmed_fill_price_for_local_pnl(self) -> None:
         paper = core.PaperPortfolio(self.settings, self.store)
         paper.open("wallet-a", "BTC", "LONG", 100, 10, leverage=3)

@@ -3533,6 +3533,7 @@ class PaperPortfolio:
         allow_same_wallet_add: bool = False,
         leverage: float | None = None,
         filled_size: float | None = None,
+        confirmed_exchange_fill: bool = False,
     ) -> float | None:
         slot = cost_basis if cost_basis is not None else self.available_slot(
             coin, price, side=side, wallet=wallet
@@ -3557,7 +3558,14 @@ class PaperPortfolio:
             return None
 
         acct = self.account()
-        if slot < self.settings.min_slot_usd or float(acct["cash"]) < slot:
+        # The minimum allocation is an order-entry rule.  Once an exchange fill
+        # is confirmed, even a partial fill below that minimum is real exposure
+        # and must be represented in the ownership ledger.
+        if (
+            (not confirmed_exchange_fill and slot < self.settings.min_slot_usd)
+            or slot <= 0
+            or float(acct["cash"]) < slot
+        ):
             return None
 
         acct["cash"] = round(float(acct["cash"]) - slot, 2)
@@ -5137,6 +5145,9 @@ class CopyTradingBot:
                 if self.settings.live and execution.filled_size > 0
                 else None
             ),
+            confirmed_exchange_fill=(
+                self.settings.live and execution.confirmed and execution.filled_size > 0
+            ),
         )
         if opened_cost is None:
             signal_id = self.store.log_signal(event.wallet, event.coin, event.side, event.kind, price, "SKIPPED", "paper commit failed")
@@ -5215,6 +5226,7 @@ class CopyTradingBot:
             event.wallet, event.coin, event.side, actual_price, actual_cost,
             allow_same_wallet_add=event.kind == "ADD", leverage=leverage,
             filled_size=execution.filled_size if execution.filled_size > 0 else None,
+            confirmed_exchange_fill=execution.confirmed and execution.filled_size > 0,
         )
         if opened is None:
             self.store.quarantine_coin(
