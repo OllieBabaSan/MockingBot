@@ -768,6 +768,10 @@ HTML = r"""<!doctype html>
   </header>
   <main>
     <div class="stats" id="stats"></div>
+    <section>
+      <h2>Open Positions</h2>
+      <div class="table-wrap"><table class="compact-table" id="positions"></table></div>
+    </section>
     <section class="alert-panel" id="token-risk-section" hidden>
       <h2>Token Risk Alerts</h2>
       <div class="table-wrap"><table id="token-risk"></table></div>
@@ -775,10 +779,6 @@ HTML = r"""<!doctype html>
     <section class="alert-panel" id="quarantine-section" hidden>
       <h2>Quarantined Coins</h2>
       <div class="table-wrap"><table id="quarantines"></table></div>
-    </section>
-    <section>
-      <h2>Open Positions</h2>
-      <div class="table-wrap"><table class="compact-table" id="positions"></table></div>
     </section>
     <section>
       <h2>Recent Closes</h2>
