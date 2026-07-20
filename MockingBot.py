@@ -2931,7 +2931,7 @@ class HyperliquidAdapter(PlatformAdapter):
         if result.confirmed:
             return "CONFIRMED"
         if not result.accepted and result.filled_size <= 0 and result.status in {
-            "exception", "rejected", "unfilled", "leverage_update_rejected",
+            "error", "exception", "rejected", "unfilled", "leverage_update_rejected",
         }:
             return "FAILED"
         return "AMBIGUOUS"
@@ -4939,6 +4939,23 @@ class CopyTradingBot:
             self.store.execution_intent(recovery_key) if recovery_key is not None else None
         )
         if recovery_intent is not None:
+            if recovery_intent["state"] == "FAILED":
+                saved = HyperliquidAdapter._execution_result_from_json(
+                    recovery_intent["result_json"]
+                )
+                reason = (
+                    saved.detail if saved is not None and saved.detail
+                    else "prior exchange entry failed with no fill"
+                )
+                signal_id = self.store.log_signal(
+                    event.wallet, event.coin, event.side, event.kind,
+                    event.entry_price, "SKIPPED", reason,
+                )
+                self.scoring_engine.observe_signal(
+                    event, signal_id, "SKIPPED", reason, event.entry_price
+                )
+                print(f"[SKIP] {event.kind} {event.coin} {event.side}: {reason}")
+                return
             self._recover_entry_event(event, recovery_key, recovery_intent)
             return
         if self.settings.live:

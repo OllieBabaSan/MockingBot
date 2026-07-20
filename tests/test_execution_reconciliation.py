@@ -43,6 +43,44 @@ class ExecutionReconciliationTests(unittest.TestCase):
         self.assertEqual(result.avg_fill_price, 101.0)
         self.assertEqual(self.adapter._exchange.leverages, [3])
 
+    def test_explicit_zero_fill_exchange_error_is_failed_not_ambiguous(self) -> None:
+        result = core.ExecutionResult(
+            False, 0.00044, 0.0, status="error", confirmed=False,
+            detail="Insufficient margin to place order.",
+        )
+        self.assertEqual(
+            core.HyperliquidAdapter._execution_intent_state(result), "FAILED"
+        )
+
+    def test_failed_open_intent_is_logged_without_resubmission(self) -> None:
+        key = "copy-event:99:open"
+        self.store.prepare_execution_intent(
+            key, "OPEN", "BTC", "SHORT", 0.00044,
+            core.Position("BTC", "SHORT", 0.00801, 64864.2, 3), 3,
+        )
+        failed = core.ExecutionResult(
+            False, 0.00044, 0.0, status="error", confirmed=False,
+            detail="Insufficient margin to place order.",
+        )
+        self.store.update_execution_intent(key, "FAILED", failed)
+        bot = core.CopyTradingBot.__new__(core.CopyTradingBot)
+        bot.settings = self.settings
+        bot.store = self.store
+        bot.platform = self.adapter
+        bot.scoring_engine = core.ScoringEngine(self.settings, self.store)
+        bot.token_risk = type("TokenRisk", (), {"observe": lambda *_args: None})()
+        event = core.CopyEvent(
+            "ADD", "wallet", "BTC", "SHORT", entry_price=64930.0, event_id=99
+        )
+
+        bot._handle_entry(event, False, {"BTC"})
+
+        row = self.store.conn.execute(
+            "SELECT action, reason FROM signals ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(row["action"], "SKIPPED")
+        self.assertIn("Insufficient margin", row["reason"])
+
     def test_confirmed_open_intent_replays_without_second_order(self) -> None:
         exchange = FakeExchange([fill_response()])
         self.adapter._exchange = exchange

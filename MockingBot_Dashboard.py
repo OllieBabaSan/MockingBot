@@ -21,6 +21,8 @@ from typing import Any, Iterator
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+import MockingBot_Compare as parity_compare
+
 
 ROOT = Path(__file__).resolve().parent
 MODE = os.getenv("MOCKINGBOT_DASHBOARD_MODE", "paper").strip().lower()
@@ -39,6 +41,10 @@ EQUITY_MAX_AGE_SECONDS = int(
     os.getenv("MOCKINGBOT_DASHBOARD_EQUITY_MAX_AGE_SECS", "90")
 )
 PAPER_STARTING_EQUITY = float(os.getenv("PAPER_STARTING_CASH", "10000"))
+PAPER_DB_PATH = Path(os.getenv(
+    "MOCKINGBOT_PAPER_DB",
+    str(ROOT / "MockingBot_Data" / "mockingbot_codex.sqlite3"),
+))
 
 _PRICE_CACHE: dict[str, float] = {}
 _PRICE_CACHE_TS = 0.0
@@ -521,6 +527,20 @@ def dashboard_data() -> dict[str, Any]:
             """,
             20,
         )
+        parity_status: dict[str, Any] = {"healthy": True, "alerts": [], "counts": {}}
+        if MODE == "live":
+            try:
+                scoring_cutover = get_json(conn, "scoring_bootstrap", {}).get("imported_at")
+                parity_status = parity_compare.build_report(
+                    PAPER_DB_PATH, DB_PATH, hours=24.0,
+                    tolerance_seconds=180, unmatched_grace_seconds=300,
+                    not_before=scoring_cutover,
+                )
+            except Exception as exc:
+                parity_status = {
+                    "healthy": False, "alerts": [], "counts": {},
+                    "error": f"Parity monitor unavailable: {exc}",
+                }
 
         return {
             "ok": True,
@@ -559,6 +579,7 @@ def dashboard_data() -> dict[str, Any]:
             "quarantines": quarantines,
             "recent_executions": recent_executions,
             "execution_intents": execution_intents,
+            "parity_status": parity_status,
         }
 
 
@@ -809,6 +830,10 @@ HTML = r"""<!doctype html>
       <h2>Execution Attention Required</h2>
       <div class="table-wrap"><table class="compact-table" id="execution-intents"></table></div>
     </section>
+    <section class="alert-panel" id="parity-section" hidden>
+      <h2>Signal Parity Attention</h2>
+      <div class="table-wrap"><table class="compact-table" id="parity-alerts"></table></div>
+    </section>
     <section class="api-panel">
       <details>
       <summary>API Health</summary>
@@ -906,6 +931,8 @@ HTML = r"""<!doctype html>
       const liveOperationsSection = document.getElementById("live-operations-section");
       liveOperationsSection.hidden = data.mode !== "live";
       if (data.mode === "live") {
+        const parity = data.parity_status || {};
+        const parityCount = (parity.alerts || []).length;
         const liveOperations = [
           ["Local Ledger Estimate", fmtMoney(data.local_estimate), ""],
           ["Available Margin", fmtMoney(capital.available_margin), ""],
@@ -913,8 +940,26 @@ HTML = r"""<!doctype html>
           ["Ledger Variance", fmtMoney(capital.equity_variance), clsNum(-(capital.equity_variance || 0))],
           ["Last Rollback", !rollback.ts ? "none" : (rollback.rollback_confirmed ? "confirmed" : "FAILED"), rollback.ts && !rollback.rollback_confirmed ? "bad" : ""],
           ["Last Backup", !backup.successful_at ? "none" : `${Math.round((backup.age_seconds || 0) / 60)}m ago`, !backup.successful_at || backup.error ? "bad" : "good"],
+          ["Signal Parity", parity.error ? "unavailable" : (parityCount ? `${parityCount} alert${parityCount === 1 ? "" : "s"}` : "clear"), parity.error || parityCount ? "bad" : "good"],
         ];
         document.getElementById("live-operations").innerHTML = liveOperations.map(([label, value, klass]) => `<div class="stat"><div class="label">${label}</div><div class="value ${klass}">${value}</div></div>`).join("");
+      }
+
+      const paritySection = document.getElementById("parity-section");
+      const parity = data.parity_status || {};
+      const parityAlerts = parity.alerts || [];
+      paritySection.hidden = data.mode !== "live" || (!parity.error && parityAlerts.length === 0);
+      if (!paritySection.hidden) {
+        const rows = parity.error
+          ? [`<tr><td colspan="5" class="bad">${esc(parity.error)}</td></tr>`]
+          : parityAlerts.slice(0, 8).map(alert => {
+              const event = alert.live || alert.paper || {};
+              const detail = alert.detail || (alert.side ? `missing from ${alert.side}` : "investigate");
+              return `<tr><td class="bad">${esc(alert.classification)}</td>
+                <td>${esc(event.coin || "")}</td><td>${esc(event.signal || "")} ${esc(event.side || "")}</td>
+                <td class="muted">${esc(shortWallet(event.wallet))}</td><td class="warn">${esc(detail)}</td></tr>`;
+            });
+        table(document.getElementById("parity-alerts"), ["Issue", "Coin", "Signal", "Wallet", "Detail"], rows, "Parity clear.");
       }
 
       const tokenRiskSection = document.getElementById("token-risk-section");

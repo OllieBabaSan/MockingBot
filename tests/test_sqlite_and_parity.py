@@ -165,7 +165,7 @@ class ParityTests(unittest.TestCase):
         live["reason"] = ""
         self.assertEqual(
             compare.compare([paper], [live], 180)[0]["classification"],
-            "STATE_DIVERGENCE",
+            "EXPECTED_STATE_VARIANCE",
         )
         live["policy_fingerprint"] = "different"
         self.assertEqual(
@@ -205,6 +205,27 @@ class ParityTests(unittest.TestCase):
     def test_missing_signal(self) -> None:
         paper = self.row(1, "paper-main", "2026-07-15 01:00:00")
         self.assertEqual(compare.compare([paper], [], 180)[0]["classification"], "MISSING_SIGNAL")
+
+    def test_unmatched_signal_has_grace_period(self) -> None:
+        now = core.datetime.now(core.timezone.utc)
+        paper = self.row(
+            1, "paper-main", now.strftime("%Y-%m-%d %H:%M:%S")
+        )
+        result = compare.compare(
+            [paper], [], 180, unmatched_grace_seconds=300, now=now
+        )[0]
+        self.assertEqual(result["classification"], "PENDING_MATCH")
+        self.assertIn("PENDING_MATCH", compare.NON_ISSUE_CLASSIFICATIONS)
+
+    def test_same_signal_different_score_is_alert(self) -> None:
+        paper = self.row(1, "paper-main", "2026-07-15 01:00:00")
+        live = self.row(2, "live-main", "2026-07-15 01:00:10")
+        live["wallet_score"] = 61.0
+
+        result = compare.compare([paper], [live], 180)[0]
+
+        self.assertEqual(result["classification"], "SCORE_DIVERGENCE")
+        self.assertIn(result["classification"], compare.ALERT_CLASSIFICATIONS)
 
 
 if __name__ == "__main__":

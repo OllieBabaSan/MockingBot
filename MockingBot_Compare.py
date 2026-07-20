@@ -32,8 +32,17 @@ STATE_REASON_PREFIXES = (
     "required margin ",
     "live buying power unavailable",
     "Scoring Engine Candidate concentration cap:",
+    "opposite side held by ",
+    "opposite side already held",
 )
-NON_ISSUE_CLASSIFICATIONS = {"MATCH", "EXPECTED_ENVIRONMENT_VARIANCE"}
+NON_ISSUE_CLASSIFICATIONS = {
+    "MATCH", "EXPECTED_ENVIRONMENT_VARIANCE", "EXPECTED_STATE_VARIANCE",
+    "TIMING_VARIANCE", "EXECUTION_VARIANCE", "PENDING_MATCH",
+}
+ALERT_CLASSIFICATIONS = {
+    "CONFIG_DIVERGENCE", "CODE_DIVERGENCE", "SCORE_DIVERGENCE",
+    "LOGIC_DIVERGENCE", "MISSING_SIGNAL",
+}
 
 
 def parse_ts(value: str) -> datetime:
@@ -44,7 +53,8 @@ def read_audit(path: Path, since: datetime) -> list[dict[str, Any]]:
     if not path.exists():
         raise FileNotFoundError(path)
     uri = f"file:{path.resolve().as_posix()}?mode=ro"
-    with sqlite3.connect(uri, uri=True, timeout=10.0) as conn:
+    conn = sqlite3.connect(uri, uri=True, timeout=10.0)
+    try:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout = 10000")
         exists = conn.execute(
@@ -56,6 +66,8 @@ def read_audit(path: Path, since: datetime) -> list[dict[str, Any]]:
             "SELECT * FROM decision_audit WHERE ts >= ? ORDER BY ts, id",
             (since.strftime("%Y-%m-%d %H:%M:%S"),),
         ).fetchall()
+    finally:
+        conn.close()
     return [dict(row) for row in rows]
 
 
@@ -80,7 +92,7 @@ def classify(paper: dict[str, Any], live: dict[str, Any], delta_seconds: float) 
         if reasons & STATE_REASONS or any(
             reason.startswith(STATE_REASON_PREFIXES) for reason in reasons
         ):
-            return "STATE_DIVERGENCE", "capacity, holdings, or risk state differs"
+            return "EXPECTED_STATE_VARIANCE", "capacity, holdings, or risk state differs"
         return "LOGIC_DIVERGENCE", "same inputs produced a different decision"
     if delta_seconds > 45:
         return "TIMING_VARIANCE", f"observed {delta_seconds:.0f}s apart"
@@ -102,7 +114,10 @@ def compare(
     paper_rows: list[dict[str, Any]],
     live_rows: list[dict[str, Any]],
     tolerance_seconds: int,
+    unmatched_grace_seconds: int = 300,
+    now: datetime | None = None,
 ) -> list[dict[str, Any]]:
+    now = now or datetime.now(timezone.utc)
     live_by_key: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
     for row in live_rows:
         live_by_key[tuple(row[field] for field in MATCH_FIELDS)].append(row)
@@ -120,7 +135,9 @@ def compare(
             if delta <= tolerance_seconds:
                 candidates.append((delta, live))
         if not candidates:
-            results.append({"classification": "MISSING_SIGNAL", "side": "live", "paper": paper})
+            age = (now - paper_ts).total_seconds()
+            classification = "PENDING_MATCH" if age < unmatched_grace_seconds else "MISSING_SIGNAL"
+            results.append({"classification": classification, "side": "live", "paper": paper})
             continue
         delta, live = min(candidates, key=lambda item: item[0])
         used.add(int(live["id"]))
@@ -137,8 +154,39 @@ def compare(
 
     for live in live_rows:
         if int(live["id"]) not in used:
-            results.append({"classification": "MISSING_SIGNAL", "side": "paper", "live": live})
+            age = (now - parse_ts(str(live["ts"]))).total_seconds()
+            classification = "PENDING_MATCH" if age < unmatched_grace_seconds else "MISSING_SIGNAL"
+            results.append({"classification": classification, "side": "paper", "live": live})
     return results
+
+
+def build_report(
+    paper_db: Path,
+    live_db: Path,
+    hours: float = 24.0,
+    tolerance_seconds: int = 180,
+    unmatched_grace_seconds: int = 300,
+    not_before: str | None = None,
+) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(hours=max(0.0, hours))
+    if not_before:
+        since = max(since, parse_ts(not_before))
+    paper_rows = read_audit(paper_db, since)
+    live_rows = read_audit(live_db, since)
+    results = compare(
+        paper_rows, live_rows, max(1, tolerance_seconds),
+        max(0, unmatched_grace_seconds), now,
+    )
+    counts = Counter(result["classification"] for result in results)
+    alerts = [r for r in results if r["classification"] in ALERT_CLASSIFICATIONS]
+    return {
+        "generated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "since": since.strftime("%Y-%m-%d %H:%M:%S"),
+        "paper_events": len(paper_rows), "live_events": len(live_rows),
+        "counts": dict(sorted(counts.items())), "alerts": alerts,
+        "healthy": not alerts,
+    }
 
 
 def main() -> int:
@@ -150,35 +198,23 @@ def main() -> int:
     parser.add_argument("--tolerance-seconds", type=int, default=180)
     args = parser.parse_args()
 
-    since = datetime.now(timezone.utc) - timedelta(hours=max(0.0, args.hours))
-    paper_rows = read_audit(args.paper_db, since)
-    live_rows = read_audit(args.live_db, since)
-    results = compare(paper_rows, live_rows, max(1, args.tolerance_seconds))
-    counts = Counter(result["classification"] for result in results)
-    report = {
-        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-        "since": since.strftime("%Y-%m-%d %H:%M:%S"),
+    report = build_report(args.paper_db, args.live_db, args.hours, args.tolerance_seconds)
+    report.update({
         "paper_db": str(args.paper_db.resolve()),
         "live_db": str(args.live_db.resolve()),
-        "paper_events": len(paper_rows),
-        "live_events": len(live_rows),
-        "counts": dict(sorted(counts.items())),
-        "divergences": [
-            r for r in results
-            if r["classification"] not in NON_ISSUE_CLASSIFICATIONS
-        ],
-    }
+        "divergences": report.pop("alerts"),
+    })
     args.log.parent.mkdir(parents=True, exist_ok=True)
     with args.log.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(report, separators=(",", ":"), default=str) + "\n")
 
     print("=== MOCKINGBOT PARITY ===")
-    print(f"Paper events: {len(paper_rows)}")
-    print(f"Live events:  {len(live_rows)}")
-    for name, count in sorted(counts.items()):
+    print(f"Paper events: {report['paper_events']}")
+    print(f"Live events:  {report['live_events']}")
+    for name, count in sorted(report["counts"].items()):
         print(f"{name:20} {count}")
     print(f"Log: {args.log}")
-    return 2 if any(name.endswith("DIVERGENCE") for name in counts) else 0
+    return 2 if report["divergences"] else 0
 
 
 if __name__ == "__main__":
