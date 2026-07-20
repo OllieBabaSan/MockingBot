@@ -429,6 +429,7 @@ def dashboard_data() -> dict[str, Any]:
             """
             SELECT ts, coin, wallet, side, signal, reason, market_cap_rank, source
             FROM token_risk_events
+            WHERE datetime(ts) >= datetime('now', '-24 hours')
             ORDER BY id DESC
             LIMIT ?
             """,

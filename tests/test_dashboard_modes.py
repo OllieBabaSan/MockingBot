@@ -122,6 +122,37 @@ class DashboardModeTests(unittest.TestCase):
         self.assertEqual(data["local_estimate"], 9999.0)
         self.assertTrue(data["equity_error"])
 
+    def test_token_risk_alerts_expire_from_dashboard_after_24_hours(self) -> None:
+        configured = settings(self.root / "token-risk")
+        store = core.Store(configured.db_path)
+        try:
+            with store.conn:
+                store.conn.execute(
+                    """
+                    INSERT INTO token_risk_events(
+                        ts, coin, wallet, side, signal, reason, market_cap_rank, source
+                    ) VALUES(datetime('now', '-25 hours'), 'OLD', 'wallet', 'LONG',
+                             'ENTRY', 'old notice', NULL, 'test')
+                    """
+                )
+                store.conn.execute(
+                    """
+                    INSERT INTO token_risk_events(
+                        ts, coin, wallet, side, signal, reason, market_cap_rank, source
+                    ) VALUES(datetime('now', '-23 hours'), 'NEW', 'wallet', 'LONG',
+                             'ENTRY', 'recent notice', NULL, 'test')
+                    """
+                )
+        finally:
+            store.conn.close()
+
+        with patch.object(dashboard, "MODE", "paper"), patch.object(
+            dashboard, "DB_PATH", configured.db_path
+        ), patch.object(dashboard, "live_prices", return_value=({}, "stored")):
+            data = dashboard.dashboard_data()
+
+        self.assertEqual([row["coin"] for row in data["token_risk_alerts"]], ["NEW"])
+
     def test_html_has_unambiguous_mode_and_safety_panels(self) -> None:
         self.assertIn('id="mode-badge"', dashboard.HTML)
         self.assertIn('id="quarantine-section"', dashboard.HTML)
