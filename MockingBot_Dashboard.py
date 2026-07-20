@@ -772,10 +772,6 @@ HTML = r"""<!doctype html>
       <h2>Open Positions</h2>
       <div class="table-wrap"><table class="compact-table" id="positions"></table></div>
     </section>
-    <section class="alert-panel" id="token-risk-section" hidden>
-      <h2>Token Risk Alerts</h2>
-      <div class="table-wrap"><table id="token-risk"></table></div>
-    </section>
     <section class="alert-panel" id="quarantine-section" hidden>
       <h2>Quarantined Coins</h2>
       <div class="table-wrap"><table id="quarantines"></table></div>
@@ -793,6 +789,10 @@ HTML = r"""<!doctype html>
     <section>
       <h2>Execution Confirmations</h2>
       <div class="table-wrap"><table class="compact-table" id="executions"></table></div>
+    </section>
+    <section class="alert-panel" id="token-risk-section" hidden>
+      <h2>Token Risk Alerts</h2>
+      <div class="table-wrap"><table id="token-risk"></table></div>
     </section>
     <section class="alert-panel" id="execution-intents-section" hidden>
       <h2>Execution Attention Required</h2>
