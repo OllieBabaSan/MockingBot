@@ -764,6 +764,8 @@ class Store:
                 cost_basis REAL NOT NULL,
                 leverage REAL NOT NULL DEFAULT 3,
                 filled_size REAL,
+                entry_tier TEXT,
+                entry_score REAL,
                 opened_at TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'OPEN',
                 closed_at TEXT,
@@ -967,6 +969,8 @@ class Store:
         self.conn.commit()
         self._ensure_column("paper_position_slices", "leverage", "REAL NOT NULL DEFAULT 3")
         self._ensure_column("paper_position_slices", "filled_size", "REAL")
+        self._ensure_column("paper_position_slices", "entry_tier", "TEXT")
+        self._ensure_column("paper_position_slices", "entry_score", "REAL")
         self._ensure_column("execution_audit", "leverage", "REAL")
         self._ensure_column("execution_audit", "requested_leverage", "REAL")
         self._ensure_column("execution_audit", "reference_price", "REAL")
@@ -1543,6 +1547,8 @@ class Store:
         source_wallet: str,
         leverage: float,
         filled_size: float | None = None,
+        entry_tier: str | None = None,
+        entry_score: float | None = None,
     ) -> None:
         """Commit cash, allocation slice, and aggregate position as one ledger change."""
         with self.conn:
@@ -1555,12 +1561,12 @@ class Store:
                 """
                 INSERT INTO paper_position_slices(
                     coin, side, source_wallet, entry_price, cost_basis, leverage,
-                    filled_size, opened_at, status
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')
+                    filled_size, entry_tier, entry_score, opened_at, status
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')
                 """,
                 (
                     coin, side, source_wallet, entry_price, cost_basis, leverage,
-                    filled_size, utc_now(),
+                    filled_size, entry_tier, entry_score, utc_now(),
                 ),
             )
             self._sync_paper_position_tx(coin)
@@ -3534,6 +3540,8 @@ class PaperPortfolio:
         leverage: float | None = None,
         filled_size: float | None = None,
         confirmed_exchange_fill: bool = False,
+        entry_tier: str | None = None,
+        entry_score: float | None = None,
     ) -> float | None:
         slot = cost_basis if cost_basis is not None else self.available_slot(
             coin, price, side=side, wallet=wallet
@@ -3580,7 +3588,7 @@ class PaperPortfolio:
         )
         self.store.commit_paper_open(
             acct, coin, side, price, round(slot, 2), wallet, position_leverage,
-            filled_size,
+            filled_size, entry_tier, entry_score,
         )
         return round(slot, 2)
 
@@ -3807,10 +3815,9 @@ class ScoringEngine:
                 WHERE wallet = ? AND signal = 'EXIT' AND pnl_pct IS NOT NULL
                 UNION ALL
                 SELECT paper_gain, pnl_pct, 1 AS source_order, id AS sort_id
-                FROM signals
+                FROM marshal_shadow_positions
                 WHERE wallet = ?
-                  AND signal = 'EXIT'
-                  AND action = 'EXECUTED'
+                  AND status = 'CLOSED'
                   AND pnl_pct IS NOT NULL
             )
             ORDER BY source_order, sort_id
@@ -3823,8 +3830,8 @@ class ScoringEngine:
                 SELECT
                     (SELECT COUNT(*) FROM scoring_seed_signals WHERE wallet = ? AND signal = 'ENTRY')
                     +
-                    (SELECT COUNT(*) FROM signals
-                     WHERE wallet = ? AND signal = 'ENTRY' AND action = 'EXECUTED') AS n
+                    (SELECT COUNT(*) FROM marshal_shadow_positions
+                     WHERE wallet = ?) AS n
                 """,
                 (wallet, wallet),
             ).fetchone()["n"]
@@ -3835,10 +3842,9 @@ class ScoringEngine:
                 SELECT
                     (SELECT COUNT(*) FROM scoring_seed_signals WHERE wallet = ? AND signal = 'ADD')
                     +
-                    (SELECT COUNT(*) FROM signals
-                     WHERE wallet = ? AND signal = 'ADD' AND action = 'EXECUTED') AS n
+                    0 AS n
                 """,
-                (wallet, wallet),
+                (wallet,),
             ).fetchone()["n"]
         )
         entry_count += add_count
@@ -4114,6 +4120,11 @@ class ScoringEngine:
         actual_reason: str = "",
         price: float | None = None,
     ) -> None:
+        # Score the source wallet independently of local portfolio capacity.
+        # Both paper and live observe the same source entry/exit lifecycle even
+        # when only one instance can allocate an actual position.
+        if event.kind == "EXIT":
+            self.store.close_scoring_engine_shadow_positions(event, price, signal_id)
         score = self.score_wallet(event.wallet)
         recommendation, would_execute, reason = self.recommendation(score, event, actual_action, actual_reason)
         self.store.log_scoring_engine_wallet_score(score)
@@ -4136,10 +4147,8 @@ class ScoringEngine:
             score,
             price,
         )
-        if event.kind == "ENTRY" and actual_action == "SKIPPED" and would_execute and price and price > 0:
+        if event.kind == "ENTRY" and price and price > 0:
             self.store.open_scoring_engine_shadow_position(event, price, signal_id, score)
-        if event.kind == "EXIT":
-            self.store.close_scoring_engine_shadow_positions(event, price, signal_id)
 
 
 # ---------------------------------------------------------------------------
@@ -5148,6 +5157,8 @@ class CopyTradingBot:
             confirmed_exchange_fill=(
                 self.settings.live and execution.confirmed and execution.filled_size > 0
             ),
+            entry_tier=scoring_score.tier,
+            entry_score=scoring_score.total_score,
         )
         if opened_cost is None:
             signal_id = self.store.log_signal(event.wallet, event.coin, event.side, event.kind, price, "SKIPPED", "paper commit failed")
@@ -5227,6 +5238,8 @@ class CopyTradingBot:
             allow_same_wallet_add=event.kind == "ADD", leverage=leverage,
             filled_size=execution.filled_size if execution.filled_size > 0 else None,
             confirmed_exchange_fill=execution.confirmed and execution.filled_size > 0,
+            entry_tier=self.scoring_engine.score_wallet(event.wallet).tier,
+            entry_score=self.scoring_engine.score_wallet(event.wallet).total_score,
         )
         if opened is None:
             self.store.quarantine_coin(

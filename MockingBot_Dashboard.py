@@ -179,7 +179,8 @@ def open_allocations(
 ) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
-        SELECT id, coin, side, source_wallet, entry_price, cost_basis, leverage, opened_at
+        SELECT id, coin, side, source_wallet, entry_price, cost_basis, leverage,
+               entry_tier, entry_score, opened_at
         FROM paper_position_slices
         WHERE status = 'OPEN'
         ORDER BY opened_at DESC, id DESC
@@ -207,6 +208,11 @@ def open_allocations(
                 "wallet": str(row["source_wallet"]),
                 "wallet_short": short_wallet(str(row["source_wallet"])),
                 "wallet_status": status_label(statuses.get(str(row["source_wallet"]))),
+                "entry_status": (
+                    f"{row['entry_tier']} {float(row['entry_score']):.1f}"
+                    if row["entry_tier"] and row["entry_score"] is not None
+                    else "Legacy"
+                ),
                 "entry_price": entry,
                 "last_price": last,
                 "cost_basis": cost,
@@ -237,6 +243,7 @@ def aggregate_positions(allocations: list[dict[str, Any]]) -> list[dict[str, Any
                 "allocation_count": 0,
                 "wallets": [],
                 "wallet_statuses": [],
+                "entry_statuses": [],
                 "opened_times": [],
                 "last_price": alloc["last_price"],
             },
@@ -250,6 +257,7 @@ def aggregate_positions(allocations: list[dict[str, Any]]) -> list[dict[str, Any
         group["allocation_count"] += 1
         group["wallets"].append(alloc["wallet_short"])
         group["wallet_statuses"].append(alloc["wallet_status"])
+        group["entry_statuses"].append(alloc["entry_status"])
         group["opened_times"].append(alloc["opened_at"])
         group["last_price"] = alloc["last_price"] or group["last_price"]
         if alloc["pnl_usd"] is None:
@@ -280,6 +288,8 @@ def aggregate_positions(allocations: list[dict[str, Any]]) -> list[dict[str, Any
                 "wallets": group["wallets"][:4] + (["..."] if len(group["wallets"]) > 4 else []),
                 "wallet_statuses": group["wallet_statuses"][:4]
                 + (["..."] if len(group["wallet_statuses"]) > 4 else []),
+                "entry_statuses": group["entry_statuses"][:4]
+                + (["..."] if len(group["entry_statuses"]) > 4 else []),
                 "opened_times": group["opened_times"][:4]
                 + (["..."] if len(group["opened_times"]) > 4 else []),
             }
@@ -932,7 +942,7 @@ HTML = r"""<!doctype html>
           </tr>`), "No quarantined coins.");
       }
 
-      table(document.getElementById("positions"), ["Market", "Opened", "Margin", "Entry", "Last", "Open PnL", "Source", "Tier"],
+      table(document.getElementById("positions"), ["Market", "Opened", "Margin", "Entry", "Last", "Open PnL", "Source", "Entry / Current"],
         data.positions.map(p => `<tr>
           <td data-label="Market"><strong>${esc(p.coin)}</strong> <span class="pill">${esc(p.side)}</span>${p.allocation_count > 1 ? ` <span class="muted">×${p.allocation_count}</span>` : ""}</td>
           <td data-label="Opened" class="muted">${listCell((p.opened_times || []).map(fmtTradeTime))}</td>
@@ -941,7 +951,7 @@ HTML = r"""<!doctype html>
           <td data-label="Last">${p.last_price ? Number(p.last_price).toLocaleString(undefined, {maximumFractionDigits: 6}) : "n/a"}</td>
           <td data-label="Open PnL" class="${clsNum(p.pnl_usd)}">${fmtMoney(p.pnl_usd)} <span class="muted">${fmtPct(p.pnl_pct)}</span></td>
           <td data-label="Source" class="muted">${listCell(p.wallets || [])}</td>
-          <td data-label="Tier" class="muted">${listCell(p.wallet_statuses || [])}</td>
+          <td data-label="Entry / Current" class="muted">${listCell((p.wallet_statuses || []).map((current, i) => `${(p.entry_statuses || [])[i] || "Legacy"} / ${current}`))}</td>
         </tr>`), "No open positions.");
 
       table(document.getElementById("closes"), ["Closed", "Market", "Margin", "Result", "Source", "Tier"],

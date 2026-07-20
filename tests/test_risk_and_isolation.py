@@ -100,6 +100,15 @@ class RiskAndIsolationTests(unittest.TestCase):
                 paper_store.log_signal(
                     wallet, "BTC", "LONG", "EXIT", 105, "EXECUTED", paper_gain=25, pnl_pct=5
                 )
+                with paper_store.conn:
+                    paper_store.conn.execute(
+                        """
+                        INSERT INTO scoring_seed_signals(
+                            source_signal_id, ts, wallet, signal, paper_gain, pnl_pct
+                        ) SELECT id, ts, wallet, signal, paper_gain, pnl_pct
+                          FROM signals WHERE action = 'EXECUTED'
+                        """
+                    )
                 expected = core.ScoringEngine(paper_settings, paper_store).score_wallet(wallet)
 
                 live_settings = settings(

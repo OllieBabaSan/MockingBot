@@ -14,16 +14,15 @@ class ScoringNormalizationTests(unittest.TestCase):
         store = core.Store(configured.db_path)
         try:
             for index, (gain, pnl) in enumerate(zip(gains, pnls, strict=True)):
-                store.log_signal(
-                    "wallet",
-                    f"COIN{index}",
-                    "LONG",
-                    "EXIT",
-                    100.0,
-                    "EXECUTED",
-                    paper_gain=gain,
-                    pnl_pct=pnl,
+                store.conn.execute(
+                    """
+                    INSERT INTO scoring_seed_signals(
+                        source_signal_id, ts, wallet, signal, paper_gain, pnl_pct
+                    ) VALUES(?, ?, 'wallet', 'EXIT', ?, ?)
+                    """,
+                    (index + 1, core.utc_now(), gain, pnl),
                 )
+            store.conn.commit()
             return core.ScoringEngine(configured, store).score_wallet("wallet")
         finally:
             store.conn.close()
@@ -50,6 +49,29 @@ class ScoringNormalizationTests(unittest.TestCase):
         self.assertEqual(small.total_score, large.total_score)
         self.assertEqual(small.tier, large.tier)
         self.assertEqual(small.realized_pnl, -75.0)
+
+    def test_shadow_score_is_independent_of_local_trade_acceptance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            scores = []
+            for name, action, reason in (
+                ("accepted", "EXECUTED", "allocated"),
+                ("rejected", "SKIPPED", "position cap"),
+            ):
+                configured = settings(Path(tmp) / name)
+                store = core.Store(configured.db_path)
+                try:
+                    engine = core.ScoringEngine(configured, store)
+                    entry = core.CopyEvent("ENTRY", "wallet", "BTC", "LONG")
+                    exit_event = core.CopyEvent("EXIT", "wallet", "BTC", "LONG")
+                    engine.observe_signal(entry, None, action, reason, 100.0)
+                    engine.observe_signal(exit_event, None, action, reason, 102.0)
+                    scores.append(engine.score_wallet("wallet"))
+                finally:
+                    store.conn.close()
+
+        self.assertEqual(scores[0].sample_size, 1)
+        self.assertEqual(scores[0].total_score, scores[1].total_score)
+        self.assertEqual(scores[0].realized_pnl, scores[1].realized_pnl)
 
 
 if __name__ == "__main__":
