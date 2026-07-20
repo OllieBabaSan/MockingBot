@@ -164,6 +164,45 @@ class RiskAndIsolationTests(unittest.TestCase):
             finally:
                 store.conn.close()
 
+    def test_live_roster_mirrors_canonical_paper_without_candidate_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            paper_settings = settings(root / "paper")
+            paper_store = core.Store(paper_settings.db_path)
+            wallets = ["wallet-a", "wallet-b"]
+            try:
+                paper_store.replace_roster(
+                    wallets,
+                    {
+                        wallet: core.WalletMetrics(False, True, 20, 0.60, 1.8)
+                        for wallet in wallets
+                    },
+                )
+            finally:
+                paper_store.conn.close()
+
+            live_settings = settings(
+                root / "live", live=True,
+                scoring_seed_db_path=paper_settings.db_path,
+            )
+            live_store = core.Store(live_settings.db_path)
+
+            class NoRefreshPlatform:
+                def candidate_wallets(self, _limit):
+                    raise AssertionError("live must not independently select candidates")
+
+            try:
+                roster = core.RosterService(
+                    live_settings, live_store, NoRefreshPlatform()
+                ).load_or_refresh(force=True)
+                self.assertEqual(roster, wallets)
+                self.assertEqual(live_store.roster(), wallets)
+                self.assertEqual(
+                    live_store.roster_wallet_metrics("wallet-a").sample, 20
+                )
+            finally:
+                live_store.conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1074,6 +1074,49 @@ class Store:
             )
         return metadata
 
+    def sync_roster_from_source(self, source_path: Path) -> list[str]:
+        """Mirror the canonical paper roster without copying trading state."""
+        if not source_path.exists() or source_path.resolve() == self.db_path.resolve():
+            raise RuntimeError(f"Canonical roster database unavailable: {source_path}")
+        source = sqlite3.connect(
+            f"file:{source_path.resolve().as_posix()}?mode=ro", uri=True, timeout=10.0
+        )
+        source.row_factory = sqlite3.Row
+        try:
+            roster = source.execute(
+                "SELECT wallet, status, score, updated_at FROM roster ORDER BY wallet"
+            ).fetchall()
+            metrics = source.execute(
+                "SELECT wallet, sample, win_rate, profit_factor, updated_at "
+                "FROM roster_wallet_metrics ORDER BY wallet"
+            ).fetchall()
+        finally:
+            source.close()
+        if not roster:
+            raise RuntimeError("Canonical paper roster is empty")
+        with self.conn:
+            self.conn.execute("DELETE FROM roster")
+            self.conn.executemany(
+                "INSERT INTO roster(wallet, status, score, updated_at) VALUES(?, ?, ?, ?)",
+                [tuple(row) for row in roster],
+            )
+            self.conn.execute("DELETE FROM roster_wallet_metrics")
+            self.conn.executemany(
+                "INSERT INTO roster_wallet_metrics(wallet, sample, win_rate, profit_factor, updated_at) "
+                "VALUES(?, ?, ?, ?, ?)",
+                [tuple(row) for row in metrics],
+            )
+            self.conn.execute(
+                "INSERT INTO kv(key, value) VALUES('roster_refresh_cycle', '{}') "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+            )
+            self.conn.execute(
+                "INSERT INTO kv(key, value) VALUES('last_canonical_roster_sync', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (json.dumps({"synced_at": utc_now(), "source": str(source_path.resolve())}),),
+            )
+        return [str(row["wallet"]) for row in roster if row["status"] == "follow"]
+
     def scoring_seed_fingerprint(self) -> str:
         return str(self.get_json("scoring_bootstrap", {}).get("fingerprint", ""))
 
@@ -4181,6 +4224,19 @@ class RosterService:
         return bool(candidates) and cursor < len(candidates)
 
     def load_or_refresh(self, force: bool = False) -> list[str]:
+        if self.settings.live:
+            try:
+                wallets = self.store.sync_roster_from_source(
+                    self.settings.scoring_seed_db_path
+                )
+                print(f"[ROSTER] Mirrored {len(wallets)} canonical paper wallet(s)")
+                return wallets
+            except Exception as exc:
+                cached = self.store.roster()
+                if cached:
+                    print(f"[ROSTER] Canonical sync failed; keeping cached roster: {exc}")
+                    return cached
+                raise
         last = float(self.store.get_json("last_roster_refresh", 0))
         cached = self.store.roster()
         config_changed = self.store.get_json("last_roster_config", {}) != self._config_signature()
@@ -4702,7 +4758,9 @@ class CopyTradingBot:
             )
 
             roster_check_interval = (
-                self.settings.roster_refresh_batch_seconds
+                min(self.settings.roster_refresh_batch_seconds, 60)
+                if self.settings.live
+                else self.settings.roster_refresh_batch_seconds
                 if self.roster.refresh_in_progress()
                 else self.settings.roster_refresh_seconds
             )
