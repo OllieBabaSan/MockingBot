@@ -174,6 +174,27 @@ def build_report(
         since = max(since, parse_ts(not_before))
     paper_rows = read_audit(paper_db, since)
     live_rows = read_audit(live_db, since)
+    # A coordinated restart creates a new comparison epoch. Older audited
+    # decisions remain available as history, but should not make the current
+    # deployment appear divergent. Only advance when both newest decisions
+    # identify the same build; differing newest builds must remain alertable.
+    if paper_rows and live_rows:
+        paper_code = paper_rows[-1]["code_fingerprint"]
+        live_code = live_rows[-1]["code_fingerprint"]
+        if paper_code == live_code:
+            paper_code_rows = [
+                row for row in paper_rows if row["code_fingerprint"] == paper_code
+            ]
+            live_code_rows = [
+                row for row in live_rows if row["code_fingerprint"] == live_code
+            ]
+            shared_epoch = min(
+                parse_ts(str(paper_code_rows[0]["ts"])),
+                parse_ts(str(live_code_rows[0]["ts"])),
+            )
+            paper_rows = paper_code_rows
+            live_rows = live_code_rows
+            since = max(since, shared_epoch)
     results = compare(
         paper_rows, live_rows, max(1, tolerance_seconds),
         max(0, unmatched_grace_seconds), now,

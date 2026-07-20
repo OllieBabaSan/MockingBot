@@ -7,6 +7,7 @@ import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 import MockingBot as core
 import MockingBot_Compare as compare
@@ -226,6 +227,25 @@ class ParityTests(unittest.TestCase):
 
         self.assertEqual(result["classification"], "SCORE_DIVERGENCE")
         self.assertIn(result["classification"], compare.ALERT_CLASSIFICATIONS)
+
+    def test_report_uses_latest_shared_code_epoch(self) -> None:
+        old_paper = self.row(1, "paper-main", "2026-07-20 15:00:00")
+        old_live = self.row(2, "live-main", "2026-07-20 15:00:01")
+        old_live["code_fingerprint"] = "different-old-code"
+        new_paper = self.row(3, "paper-main", "2026-07-20 16:00:00")
+        new_live = self.row(4, "live-main", "2026-07-20 16:00:01")
+        new_paper["code_fingerprint"] = "shared-new-code"
+        new_live["code_fingerprint"] = "shared-new-code"
+
+        with patch.object(
+            compare, "read_audit", side_effect=[[old_paper, new_paper], [old_live, new_live]]
+        ):
+            report = compare.build_report(Path("paper"), Path("live"), hours=10000)
+
+        self.assertEqual(report["paper_events"], 1)
+        self.assertEqual(report["live_events"], 1)
+        self.assertEqual(report["counts"], {"MATCH": 1})
+        self.assertTrue(report["healthy"])
 
 
 if __name__ == "__main__":
