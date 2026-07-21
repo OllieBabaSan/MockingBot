@@ -1431,18 +1431,34 @@ class Store:
                     """
                 ).fetchall()
                 initialized_at = utc_now()
+                shadow_columns = {
+                    str(row["name"])
+                    for row in self.conn.execute(
+                        "PRAGMA table_info(marshal_shadow_positions)"
+                    )
+                }
+                legacy_score_column = (
+                    ", scoring_score" if "scoring_score" in shadow_columns else ""
+                )
+                legacy_score_placeholder = ", ?" if legacy_score_column else ""
+                shadow_values = []
+                for row in shadow_rows:
+                    values = list(tuple(row))
+                    if legacy_score_column:
+                        values.append(row["marshal_score"])
+                    shadow_values.append(tuple(values))
                 with self.conn:
                     self.conn.execute("DELETE FROM marshal_shadow_positions")
                     self.conn.executemany(
-                        """
+                        f"""
                         INSERT INTO marshal_shadow_positions(
                             wallet, coin, side, entry_price, opened_at,
                             source_signal_id, marshal_score, marshal_tier, status,
                             exit_price, closed_at, paper_gain, pnl_pct,
-                            close_signal_id, close_reason
-                        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            close_signal_id, close_reason{legacy_score_column}
+                        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?{legacy_score_placeholder})
                         """,
-                        [tuple(row) for row in shadow_rows],
+                        shadow_values,
                     )
                     self.conn.execute(
                         "INSERT INTO kv(key, value) VALUES('canonical_event_cursor', ?) "

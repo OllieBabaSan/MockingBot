@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import sqlite3
 from pathlib import Path
 
 import MockingBot as core
@@ -157,6 +158,52 @@ class EventDurabilityTests(unittest.TestCase):
                 ).fetchone()[0],
                 1,
             )
+        finally:
+            paper_store.conn.close()
+            live_store.conn.close()
+
+    def test_canonical_shadow_import_supports_legacy_required_score_column(self) -> None:
+        root = Path(self.temp.name)
+        paper_settings = settings(root / "legacy-paper")
+        paper_store = core.Store(paper_settings.db_path)
+        with paper_store.conn:
+            paper_store.conn.execute(
+                """
+                INSERT INTO marshal_shadow_positions(
+                    wallet, coin, side, entry_price, opened_at, marshal_score,
+                    marshal_tier, status
+                ) VALUES('wallet', 'BTC', 'LONG', 100, '2026-01-01', 61,
+                         'Core', 'OPEN')
+                """
+            )
+
+        live_settings = settings(
+            root / "legacy-live", live=True,
+            scoring_seed_db_path=paper_settings.db_path,
+        )
+        live_settings.db_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy = sqlite3.connect(live_settings.db_path)
+        legacy.execute(
+            """
+            CREATE TABLE marshal_shadow_positions(
+                id INTEGER PRIMARY KEY, wallet TEXT NOT NULL, coin TEXT NOT NULL,
+                side TEXT NOT NULL, entry_price REAL NOT NULL, opened_at TEXT NOT NULL,
+                source_signal_id INTEGER, scoring_score REAL NOT NULL,
+                marshal_tier TEXT NOT NULL, status TEXT NOT NULL, exit_price REAL,
+                closed_at TEXT, paper_gain REAL, pnl_pct REAL, close_signal_id INTEGER,
+                close_reason TEXT)
+            """
+        )
+        legacy.commit()
+        legacy.close()
+
+        live_store = core.Store(live_settings.db_path)
+        try:
+            live_store.import_canonical_copy_events(paper_settings.db_path)
+            row = live_store.conn.execute(
+                "SELECT marshal_score, scoring_score FROM marshal_shadow_positions"
+            ).fetchone()
+            self.assertEqual(tuple(row), (61.0, 61.0))
         finally:
             paper_store.conn.close()
             live_store.conn.close()
