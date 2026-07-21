@@ -3572,10 +3572,19 @@ class HyperliquidAdapter(PlatformAdapter):
             )
             if before.size - reduction <= tolerance:
                 self.store.clear_coin_quarantine(coin)
-        elif reduction <= tolerance and submission_error:
+        elif reduction <= tolerance and not response_execution.accepted:
+            rejection_detail = (
+                response_execution.detail
+                or submission_error
+                or "close rejected with no position change"
+            )
             result = ExecutionResult(
-                False, requested_size, status="exception",
-                detail=f"close submission failed with no position change: {submission_error}",
+                False, requested_size,
+                status=response_execution.status or "rejected",
+                detail=(
+                    "close not filled; no position change confirmed "
+                    f"(exchange position unchanged): {rejection_detail}"
+                ),
             )
         else:
             detail = f"requested reduction={requested_size:g}; measured={reduction:g}; {state_detail}"
@@ -4729,6 +4738,21 @@ class Reconciler:
             if self.paper.exclusively_owned_by(wallet, coin, side)
             else self.paper.allocation_position_size(wallet, coin, side)
         )
+        if (
+            self.settings.live
+            and close_size is not None
+            and close_size * price < self.settings.min_order_notional
+        ):
+            detail = (
+                f"{reason}; deferred sub-minimum partial close: "
+                f"size={close_size:g} notional=${close_size * price:.2f} "
+                f"minimum=${self.settings.min_order_notional:.2f}"
+            )
+            self.store.log_signal(
+                wallet, coin, side, "EXIT", price, "SKIPPED", detail
+            )
+            print(f"[RECONCILE] {coin} {side}: {detail}")
+            return
         if isinstance(self.platform, HyperliquidAdapter):
             execution = self.platform.close_position(
                 coin, close_size, price, intent_key
@@ -5683,6 +5707,24 @@ class CopyTradingBot:
                 event.wallet, event.coin, event.side
             )
         )
+        if (
+            self.settings.live
+            and close_size is not None
+            and close_size * price < self.settings.min_order_notional
+        ):
+            reason = (
+                f"deferred sub-minimum partial close: size={close_size:g} "
+                f"notional=${close_size * price:.2f} "
+                f"minimum=${self.settings.min_order_notional:.2f}"
+            )
+            signal_id = self.store.log_signal(
+                event.wallet, event.coin, side, "EXIT", price, "SKIPPED", reason
+            )
+            self.scoring_engine.observe_signal(
+                event, signal_id, "SKIPPED", reason, price
+            )
+            print(f"[EXIT] {event.coin} {side}: {reason}")
+            return
         execution_key = (
             f"copy-event:{event_identity}:close" if event_identity is not None else None
         )

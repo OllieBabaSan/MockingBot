@@ -536,6 +536,24 @@ class ExecutionReconciliationTests(unittest.TestCase):
         self.assertAlmostEqual(audit["slippage_bps"], 100.0)
         self.assertEqual(audit["price_source"], "exchange_fill")
 
+    def test_rejected_zero_fill_close_is_failed_without_quarantine(self) -> None:
+        rejected = {
+            "status": "ok",
+            "response": {"data": {"statuses": [{"error": "Order must have minimum value"}]}},
+        }
+        self.adapter._exchange = FakeExchange([rejected])
+        unchanged = core.Position("BTC", "LONG", 0.50, 100.0, 3)
+        self.adapter._confirmed_position = lambda _coin: (True, unchanged)
+        key = "copy-event:tiny-close:close"
+
+        result = self.adapter.close_position("BTC", 0.01, 100.0, key)
+
+        self.assertFalse(result)
+        self.assertEqual(result.status, "error")
+        self.assertIn("position unchanged", result.detail)
+        self.assertEqual(self.store.execution_intent(key)["state"], "FAILED")
+        self.assertIsNone(self.store.coin_quarantine("BTC"))
+
     def test_execution_slippage_is_positive_only_when_adverse(self) -> None:
         cases = [
             ("LONG", "OPEN", 101.0, 100.0),
@@ -662,6 +680,35 @@ class ExecutionReconciliationTests(unittest.TestCase):
 
         self.assertEqual(requested_sizes, [0.301, None])
         self.assertIsNone(paper.position("BTC"))
+
+    def test_reconciler_defers_subminimum_partial_close_without_exchange_call(self) -> None:
+        paper = core.PaperPortfolio(self.settings, self.store)
+        paper.open(
+            "wallet-a", "BTC", "LONG", 100, 1,
+            leverage=3, filled_size=0.03, confirmed_exchange_fill=True,
+        )
+        paper.open(
+            "wallet-b", "BTC", "LONG", 100, 20,
+            leverage=3, filled_size=0.60, confirmed_exchange_fill=True,
+        )
+        self.adapter.mid_price = lambda _coin: 100.0
+        self.adapter.close_position = lambda *_args, **_kwargs: self.fail(
+            "sub-minimum partial close must not reach the exchange"
+        )
+        reconciler = core.Reconciler(
+            self.settings, self.store, self.adapter, paper,
+            core.RiskManager(self.settings, self.store, core.Notifier("")),
+        )
+
+        reconciler._force_close("BTC", "wallet-a", "LONG", "source closed")
+
+        self.assertTrue(paper.owns_position("wallet-a", "BTC", "LONG"))
+        self.assertIsNone(self.store.coin_quarantine("BTC"))
+        signal = self.store.conn.execute(
+            "SELECT action, reason FROM signals ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(signal["action"], "SKIPPED")
+        self.assertIn("deferred sub-minimum partial close", signal["reason"])
 
     def test_reconciler_does_not_close_quarantined_live_coin(self) -> None:
         paper = core.PaperPortfolio(self.settings, self.store)
