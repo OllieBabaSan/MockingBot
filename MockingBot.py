@@ -612,6 +612,9 @@ class CopyEvent:
     current_size: float | None = None
     event_id: int | None = None
     detected_at: str | None = None
+    event_uid: str | None = None
+    source_event_id: int | None = None
+    observed_price: float | None = None
 
 
 @dataclass(frozen=True)
@@ -790,6 +793,9 @@ class Store:
 
             CREATE TABLE IF NOT EXISTS pending_copy_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_uid TEXT,
+                source_instance TEXT,
+                source_event_id INTEGER,
                 detected_at TEXT NOT NULL,
                 wallet TEXT NOT NULL,
                 coin TEXT NOT NULL,
@@ -798,6 +804,7 @@ class Store:
                 entry_price REAL,
                 previous_size REAL,
                 current_size REAL,
+                observed_price REAL,
                 status TEXT NOT NULL DEFAULT 'PENDING',
                 handled_at TEXT
             );
@@ -978,6 +985,20 @@ class Store:
         self._ensure_column("execution_intents", "leverage", "REAL")
         self._ensure_column("decision_audit", "policy_fingerprint", "TEXT")
         self._ensure_column("decision_audit", "environment_fingerprint", "TEXT")
+        self._ensure_column("pending_copy_events", "event_uid", "TEXT")
+        self._ensure_column("pending_copy_events", "source_instance", "TEXT")
+        self._ensure_column("pending_copy_events", "source_event_id", "INTEGER")
+        self._ensure_column("pending_copy_events", "observed_price", "REAL")
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_copy_events_uid "
+            "ON pending_copy_events(event_uid) WHERE event_uid IS NOT NULL"
+        )
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_copy_events_source "
+            "ON pending_copy_events(source_instance, source_event_id) "
+            "WHERE source_instance IS NOT NULL AND source_event_id IS NOT NULL"
+        )
+        self.conn.commit()
         self._ensure_column("execution_audit", "price_source", "TEXT")
         self._migrate_scoring_journal_score_columns()
         self._migrate_legacy_paper_positions()
@@ -1312,17 +1333,38 @@ class Store:
     ) -> None:
         seeded = set(self.get_json("seeded_wallets", []))
         seeded.add(wallet)
+        detected_at = utc_now()
+        durable_events = []
+        for sequence, event in enumerate(events):
+            identity = "|".join(
+                (
+                    detected_at,
+                    event.wallet.lower(),
+                    event.coin,
+                    event.side,
+                    event.kind,
+                    repr(event.previous_size),
+                    repr(event.current_size),
+                    repr(event.entry_price),
+                    repr(event.observed_price),
+                    str(sequence),
+                )
+            )
+            durable_events.append(
+                (hashlib.sha256(identity.encode("utf-8")).hexdigest(), event)
+            )
         with self.conn:
             self.conn.executemany(
                 """
                 INSERT INTO pending_copy_events(
-                    detected_at, wallet, coin, side, kind, entry_price,
-                    previous_size, current_size, status
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+                    event_uid, detected_at, wallet, coin, side, kind, entry_price,
+                    previous_size, current_size, observed_price, status
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
                 """,
                 [
                     (
-                        utc_now(),
+                        event_uid,
+                        detected_at,
                         event.wallet,
                         event.coin,
                         event.side,
@@ -1330,8 +1372,9 @@ class Store:
                         event.entry_price,
                         event.previous_size,
                         event.current_size,
+                        event.observed_price,
                     )
-                    for event in events
+                    for event_uid, event in durable_events
                 ],
             )
             self.conn.execute("DELETE FROM wallet_positions WHERE wallet = ?", (wallet,))
@@ -1351,11 +1394,146 @@ class Store:
                 (json.dumps(sorted(seeded)),),
             )
 
+    def import_canonical_copy_events(self, source_path: Path) -> int:
+        """Import newly handled paper events exactly once into the local queue.
+
+        The first call establishes a high-water cursor so attaching an existing
+        live account never replays historical paper trades. Later calls import
+        only the contiguous handled prefix, leaving a paper event that is still
+        being evaluated for the next cycle.
+        """
+        if not source_path.exists() or source_path.resolve() == self.db_path.resolve():
+            raise RuntimeError(f"Canonical event database unavailable: {source_path}")
+        source_name = hashlib.sha256(
+            str(source_path.resolve()).lower().encode("utf-8")
+        ).hexdigest()[:16]
+        cursor_state = self.get_json("canonical_event_cursor", {})
+        if cursor_state and cursor_state.get("source_instance") != source_name:
+            raise RuntimeError("Canonical event source changed; explicit migration required")
+
+        source = sqlite3.connect(
+            f"file:{source_path.resolve().as_posix()}?mode=ro", uri=True, timeout=10.0
+        )
+        source.row_factory = sqlite3.Row
+        try:
+            source.execute("BEGIN")
+            max_id = int(source.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM pending_copy_events"
+            ).fetchone()[0])
+            if not cursor_state:
+                shadow_rows = source.execute(
+                    """
+                    SELECT wallet, coin, side, entry_price, opened_at,
+                           source_signal_id, marshal_score, marshal_tier, status,
+                           exit_price, closed_at, paper_gain, pnl_pct,
+                           close_signal_id, close_reason
+                    FROM marshal_shadow_positions ORDER BY id
+                    """
+                ).fetchall()
+                initialized_at = utc_now()
+                with self.conn:
+                    self.conn.execute("DELETE FROM marshal_shadow_positions")
+                    self.conn.executemany(
+                        """
+                        INSERT INTO marshal_shadow_positions(
+                            wallet, coin, side, entry_price, opened_at,
+                            source_signal_id, marshal_score, marshal_tier, status,
+                            exit_price, closed_at, paper_gain, pnl_pct,
+                            close_signal_id, close_reason
+                        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [tuple(row) for row in shadow_rows],
+                    )
+                    self.conn.execute(
+                        "INSERT INTO kv(key, value) VALUES('canonical_event_cursor', ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        (
+                            json.dumps(
+                                {
+                                    "source_instance": source_name,
+                                    "last_source_event_id": max_id,
+                                    "initialized_at": initialized_at,
+                                    "shadow_rows_imported": len(shadow_rows),
+                                }
+                            ),
+                        ),
+                    )
+                print(f"[SIGNALS] Canonical paper cursor seeded at event {max_id}")
+                print(
+                    f"[SCORING] Canonical shadow baseline imported: "
+                    f"{len(shadow_rows)} lifecycle row(s)"
+                )
+                return 0
+            cursor = int(cursor_state.get("last_source_event_id", 0))
+            if max_id < cursor:
+                raise RuntimeError("Canonical event journal moved backwards")
+            event_columns = {
+                str(row["name"])
+                for row in source.execute("PRAGMA table_info(pending_copy_events)")
+            }
+            observed_price_sql = (
+                "observed_price" if "observed_price" in event_columns
+                else "NULL AS observed_price"
+            )
+            rows = source.execute(
+                f"""
+                SELECT id, detected_at, wallet, coin, side, kind, entry_price,
+                       previous_size, current_size, {observed_price_sql}, status
+                FROM pending_copy_events
+                WHERE id > ? ORDER BY id
+                """,
+                (cursor,),
+            ).fetchall()
+        finally:
+            source.close()
+
+        handled: list[sqlite3.Row] = []
+        for row in rows:
+            if str(row["status"]) != "HANDLED":
+                break
+            handled.append(row)
+        if not handled:
+            return 0
+
+        with self.conn:
+            for row in handled:
+                source_id = int(row["id"])
+                event_uid = f"canonical:{source_name}:{source_id}"
+                self.conn.execute(
+                    """
+                    INSERT OR IGNORE INTO pending_copy_events(
+                        event_uid, source_instance, source_event_id, detected_at,
+                        wallet, coin, side, kind, entry_price, previous_size,
+                        current_size, observed_price, status
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+                    """,
+                    (
+                        event_uid, source_name, source_id, row["detected_at"],
+                        row["wallet"], row["coin"], row["side"], row["kind"],
+                        row["entry_price"], row["previous_size"], row["current_size"],
+                        row["observed_price"],
+                    ),
+                )
+            cursor_state.update(
+                {
+                    "source_instance": source_name,
+                    "last_source_event_id": int(handled[-1]["id"]),
+                    "updated_at": utc_now(),
+                }
+            )
+            self.conn.execute(
+                "INSERT INTO kv(key, value) VALUES('canonical_event_cursor', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (json.dumps(cursor_state),),
+            )
+        return len(handled)
+
     def pending_copy_events(self) -> list[CopyEvent]:
         rows = self.conn.execute(
             """
-            SELECT id, detected_at, wallet, coin, side, kind, entry_price,
-                   previous_size, current_size
+            SELECT id, event_uid, source_event_id, detected_at, wallet, coin,
+                   side, kind, entry_price, previous_size, current_size,
+                   observed_price
             FROM pending_copy_events
             WHERE status = 'PENDING'
             ORDER BY id
@@ -1372,6 +1550,15 @@ class Store:
                 current_size=None if row["current_size"] is None else float(row["current_size"]),
                 event_id=int(row["id"]),
                 detected_at=str(row["detected_at"]),
+                event_uid=None if row["event_uid"] is None else str(row["event_uid"]),
+                source_event_id=(
+                    None if row["source_event_id"] is None
+                    else int(row["source_event_id"])
+                ),
+                observed_price=(
+                    None if row["observed_price"] is None
+                    else float(row["observed_price"])
+                ),
             )
             for row in rows
         ]
@@ -4166,8 +4353,11 @@ class ScoringEngine:
         # Score the source wallet independently of local portfolio capacity.
         # Both paper and live observe the same source entry/exit lifecycle even
         # when only one instance can allocate an actual position.
+        scoring_price = event.observed_price or price
         if event.kind == "EXIT":
-            self.store.close_scoring_engine_shadow_positions(event, price, signal_id)
+            self.store.close_scoring_engine_shadow_positions(
+                event, scoring_price, signal_id
+            )
         score = self.score_wallet(event.wallet)
         recommendation, would_execute, reason = self.recommendation(score, event, actual_action, actual_reason)
         self.store.log_scoring_engine_wallet_score(score)
@@ -4188,10 +4378,12 @@ class ScoringEngine:
             actual_action,
             actual_reason,
             score,
-            price,
+            scoring_price,
         )
-        if event.kind == "ENTRY" and price and price > 0:
-            self.store.open_scoring_engine_shadow_position(event, price, signal_id, score)
+        if event.kind == "ENTRY" and scoring_price and scoring_price > 0:
+            self.store.open_scoring_engine_shadow_position(
+                event, scoring_price, signal_id, score
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -4339,6 +4531,14 @@ class WalletMonitor:
         self.platform = platform
 
     def scan(self, wallets: list[str]) -> tuple[list[CopyEvent], float]:
+        if self.settings.live:
+            imported = self.store.import_canonical_copy_events(
+                self.settings.scoring_seed_db_path
+            )
+            if imported:
+                print(f"[SIGNALS] Imported {imported} canonical paper event(s)")
+            return self.store.pending_copy_events(), 0.0
+
         failures = 0
         checked = 0
 
@@ -4404,6 +4604,20 @@ class WalletMonitor:
                         )
                     )
 
+            wallet_events = [
+                replace(
+                    event,
+                    observed_price=(
+                        (
+                            getattr(self.platform, "mid_price")(event.coin)
+                            if callable(getattr(self.platform, "mid_price", None))
+                            else None
+                        )
+                        or event.entry_price
+                    ),
+                )
+                for event in wallet_events
+            ]
             self.store.record_wallet_observation(wallet, current, wallet_events)
             time.sleep(self.settings.wallet_poll_delay)
 
@@ -4933,6 +5147,12 @@ class CopyTradingBot:
     def _tier_rank(tier: str) -> int:
         return {"Bench": 0, "Candidate": 1, "Core": 2, "Elite": 3}.get(tier, 0)
 
+    @staticmethod
+    def _event_identity(event: CopyEvent) -> str | None:
+        if event.event_uid:
+            return event.event_uid
+        return None if event.event_id is None else str(event.event_id)
+
     def _apply_ranked_opposite_override(
         self,
         event: CopyEvent,
@@ -4973,8 +5193,8 @@ class CopyTradingBot:
                     f"{incoming_score.total_score:.1f}"
                 ),
                 (
-                    f"ranked-reversal:event:{event.event_id}:slice:{int(row['id'])}:close"
-                    if event.event_id is not None
+                    f"ranked-reversal:event:{self._event_identity(event)}:slice:{int(row['id'])}:close"
+                    if self._event_identity(event) is not None
                     else None
                 ),
             )
@@ -4990,8 +5210,9 @@ class CopyTradingBot:
 
     def _handle_entry(self, event: CopyEvent, wind_down: bool, live_held: set[str] | None) -> None:
         self.token_risk.observe(event)
+        event_identity = self._event_identity(event)
         recovery_key = (
-            f"copy-event:{event.event_id}:open" if event.event_id is not None else None
+            f"copy-event:{event_identity}:open" if event_identity is not None else None
         )
         recovery_intent = (
             self.store.execution_intent(recovery_key) if recovery_key is not None else None
@@ -5164,7 +5385,7 @@ class CopyTradingBot:
 
         notional = cost * effective_leverage
         execution_key = (
-            f"copy-event:{event.event_id}:open" if event.event_id is not None else None
+            f"copy-event:{event_identity}:open" if event_identity is not None else None
         )
         if isinstance(self.platform, HyperliquidAdapter):
             execution = self.platform.open_position(
@@ -5240,8 +5461,8 @@ class CopyTradingBot:
             self.scoring_engine.observe_signal(event, signal_id, "SKIPPED", "paper commit failed", price)
             print(f"[WARN] {event.kind} {event.coin} {event.side}: live opened but paper commit failed")
             recovery_key = (
-                f"copy-event:{event.event_id}:paper-commit-rollback"
-                if event.event_id is not None else None
+                f"copy-event:{event_identity}:paper-commit-rollback"
+                if event_identity is not None else None
             )
             if isinstance(self.platform, HyperliquidAdapter):
                 recovery_close = self.platform.close_position(
@@ -5342,9 +5563,10 @@ class CopyTradingBot:
         reference_price: float,
         had_local_position: bool,
     ) -> str:
+        event_identity = self._event_identity(event)
         rollback_key = (
-            f"copy-event:{event.event_id}:entry-rollback"
-            if event.event_id is not None else None
+            f"copy-event:{event_identity}:entry-rollback"
+            if event_identity is not None else None
         )
         if isinstance(self.platform, HyperliquidAdapter):
             rollback = self.platform.close_position(
@@ -5394,8 +5616,9 @@ class CopyTradingBot:
         return "; AUTOMATIC ROLLBACK FAILED; coin quarantined"
 
     def _handle_exit(self, event: CopyEvent) -> None:
+        event_identity = self._event_identity(event)
         close_intent_key = (
-            f"copy-event:{event.event_id}:close" if event.event_id is not None else None
+            f"copy-event:{event_identity}:close" if event_identity is not None else None
         )
         recovering_close = (
             close_intent_key is not None
@@ -5445,7 +5668,7 @@ class CopyTradingBot:
             )
         )
         execution_key = (
-            f"copy-event:{event.event_id}:close" if event.event_id is not None else None
+            f"copy-event:{event_identity}:close" if event_identity is not None else None
         )
         if isinstance(self.platform, HyperliquidAdapter):
             execution = self.platform.close_position(

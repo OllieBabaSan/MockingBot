@@ -9,11 +9,15 @@ from helpers import settings
 
 
 class MutablePositions:
-    def __init__(self, states):
+    def __init__(self, states, prices=None):
         self.states = states
+        self.prices = prices or {}
 
     def positions(self, wallet):
         return self.states.get(wallet)
+
+    def mid_price(self, coin):
+        return self.prices.get(coin)
 
 
 class EventDurabilityTests(unittest.TestCase):
@@ -27,7 +31,7 @@ class EventDurabilityTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_unacknowledged_event_survives_snapshot_advance_and_restart_scan(self) -> None:
-        platform = MutablePositions({"wallet": {}})
+        platform = MutablePositions({"wallet": {}}, {"SOL": 51.25})
         monitor = core.WalletMonitor(self.configured, self.store, platform)
         monitor.scan(["wallet"])
         platform.states["wallet"] = {
@@ -77,6 +81,85 @@ class EventDurabilityTests(unittest.TestCase):
 
         self.assertEqual([(event.kind, event.side) for event in events], [("EXIT", "LONG"), ("ENTRY", "SHORT")])
         self.assertLess(events[0].event_id, events[1].event_id)
+
+    def test_live_consumes_handled_canonical_events_once_in_source_order(self) -> None:
+        root = Path(self.temp.name)
+        paper_settings = settings(root / "paper", wallet_poll_delay=0)
+        live_settings = settings(
+            root / "live",
+            live=True,
+            wallet_poll_delay=0,
+            scoring_seed_db_path=paper_settings.db_path,
+        )
+        paper_store = core.Store(paper_settings.db_path)
+        live_store = core.Store(live_settings.db_path)
+        platform = MutablePositions({"wallet": {}}, {"SOL": 51.25})
+        try:
+            with paper_store.conn:
+                paper_store.conn.execute(
+                    """
+                    INSERT INTO marshal_shadow_positions(
+                        wallet, coin, side, entry_price, opened_at, marshal_score,
+                        marshal_tier, status, exit_price, closed_at, paper_gain,
+                        pnl_pct, close_reason
+                    ) VALUES('seed-wallet', 'BTC', 'LONG', 100, '2026-01-01',
+                             60, 'Core', 'CLOSED', 105, '2026-01-02', 15, 5,
+                             'canonical test')
+                    """
+                )
+            paper_monitor = core.WalletMonitor(paper_settings, paper_store, platform)
+            live_monitor = core.WalletMonitor(live_settings, live_store, platform)
+            paper_monitor.scan(["wallet"])
+
+            # First connection establishes a cursor and never replays history.
+            events, failures = live_monitor.scan(["wallet"])
+            self.assertEqual(events, [])
+            self.assertEqual(failures, 0.0)
+            copied_shadow = live_store.conn.execute(
+                "SELECT wallet, pnl_pct FROM marshal_shadow_positions"
+            ).fetchone()
+            self.assertEqual(tuple(copied_shadow), ("seed-wallet", 5.0))
+            self.assertEqual(
+                live_store.conn.execute("SELECT COUNT(*) FROM paper_positions").fetchone()[0],
+                0,
+            )
+
+            platform.states["wallet"] = {
+                "SOL": core.Position("SOL", "LONG", 2.0, 50.0)
+            }
+            paper_events, _ = paper_monitor.scan(["wallet"])
+            self.assertEqual(len(paper_events), 1)
+
+            # Paper has not completed the decision, so live must wait.
+            live_events, _ = live_monitor.scan(["wallet"])
+            self.assertEqual(live_events, [])
+
+            paper_store.acknowledge_copy_event(paper_events[0].event_id)
+            live_events, _ = live_monitor.scan(["wallet"])
+            self.assertEqual(len(live_events), 1)
+            self.assertEqual(live_events[0].source_event_id, paper_events[0].event_id)
+            self.assertEqual(live_events[0].observed_price, 51.25)
+            self.assertEqual(
+                (live_events[0].kind, live_events[0].wallet, live_events[0].coin),
+                ("ENTRY", "wallet", "SOL"),
+            )
+
+            # Repeated scans and a reconstructed monitor cannot duplicate it.
+            again, _ = live_monitor.scan(["wallet"])
+            self.assertEqual([event.event_id for event in again], [live_events[0].event_id])
+            live_store.acknowledge_copy_event(live_events[0].event_id)
+            restarted = core.WalletMonitor(live_settings, live_store, platform)
+            final, _ = restarted.scan(["wallet"])
+            self.assertEqual(final, [])
+            self.assertEqual(
+                live_store.conn.execute(
+                    "SELECT COUNT(*) FROM pending_copy_events WHERE source_event_id IS NOT NULL"
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            paper_store.conn.close()
+            live_store.conn.close()
 
 
 if __name__ == "__main__":
