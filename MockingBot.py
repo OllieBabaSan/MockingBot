@@ -971,6 +971,17 @@ class Store:
                 quarantined_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS capital_flows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                amount REAL NOT NULL,
+                pre_account_value REAL NOT NULL,
+                post_account_value REAL NOT NULL,
+                verification TEXT NOT NULL,
+                details TEXT
+            );
             """
         )
         self.conn.commit()
@@ -2851,6 +2862,34 @@ class HyperliquidAdapter(PlatformAdapter):
             )
         except (TypeError, ValueError):
             return None
+
+    def deposits_since(self, start_time_ms: int) -> list[dict[str, Any]] | None:
+        """Return confirmed account deposits from Hyperliquid's non-funding ledger."""
+        rows = self._post_info(
+            {
+                "type": "userNonFundingLedgerUpdates",
+                "user": self.settings.hl_wallet_address,
+                "startTime": int(start_time_ms),
+            },
+            "user_non_funding_ledger_updates",
+            self.settings.hl_wallet_address,
+        )
+        if not isinstance(rows, list):
+            return None
+        deposits: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            delta = row.get("delta")
+            if not isinstance(delta, dict) or str(delta.get("type", "")).lower() != "deposit":
+                continue
+            try:
+                amount = float(delta.get("usdc"))
+            except (TypeError, ValueError):
+                continue
+            if amount > 0:
+                deposits.append({"time": row.get("time"), "amount": amount})
+        return deposits
 
     def live_positions(self) -> dict[str, Position] | None:
         state = self._user_state()
@@ -5825,16 +5864,25 @@ def live_command_settings() -> Settings:
     base = Settings()
     explicit_data_dir = os.getenv("MOCKINGBOT_LIVE_DATA_DIR", "").strip()
     explicit_slots = os.getenv("MOCKINGBOT_LIVE_MAX_POSITIONS", "").strip()
+    data_dir = (
+        Path(explicit_data_dir)
+        if explicit_data_dir
+        else ROOT / "MockingBot_Main_Live_Test_Data"
+    )
+    persisted_slots: int | None = None
+    runtime_config = data_dir / "live_runtime_config.json"
+    if not explicit_slots and runtime_config.exists():
+        try:
+            value = json.loads(runtime_config.read_text(encoding="utf-8")).get("max_positions")
+            persisted_slots = int(value) if value is not None else None
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            persisted_slots = None
     return replace(
         base,
         live=True,
-        data_dir=(
-            Path(explicit_data_dir)
-            if explicit_data_dir
-            else ROOT / "MockingBot_Main_Live_Test_Data"
-        ),
+        data_dir=data_dir,
         instance_id="live-main",
-        max_positions=int(explicit_slots) if explicit_slots else 4,
+        max_positions=int(explicit_slots) if explicit_slots else (persisted_slots or 4),
     )
 
 
@@ -6102,6 +6150,134 @@ def reset_live_risk_baseline(
             store.conn.close()
 
 
+def prepare_live_capital_contribution(settings: Settings, amount: float, target_slots: int) -> bool:
+    if amount <= 0 or target_slots <= 0:
+        print("Capital contribution preparation blocked: amount and target slots must be positive.")
+        return False
+    with InstanceLock(settings):
+        store = Store(settings.db_path)
+        try:
+            if store.get_json("pending_live_capital_contribution", None):
+                print("Capital contribution preparation blocked: another contribution is pending.")
+                return False
+            adapter = HyperliquidAdapter(settings, store)
+            adapter.validate_live_credentials()
+            capital = adapter.capital_snapshot()
+            if capital is None or capital.account_value <= 0:
+                print("Capital contribution preparation blocked: verified live equity is unavailable.")
+                return False
+            identity = store.get_json("live_account_identity", {})
+            baseline = store.get_json("live_risk_baseline", {})
+            if (
+                str(identity.get("wallet", "")).lower() != settings.hl_wallet_address.lower()
+                or str(baseline.get("wallet", "")).lower() != settings.hl_wallet_address.lower()
+            ):
+                print("Capital contribution preparation blocked: live identity or risk baseline is invalid.")
+                return False
+            prepared_ms = int(time.time() * 1000)
+            store.set_json(
+                "pending_live_capital_contribution",
+                {
+                    "amount": round(amount, 8),
+                    "target_slots": target_slots,
+                    "prepared_at": utc_now(),
+                    "prepared_unix_ms": prepared_ms,
+                    "pre_account_value": capital.account_value,
+                    "wallet": settings.hl_wallet_address,
+                },
+            )
+            print(
+                f"Contribution prepared at verified equity ${capital.account_value:,.2f}. "
+                f"Keep live stopped, deposit exactly ${amount:,.2f}, then run "
+                "'python .\\MockingBot.py confirm-live-capital-contribution'."
+            )
+            return True
+        finally:
+            store.conn.close()
+
+
+def confirm_live_capital_contribution(
+    settings: Settings, platform: HyperliquidAdapter | Any | None = None
+) -> bool:
+    with InstanceLock(settings):
+        store = Store(settings.db_path)
+        try:
+            pending = store.get_json("pending_live_capital_contribution", None)
+            if not isinstance(pending, dict):
+                print("Capital contribution confirmation blocked: no prepared contribution exists.")
+                return False
+            if str(pending.get("wallet", "")).lower() != settings.hl_wallet_address.lower():
+                print("Capital contribution confirmation blocked: prepared wallet does not match.")
+                return False
+            amount = float(pending["amount"])
+            adapter = platform or HyperliquidAdapter(settings, store)
+            adapter.validate_live_credentials()
+            deposits = adapter.deposits_since(int(pending["prepared_unix_ms"]))
+            matching = [row for row in (deposits or []) if abs(float(row["amount"]) - amount) <= 0.01]
+            if not matching:
+                print(
+                    f"Capital contribution confirmation blocked: Hyperliquid has not confirmed "
+                    f"the prepared ${amount:,.2f} deposit."
+                )
+                return False
+            capital = adapter.capital_snapshot()
+            if capital is None or capital.account_value <= 0:
+                print("Capital contribution confirmation blocked: verified live equity is unavailable.")
+                return False
+            account = store.get_json("paper_account", None)
+            baseline = store.get_json("live_risk_baseline", None)
+            identity = store.get_json("live_account_identity", None)
+            if not all(isinstance(item, dict) for item in (account, baseline, identity)):
+                print("Capital contribution confirmation blocked: required live accounting state is missing.")
+                return False
+            backup = store.create_verified_backup(settings.backup_dir, settings.backup_retention_count)
+            now = utc_now()
+            account["cash"] = round(float(account.get("cash", 0)) + amount, 8)
+            baseline["start_value"] = float(baseline["start_value"]) + amount
+            baseline["high_water_value"] = float(baseline["high_water_value"]) + amount
+            baseline["capital_adjusted_at"] = now
+            identity["net_capital_contributions"] = (
+                float(identity.get("net_capital_contributions", 0)) + amount
+            )
+            target_slots = int(pending["target_slots"])
+            with store.conn:
+                for key, value in (
+                    ("paper_account", account),
+                    ("live_risk_baseline", baseline),
+                    ("live_account_identity", identity),
+                ):
+                    store.conn.execute(
+                        "INSERT INTO kv(key, value) VALUES(?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (key, json.dumps(value)),
+                    )
+                store.conn.execute("DELETE FROM kv WHERE key='pending_live_capital_contribution'")
+                store.conn.execute(
+                    "INSERT INTO capital_flows(ts, kind, amount, pre_account_value, "
+                    "post_account_value, verification, details) VALUES(?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        now, "CONTRIBUTION", amount, float(pending["pre_account_value"]),
+                        capital.account_value, "HYPERLIQUID_LEDGER",
+                        json.dumps({"deposit_time": matching[0].get("time"), "target_slots": target_slots}),
+                    ),
+                )
+            settings.data_dir.mkdir(parents=True, exist_ok=True)
+            config_path = settings.data_dir / "live_runtime_config.json"
+            temp_path = config_path.with_suffix(".tmp")
+            temp_path.write_text(
+                json.dumps({"max_positions": target_slots, "updated_at": now}, indent=2),
+                encoding="utf-8",
+            )
+            temp_path.replace(config_path)
+            print(
+                f"Confirmed ${amount:,.2f} contribution; local cash and breaker baseline adjusted, "
+                f"performance history preserved, and {target_slots} slots configured. Backup: {backup}"
+            )
+            return True
+        finally:
+            store.conn.close()
+
+
 def main(argv: list[str]) -> int:
     settings = Settings()
     if len(argv) > 1 and argv[1] == "preflight-live":
@@ -6110,6 +6286,12 @@ def main(argv: list[str]) -> int:
         return start_live()
     if len(argv) > 1 and argv[1] == "reset-live-risk-baseline":
         return 0 if reset_live_risk_baseline(live_command_settings()) else 2
+    if len(argv) > 1 and argv[1] == "prepare-live-capital-contribution":
+        amount = float(argv[2]) if len(argv) > 2 else 300.0
+        target_slots = int(argv[3]) if len(argv) > 3 else 6
+        return 0 if prepare_live_capital_contribution(live_command_settings(), amount, target_slots) else 2
+    if len(argv) > 1 and argv[1] == "confirm-live-capital-contribution":
+        return 0 if confirm_live_capital_contribution(live_command_settings()) else 2
     if len(argv) > 1 and argv[1] == "status":
         print_status(settings)
         return 0

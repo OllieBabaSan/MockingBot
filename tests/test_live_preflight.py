@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import sys
 import tempfile
@@ -30,6 +31,15 @@ class FakePreflightAdapter:
 
     def live_positions(self) -> dict[str, core.Position]:
         return self.positions
+
+
+class FakeContributionAdapter(FakePreflightAdapter):
+    def __init__(self, equity: float, deposits: list[dict[str, object]]):
+        super().__init__(equity=equity)
+        self.deposits = deposits
+
+    def deposits_since(self, _start_time_ms: int) -> list[dict[str, object]]:
+        return self.deposits
 
 
 class LivePreflightTests(unittest.TestCase):
@@ -130,6 +140,88 @@ class LivePreflightTests(unittest.TestCase):
         self.assertTrue(configured.live)
         self.assertEqual(configured.max_positions, 4)
         self.assertEqual(configured.data_dir.name, "MockingBot_Main_Live_Test_Data")
+
+    def test_live_launcher_reads_confirmed_persisted_slot_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            (data_dir / "live_runtime_config.json").write_text(
+                '{"max_positions": 6}', encoding="utf-8"
+            )
+            with patch.dict(
+                os.environ,
+                {"MOCKINGBOT_LIVE_DATA_DIR": str(data_dir)},
+                clear=False,
+            ):
+                configured = core.live_command_settings()
+        self.assertEqual(configured.max_positions, 6)
+
+    def test_confirmed_contribution_preserves_performance_and_enables_slots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            configured = self.configured(Path(tmp))
+            store = core.Store(configured.db_path)
+            store.save_paper_account({"cash": 25.0, "realized_pnl": -20.0})
+            store.set_json(
+                "live_account_identity",
+                {"wallet": configured.hl_wallet_address, "initial_account_value": 500.0},
+            )
+            store.set_json(
+                "live_risk_baseline",
+                {
+                    "wallet": configured.hl_wallet_address,
+                    "start_value": 500.0,
+                    "high_water_value": 520.0,
+                },
+            )
+            store.set_json(
+                "pending_live_capital_contribution",
+                {
+                    "wallet": configured.hl_wallet_address,
+                    "amount": 300.0,
+                    "target_slots": 6,
+                    "prepared_unix_ms": 123,
+                    "pre_account_value": 450.0,
+                },
+            )
+            store.conn.close()
+            adapter = FakeContributionAdapter(750.0, [{"time": 456, "amount": 300.0}])
+            self.assertTrue(core.confirm_live_capital_contribution(configured, adapter))
+            store = core.Store(configured.db_path)
+            self.assertEqual(store.get_json("paper_account", {})["cash"], 325.0)
+            baseline = store.get_json("live_risk_baseline", {})
+            self.assertEqual(baseline["start_value"], 800.0)
+            self.assertEqual(baseline["high_water_value"], 820.0)
+            self.assertEqual(
+                store.get_json("live_account_identity", {})["net_capital_contributions"], 300.0
+            )
+            self.assertIsNone(store.get_json("pending_live_capital_contribution", None))
+            flow = store.conn.execute("SELECT * FROM capital_flows").fetchone()
+            self.assertEqual(flow["amount"], 300.0)
+            store.conn.close()
+            self.assertEqual(
+                json.loads((configured.data_dir / "live_runtime_config.json").read_text())["max_positions"],
+                6,
+            )
+
+    def test_contribution_is_not_applied_without_exchange_ledger_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            configured = self.configured(Path(tmp))
+            store = core.Store(configured.db_path)
+            store.set_json(
+                "pending_live_capital_contribution",
+                {
+                    "wallet": configured.hl_wallet_address,
+                    "amount": 300.0,
+                    "target_slots": 6,
+                    "prepared_unix_ms": 123,
+                    "pre_account_value": 450.0,
+                },
+            )
+            store.conn.close()
+            adapter = FakeContributionAdapter(750.0, [])
+            self.assertFalse(core.confirm_live_capital_contribution(configured, adapter))
+            store = core.Store(configured.db_path)
+            self.assertIsNotNone(store.get_json("pending_live_capital_contribution", None))
+            store.conn.close()
 
     def test_ordinary_main_rejects_environment_live_mode(self) -> None:
         live_settings = settings(Path("unused"), live=True)
