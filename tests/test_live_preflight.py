@@ -183,19 +183,21 @@ class LivePreflightTests(unittest.TestCase):
                 },
             )
             store.conn.close()
-            adapter = FakeContributionAdapter(750.0, [{"time": 456, "amount": 300.0}])
+            adapter = FakeContributionAdapter(
+                750.3, [{"time": 456, "amount": 300.3, "type": "send"}]
+            )
             self.assertTrue(core.confirm_live_capital_contribution(configured, adapter))
             store = core.Store(configured.db_path)
-            self.assertEqual(store.get_json("paper_account", {})["cash"], 325.0)
+            self.assertEqual(store.get_json("paper_account", {})["cash"], 325.3)
             baseline = store.get_json("live_risk_baseline", {})
-            self.assertEqual(baseline["start_value"], 800.0)
-            self.assertEqual(baseline["high_water_value"], 820.0)
+            self.assertEqual(baseline["start_value"], 800.3)
+            self.assertEqual(baseline["high_water_value"], 820.3)
             self.assertEqual(
-                store.get_json("live_account_identity", {})["net_capital_contributions"], 300.0
+                store.get_json("live_account_identity", {})["net_capital_contributions"], 300.3
             )
             self.assertIsNone(store.get_json("pending_live_capital_contribution", None))
             flow = store.conn.execute("SELECT * FROM capital_flows").fetchone()
-            self.assertEqual(flow["amount"], 300.0)
+            self.assertEqual(flow["amount"], 300.3)
             store.conn.close()
             self.assertEqual(
                 json.loads((configured.data_dir / "live_runtime_config.json").read_text())["max_positions"],

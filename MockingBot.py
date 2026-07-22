@@ -2864,7 +2864,7 @@ class HyperliquidAdapter(PlatformAdapter):
             return None
 
     def deposits_since(self, start_time_ms: int) -> list[dict[str, Any]] | None:
-        """Return confirmed account deposits from Hyperliquid's non-funding ledger."""
+        """Return confirmed inbound USDC credits from Hyperliquid's account ledger."""
         rows = self._post_info(
             {
                 "type": "userNonFundingLedgerUpdates",
@@ -2881,14 +2881,26 @@ class HyperliquidAdapter(PlatformAdapter):
             if not isinstance(row, dict):
                 continue
             delta = row.get("delta")
-            if not isinstance(delta, dict) or str(delta.get("type", "")).lower() != "deposit":
+            if not isinstance(delta, dict):
+                continue
+            event_type = str(delta.get("type", "")).lower()
+            raw_amount: Any = delta.get("usdc")
+            if event_type == "send":
+                destination = str(delta.get("destination", "")).lower()
+                token = str(delta.get("token", "")).upper()
+                if destination != self.settings.hl_wallet_address.lower() or token != "USDC":
+                    continue
+                raw_amount = delta.get("amount")
+            elif event_type != "deposit":
                 continue
             try:
-                amount = float(delta.get("usdc"))
+                amount = float(raw_amount)
             except (TypeError, ValueError):
                 continue
             if amount > 0:
-                deposits.append({"time": row.get("time"), "amount": amount})
+                deposits.append(
+                    {"time": row.get("time"), "amount": amount, "type": event_type}
+                )
         return deposits
 
     def live_positions(self) -> dict[str, Position] | None:
@@ -6213,13 +6225,19 @@ def confirm_live_capital_contribution(
             adapter = platform or HyperliquidAdapter(settings, store)
             adapter.validate_live_credentials()
             deposits = adapter.deposits_since(int(pending["prepared_unix_ms"]))
-            matching = [row for row in (deposits or []) if abs(float(row["amount"]) - amount) <= 0.01]
+            tolerance = max(1.0, amount * 0.01)
+            matching = [
+                row for row in (deposits or [])
+                if abs(float(row["amount"]) - amount) <= tolerance
+            ]
             if not matching:
                 print(
                     f"Capital contribution confirmation blocked: Hyperliquid has not confirmed "
                     f"the prepared ${amount:,.2f} deposit."
                 )
                 return False
+            match = min(matching, key=lambda row: abs(float(row["amount"]) - amount))
+            credited_amount = float(match["amount"])
             capital = adapter.capital_snapshot()
             if capital is None or capital.account_value <= 0:
                 print("Capital contribution confirmation blocked: verified live equity is unavailable.")
@@ -6232,12 +6250,12 @@ def confirm_live_capital_contribution(
                 return False
             backup = store.create_verified_backup(settings.backup_dir, settings.backup_retention_count)
             now = utc_now()
-            account["cash"] = round(float(account.get("cash", 0)) + amount, 8)
-            baseline["start_value"] = float(baseline["start_value"]) + amount
-            baseline["high_water_value"] = float(baseline["high_water_value"]) + amount
+            account["cash"] = round(float(account.get("cash", 0)) + credited_amount, 8)
+            baseline["start_value"] = float(baseline["start_value"]) + credited_amount
+            baseline["high_water_value"] = float(baseline["high_water_value"]) + credited_amount
             baseline["capital_adjusted_at"] = now
             identity["net_capital_contributions"] = (
-                float(identity.get("net_capital_contributions", 0)) + amount
+                float(identity.get("net_capital_contributions", 0)) + credited_amount
             )
             target_slots = int(pending["target_slots"])
             with store.conn:
@@ -6256,9 +6274,17 @@ def confirm_live_capital_contribution(
                     "INSERT INTO capital_flows(ts, kind, amount, pre_account_value, "
                     "post_account_value, verification, details) VALUES(?, ?, ?, ?, ?, ?, ?)",
                     (
-                        now, "CONTRIBUTION", amount, float(pending["pre_account_value"]),
+                        now, "CONTRIBUTION", credited_amount, float(pending["pre_account_value"]),
                         capital.account_value, "HYPERLIQUID_LEDGER",
-                        json.dumps({"deposit_time": matching[0].get("time"), "target_slots": target_slots}),
+                        json.dumps(
+                            {
+                                "expected_amount": amount,
+                                "credited_amount": credited_amount,
+                                "deposit_time": match.get("time"),
+                                "ledger_type": match.get("type"),
+                                "target_slots": target_slots,
+                            }
+                        ),
                     ),
                 )
             settings.data_dir.mkdir(parents=True, exist_ok=True)
@@ -6270,7 +6296,7 @@ def confirm_live_capital_contribution(
             )
             temp_path.replace(config_path)
             print(
-                f"Confirmed ${amount:,.2f} contribution; local cash and breaker baseline adjusted, "
+                f"Confirmed ${credited_amount:,.2f} contribution; local cash and breaker baseline adjusted, "
                 f"performance history preserved, and {target_slots} slots configured. Backup: {backup}"
             )
             return True
