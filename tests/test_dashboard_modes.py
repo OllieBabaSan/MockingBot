@@ -47,11 +47,15 @@ class DashboardModeTests(unittest.TestCase):
             store.save_paper_account({"cash": 500.0, "realized_pnl": 0.0})
             store.set_json(
                 "live_account_identity",
-                {"wallet": TEST_USER, "initial_account_value": 500.0},
+                {
+                    "wallet": TEST_USER,
+                    "initial_account_value": 500.0,
+                    "net_capital_contributions": 300.3,
+                },
             )
             store.set_json(
                 "live_risk_baseline",
-                {"start_value": 500.0, "high_water_value": 510.0},
+                {"start_value": 800.3, "high_water_value": 810.3},
             )
             store.set_json(
                 "live_equity_snapshot",
@@ -78,12 +82,12 @@ class DashboardModeTests(unittest.TestCase):
             data = dashboard.dashboard_data()
         self.assertTrue(data["ok"])
         self.assertEqual(data["instance_label"], "LIVE")
-        self.assertEqual(data["baseline"], 500.0)
-        self.assertEqual(data["baseline_source"], "live-initial-equity")
-        self.assertEqual(data["risk_reference"], 510.0)
+        self.assertEqual(data["baseline"], 800.3)
+        self.assertEqual(data["baseline_source"], "live-contributed-equity")
+        self.assertEqual(data["risk_reference"], 810.3)
         self.assertEqual(data["estimated_value"], 475.0)
         self.assertEqual(data["equity_source"], "bot-risk-feed")
-        self.assertAlmostEqual(data["drawdown_pct"], 35 / 510 * 100)
+        self.assertAlmostEqual(data["drawdown_pct"], 335.3 / 810.3 * 100)
         self.assertEqual(data["account_wallet"], f"{TEST_USER[:8]}...{TEST_USER[-4:]}")
         self.assertEqual(data["counts"]["quarantined"], 1)
         self.assertEqual(data["quarantines"][0]["coin"], "BTC")

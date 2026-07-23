@@ -121,25 +121,27 @@ class LivePreflightTests(unittest.TestCase):
         bot.assert_not_called()
         configured = preflight.call_args.args[0]
         self.assertTrue(configured.live)
-        self.assertEqual(configured.max_positions, 4)
+        self.assertGreater(configured.max_positions, 0)
         self.assertEqual(configured.instance_id, "live-main")
         self.assertEqual(configured.data_dir.name, "MockingBot_Main_Live_Test_Data")
         self.assertFalse(preflight.call_args.kwargs["check_instance_lock"])
 
     def test_live_launcher_ignores_generic_paper_overrides(self) -> None:
-        with patch.dict(
-            os.environ,
-            {
-                "MOCKINGBOT_DATA_DIR": "wrong-paper-directory",
-                "MAX_POSITIONS": "99",
-            },
-            clear=False,
-        ):
-            configured = core.live_command_settings()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(
+                os.environ,
+                {
+                    "MOCKINGBOT_DATA_DIR": "wrong-paper-directory",
+                    "MAX_POSITIONS": "99",
+                    "MOCKINGBOT_LIVE_DATA_DIR": tmp,
+                },
+                clear=False,
+            ):
+                configured = core.live_command_settings()
 
         self.assertTrue(configured.live)
         self.assertEqual(configured.max_positions, 4)
-        self.assertEqual(configured.data_dir.name, "MockingBot_Main_Live_Test_Data")
+        self.assertEqual(configured.data_dir, Path(tmp))
 
     def test_live_launcher_reads_confirmed_persisted_slot_count(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -333,12 +333,15 @@ def dashboard_data() -> dict[str, Any]:
         last_entry_rollback = get_json(conn, "last_entry_rollback", {}) if MODE == "live" else {}
         if MODE == "live":
             risk_baseline = get_json(conn, "live_risk_baseline", {})
-            starting_equity = float(
-                identity.get("initial_account_value")
-                or risk_baseline.get("start_value")
-                or acct.get("cash")
-                or 0.0
-            )
+            initial_equity = identity.get("initial_account_value")
+            if initial_equity is not None:
+                starting_equity = float(initial_equity) + float(
+                    identity.get("net_capital_contributions", 0) or 0
+                )
+            else:
+                starting_equity = float(
+                    risk_baseline.get("start_value") or acct.get("cash") or 0.0
+                )
             risk_reference = float(
                 risk_baseline.get("high_water_value")
                 or risk_baseline.get("start_value")
@@ -346,7 +349,7 @@ def dashboard_data() -> dict[str, Any]:
                 or acct.get("cash")
                 or 0.0
             )
-            baseline_source = "live-initial-equity"
+            baseline_source = "live-contributed-equity"
         else:
             starting_equity = PAPER_STARTING_EQUITY
             risk_reference = starting_equity
