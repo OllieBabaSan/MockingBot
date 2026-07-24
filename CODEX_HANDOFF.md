@@ -172,6 +172,13 @@ Suggested live-test posture:
 
 ## Deferred / Not Yet Implemented
 
+Next coordinated paper/live maintenance window:
+- Refine parity classification for successful live executions:
+  - paper correctly records its midpoint estimate because it submits no exchange order
+  - live correctly records the confirmed exchange fill
+  - when both engines make the same decision, this price-source/reason difference must be
+    classified as expected environment variance, not `LOGIC_DIVERGENCE`
+
 High value but not installed:
 - Position replacement v1:
   - let stronger Core/Elite signal free capacity from weaker active Candidate exposure
