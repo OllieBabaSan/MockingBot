@@ -81,6 +81,97 @@ class ExecutionReconciliationTests(unittest.TestCase):
         self.assertEqual(row["action"], "SKIPPED")
         self.assertIn("Insufficient margin", row["reason"])
 
+    def test_successful_recovery_close_is_not_observed_as_wallet_exit(self) -> None:
+        score = core.ScoringEngineScore(
+            wallet="wallet",
+            tier="Core",
+            total_score=60.0,
+            realized_component=0.0,
+            win_rate_component=0.0,
+            recent_form_component=0.0,
+            churn_penalty=0.0,
+            loss_penalty=0.0,
+            sample_size=5,
+            realized_pnl=1.0,
+            win_rate=0.6,
+            avg_pnl_pct=0.1,
+            explanation="test",
+        )
+
+        class FakeScoring:
+            def __init__(self):
+                self.observed = []
+
+            def active_entry_decision(self, _event):
+                return core.TradeDecision("EXECUTE"), score
+
+            def allocation_multiplier(self, _score):
+                return 1.0
+
+            def leverage_for_score(self, _score):
+                return 3
+
+            def allocation_note(self, *_args):
+                return "test allocation"
+
+            def observe_signal(self, event, *_args):
+                self.observed.append(event.kind)
+
+        class FakePaper:
+            def position(self, _coin):
+                return None
+
+            def position_side(self, *_args):
+                return None
+
+            def available_slot(self, *_args, **_kwargs):
+                return 10.0
+
+            def value(self, _price_fn):
+                return 500.0
+
+            def open(self, *_args, **_kwargs):
+                return None
+
+        class FakePlatform:
+            def mid_price(self, _coin):
+                return 100.0
+
+            def open_position(self, *_args):
+                return core.ExecutionResult(
+                    True, 0.3, 0.3, 100.0, status="filled", confirmed=True
+                )
+
+            def close_position(self, *_args):
+                return core.ExecutionResult(
+                    True, 0.3, 0.3, 100.0, status="filled", confirmed=True
+                )
+
+        bot = core.CopyTradingBot.__new__(core.CopyTradingBot)
+        bot.settings = self.settings
+        bot.store = self.store
+        bot.platform = FakePlatform()
+        bot.paper = FakePaper()
+        bot.scoring_engine = FakeScoring()
+        bot.risk = type(
+            "Risk", (), {"allow_entry": lambda *_args, **_kwargs: core.TradeDecision("EXECUTE")}
+        )()
+        bot.token_risk = type("TokenRisk", (), {"observe": lambda *_args: None})()
+        event = core.CopyEvent(
+            "ADD", "wallet", "BTC", "LONG", entry_price=100.0, event_id=77
+        )
+
+        bot._handle_entry(event, False, set())
+
+        self.assertEqual(bot.scoring_engine.observed, ["ADD"])
+        signals = self.store.conn.execute(
+            "SELECT signal, reason FROM signals ORDER BY id"
+        ).fetchall()
+        self.assertEqual([row["signal"] for row in signals], ["ADD", "EXIT"])
+        self.assertEqual(
+            signals[-1]["reason"], "recovery close after paper commit failure"
+        )
+
     def test_confirmed_open_intent_replays_without_second_order(self) -> None:
         exchange = FakeExchange([fill_response()])
         self.adapter._exchange = exchange

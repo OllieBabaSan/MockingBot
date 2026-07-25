@@ -208,6 +208,73 @@ class EventDurabilityTests(unittest.TestCase):
             paper_store.conn.close()
             live_store.conn.close()
 
+    def test_scoring_shadow_resync_replaces_contamination_from_canonical_paper(self) -> None:
+        root = Path(self.temp.name)
+        paper_settings = settings(root / "canonical-paper")
+        paper_store = core.Store(paper_settings.db_path)
+        with paper_store.conn:
+            paper_store.conn.execute(
+                """
+                INSERT INTO marshal_shadow_positions(
+                    wallet, coin, side, entry_price, opened_at, marshal_score,
+                    marshal_tier, status
+                ) VALUES('wallet', 'XRP', 'LONG', 1.1, '2026-01-01', 60,
+                         'Core', 'OPEN')
+                """
+            )
+            paper_store.conn.execute(
+                """
+                INSERT INTO marshal_wallet_scores(
+                    ts, wallet, tier, total_score, realized_component,
+                    win_rate_component, recent_form_component, churn_penalty,
+                    loss_penalty, sample_size, realized_pnl, win_rate,
+                    avg_pnl_pct, explanation
+                ) VALUES('2026-01-01', 'wallet', 'Core', 60, 0, 0, 0, 0,
+                         0, 5, 1, 0.6, 0.1, 'canonical')
+                """
+            )
+
+        live_settings = settings(
+            root / "live", live=True,
+            scoring_seed_db_path=paper_settings.db_path,
+        )
+        live_store = core.Store(live_settings.db_path)
+        try:
+            live_store.import_canonical_copy_events(paper_settings.db_path)
+            with live_store.conn:
+                live_store.conn.execute(
+                    """
+                    UPDATE marshal_shadow_positions
+                    SET status='CLOSED', pnl_pct=-9, paper_gain=-9
+                    WHERE wallet='wallet' AND coin='XRP'
+                    """
+                )
+            shadows, scores = live_store.resync_canonical_scoring_shadow(
+                paper_settings.db_path
+            )
+
+            self.assertEqual(shadows, 1)
+            self.assertEqual(scores, 1)
+            shadow = live_store.conn.execute(
+                """
+                SELECT status, pnl_pct FROM marshal_shadow_positions
+                WHERE wallet='wallet' AND coin='XRP'
+                """
+            ).fetchone()
+            self.assertEqual(shadow["status"], "OPEN")
+            self.assertIsNone(shadow["pnl_pct"])
+            latest = live_store.conn.execute(
+                """
+                SELECT tier, total_score, explanation
+                FROM marshal_wallet_scores WHERE wallet='wallet'
+                ORDER BY id DESC LIMIT 1
+                """
+            ).fetchone()
+            self.assertEqual(tuple(latest), ("Core", 60.0, "canonical"))
+        finally:
+            paper_store.conn.close()
+            live_store.conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

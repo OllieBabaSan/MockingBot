@@ -1555,6 +1555,108 @@ class Store:
             )
         return len(handled)
 
+    def resync_canonical_scoring_shadow(self, source_path: Path) -> tuple[int, int]:
+        """Replace derived live scoring state with a caught-up canonical snapshot."""
+        if not source_path.exists() or source_path.resolve() == self.db_path.resolve():
+            raise RuntimeError(f"Canonical scoring database unavailable: {source_path}")
+        source_name = hashlib.sha256(
+            str(source_path.resolve()).lower().encode("utf-8")
+        ).hexdigest()[:16]
+        cursor_state = self.get_json("canonical_event_cursor", {})
+        if not cursor_state or cursor_state.get("source_instance") != source_name:
+            raise RuntimeError("Canonical event cursor is missing or belongs to another source")
+
+        source = sqlite3.connect(
+            f"file:{source_path.resolve().as_posix()}?mode=ro", uri=True, timeout=10.0
+        )
+        source.row_factory = sqlite3.Row
+        try:
+            source.execute("BEGIN")
+            source_max_event = int(source.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM pending_copy_events"
+            ).fetchone()[0])
+            local_cursor = int(cursor_state.get("last_source_event_id", 0))
+            if local_cursor != source_max_event:
+                raise RuntimeError(
+                    "Canonical scoring resync blocked: live event cursor is not caught up "
+                    f"(live={local_cursor}, paper={source_max_event})"
+                )
+            pending_source = int(source.execute(
+                "SELECT COUNT(*) FROM pending_copy_events WHERE status = 'PENDING'"
+            ).fetchone()[0])
+            if pending_source:
+                raise RuntimeError(
+                    "Canonical scoring resync blocked: paper has unhandled source events"
+                )
+
+            shadow_rows = source.execute(
+                """
+                SELECT wallet, coin, side, entry_price, opened_at,
+                       source_signal_id, marshal_score, marshal_tier, status,
+                       exit_price, closed_at, paper_gain, pnl_pct,
+                       close_signal_id, close_reason
+                FROM marshal_shadow_positions ORDER BY id
+                """
+            ).fetchall()
+            score_rows = source.execute(
+                """
+                SELECT ts, wallet, tier, total_score, realized_component,
+                       win_rate_component, recent_form_component, churn_penalty,
+                       loss_penalty, sample_size, realized_pnl, win_rate,
+                       avg_pnl_pct, explanation
+                FROM marshal_wallet_scores scores
+                WHERE id = (
+                    SELECT MAX(id) FROM marshal_wallet_scores
+                    WHERE wallet = scores.wallet
+                )
+                ORDER BY wallet
+                """
+            ).fetchall()
+            shadow_columns = {
+                str(row["name"])
+                for row in self.conn.execute(
+                    "PRAGMA table_info(marshal_shadow_positions)"
+                )
+            }
+            legacy_score_column = (
+                ", scoring_score" if "scoring_score" in shadow_columns else ""
+            )
+            legacy_score_placeholder = ", ?" if legacy_score_column else ""
+            shadow_values: list[tuple[Any, ...]] = []
+            for row in shadow_rows:
+                values = list(tuple(row))
+                if legacy_score_column:
+                    values.append(row["marshal_score"])
+                shadow_values.append(tuple(values))
+
+            with self.conn:
+                self.conn.execute("DELETE FROM marshal_shadow_positions")
+                self.conn.executemany(
+                    f"""
+                    INSERT INTO marshal_shadow_positions(
+                        wallet, coin, side, entry_price, opened_at,
+                        source_signal_id, marshal_score, marshal_tier, status,
+                        exit_price, closed_at, paper_gain, pnl_pct,
+                        close_signal_id, close_reason{legacy_score_column}
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?{legacy_score_placeholder})
+                    """,
+                    shadow_values,
+                )
+                self.conn.executemany(
+                    """
+                    INSERT INTO marshal_wallet_scores(
+                        ts, wallet, tier, total_score, realized_component,
+                        win_rate_component, recent_form_component, churn_penalty,
+                        loss_penalty, sample_size, realized_pnl, win_rate,
+                        avg_pnl_pct, explanation
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [tuple(row) for row in score_rows],
+                )
+            return len(shadow_rows), len(score_rows)
+        finally:
+            source.close()
+
     def pending_copy_events(self) -> list[CopyEvent]:
         rows = self.conn.execute(
             """
@@ -5573,10 +5675,8 @@ class CopyTradingBot:
                     "SKIPPED",
                     "recovery close failed after paper commit failure",
                 )
-                self.scoring_engine.observe_signal(event, recovery_id, "SKIPPED", "recovery close failed after paper commit failure", price)
                 print(f"[ALERT] {event.coin} {event.side}: live position may be unmanaged")
             else:
-                recovery_event = CopyEvent("EXIT", event.wallet, event.coin, event.side)
                 recovery_id = self.store.log_signal(
                     event.wallet,
                     event.coin,
@@ -5586,7 +5686,6 @@ class CopyTradingBot:
                     "EXECUTED",
                     "recovery close after paper commit failure",
                 )
-                self.scoring_engine.observe_signal(recovery_event, recovery_id, "EXECUTED", "recovery close after paper commit failure", price)
             return
 
         signal_id = self.store.log_signal(event.wallet, event.coin, event.side, event.kind, price, "EXECUTED", allocation_reason)
@@ -6304,6 +6403,37 @@ def confirm_live_capital_contribution(
             store.conn.close()
 
 
+def resync_live_scoring_shadow(
+    paper_settings: Settings,
+    live_settings: Settings,
+) -> bool:
+    """Repair live's derived scoring state while both engines are stopped."""
+    with InstanceLock(paper_settings), InstanceLock(live_settings):
+        store = Store(live_settings.db_path)
+        try:
+            identity = store.get_json("live_account_identity", {})
+            if str(identity.get("wallet", "")).lower() != live_settings.hl_wallet_address.lower():
+                print("Live scoring resync blocked: database account identity is invalid.")
+                return False
+            backup = store.create_verified_backup(
+                live_settings.backup_dir, live_settings.backup_retention_count
+            )
+            shadow_count, score_count = store.resync_canonical_scoring_shadow(
+                live_settings.scoring_seed_db_path
+            )
+            print(
+                f"Live scoring shadow resynchronized from canonical paper: "
+                f"{shadow_count} lifecycle row(s), {score_count} latest wallet score(s). "
+                f"Backup: {backup}"
+            )
+            return True
+        except Exception as exc:
+            print(f"Live scoring resync blocked: {exc}")
+            return False
+        finally:
+            store.conn.close()
+
+
 def main(argv: list[str]) -> int:
     settings = Settings()
     if len(argv) > 1 and argv[1] == "preflight-live":
@@ -6318,6 +6448,12 @@ def main(argv: list[str]) -> int:
         return 0 if prepare_live_capital_contribution(live_command_settings(), amount, target_slots) else 2
     if len(argv) > 1 and argv[1] == "confirm-live-capital-contribution":
         return 0 if confirm_live_capital_contribution(live_command_settings()) else 2
+    if len(argv) > 1 and argv[1] == "resync-live-scoring-shadow":
+        return (
+            0
+            if resync_live_scoring_shadow(Settings(), live_command_settings())
+            else 2
+        )
     if len(argv) > 1 and argv[1] == "status":
         print_status(settings)
         return 0
