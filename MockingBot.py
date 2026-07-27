@@ -233,7 +233,7 @@ class Settings:
     scoring_engine_elite_leverage: int = env_int("SCORING_ENGINE_ELITE_LEVERAGE", 3)
     max_positions: int = env_int("MAX_POSITIONS", 4 if env_bool("HL_LIVE", False) else 10)
     max_slices_per_coin: int = env_int("MAX_SLICES_PER_COIN", 5)
-    max_coin_cost_multiplier: float = env_float("MAX_COIN_COST_MULT", 2.0)
+    max_coin_margin_pct: float = env_float("MAX_COIN_MARGIN_PCT", 0.20)
     max_wallet_margin_pct: float = env_float("MAX_WALLET_MARGIN_PCT", 0.35)
     max_allocations_per_wallet_coin_side: int = env_int("MAX_ALLOCATIONS_PER_WALLET_COIN_SIDE", 2)
     same_wallet_add_threshold_pct: float = env_float("SAME_WALLET_ADD_THRESHOLD_PCT", 25.0)
@@ -336,7 +336,7 @@ def settings_signature(settings: Settings) -> dict[str, Any]:
         "live_margin_reserve_pct": settings.live_margin_reserve_pct,
         "live_size_tolerance_pct": settings.live_size_tolerance_pct,
         "max_slices_per_coin": settings.max_slices_per_coin,
-        "max_coin_cost_multiplier": settings.max_coin_cost_multiplier,
+        "max_coin_margin_pct": settings.max_coin_margin_pct,
         "max_allocations_per_wallet_coin_side": settings.max_allocations_per_wallet_coin_side,
         "same_wallet_add_threshold_pct": settings.same_wallet_add_threshold_pct,
         "live_entry_event_max_age_seconds": settings.live_entry_event_max_age_seconds,
@@ -399,6 +399,8 @@ def validate_settings(settings: Settings) -> None:
         errors.append("MAX_WALLET_MARGIN_PCT must be greater than 0 and at most 1")
     if settings.max_slices_per_coin <= 0:
         errors.append("MAX_SLICES_PER_COIN must be positive")
+    if not 0 < settings.max_coin_margin_pct <= 1:
+        errors.append("MAX_COIN_MARGIN_PCT must be between 0 and 1")
     if not 0.001 <= settings.slippage <= 0.02:
         errors.append("SLIPPAGE must be between 0.001 (0.1%) and 0.02 (2%)")
     if not 1 <= settings.max_leverage_cap <= 5:
@@ -3925,7 +3927,7 @@ class PaperPortfolio:
         base_slot = total_value / self.settings.max_positions
         slot = base_slot * multiplier
         current_coin_cost = sum(float(row["cost_basis"]) for row in self.store.open_position_slices(coin))
-        max_coin_cost = base_slot * self.settings.max_coin_cost_multiplier
+        max_coin_cost = total_value * self.settings.max_coin_margin_pct
         remaining_coin_capacity = max_coin_cost - current_coin_cost
         slot = min(slot, remaining_coin_capacity, float(acct["cash"]))
         if wallet:

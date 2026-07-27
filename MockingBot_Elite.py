@@ -94,7 +94,7 @@ def elite_settings() -> Any:
         wind_down=False,
         max_positions=50,
         max_slices_per_coin=5,
-        max_coin_cost_multiplier=5.0,
+        max_coin_margin_pct=0.10,
         max_position_days=3650,
         hl_wallet_address=credentials["wallet"] or base.hl_wallet_address,
         hl_api_key=credentials["api_key"] or base.hl_api_key,
