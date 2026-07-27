@@ -901,20 +901,11 @@ HTML = r"""<!doctype html>
         document.getElementById("updated").textContent = data.error || "Dashboard error";
         return;
       }
-      const priceLabel = data.price_source === "live"
-        ? "live mids cached"
-        : data.price_source === "cached-live"
-          ? "cached mids"
-          : "stored prices";
       const badge = document.getElementById("mode-badge");
       badge.textContent = data.instance_label;
       badge.className = `mode-badge ${data.mode === "live" ? "live" : "paper"}`;
-      const accountLabel = data.account_wallet ? ` | account ${data.account_wallet}` : "";
       document.title = `MockingBot ${data.instance_label} Dashboard`;
-      const equityLabel = data.mode === "live"
-        ? ` | equity ${data.equity_source}${data.equity_age_seconds === null || data.equity_age_seconds === undefined ? "" : ` (${Math.round(data.equity_age_seconds)}s old)`}`
-        : "";
-      document.getElementById("updated").textContent = `Updated ${fmtTime(data.generated_at)} | read-only | ${priceLabel}${accountLabel}${equityLabel}`;
+      document.getElementById("updated").textContent = `Updated ${fmtTime(data.generated_at)}`;
       const c = data.counts || {};
       const capital = data.capital || {};
       const rollback = data.last_entry_rollback || {};

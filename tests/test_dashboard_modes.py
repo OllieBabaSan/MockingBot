@@ -164,6 +164,9 @@ class DashboardModeTests(unittest.TestCase):
         self.assertIn('id="timezone"', dashboard.HTML)
         self.assertIn('hour12: true', dashboard.HTML)
         self.assertIn('localStorage.getItem("mockingbot-timezone")', dashboard.HTML)
+        self.assertNotIn('| read-only |', dashboard.HTML)
+        self.assertNotIn('live mids cached', dashboard.HTML)
+        self.assertNotIn('| equity ${data.equity_source}', dashboard.HTML)
 
 
 if __name__ == "__main__":
