@@ -25,6 +25,7 @@ class DashboardModeTests(unittest.TestCase):
         try:
             store.save_paper_account({"cash": 10_050.0, "realized_pnl": 50.0})
             store.set_json("session", {"paper_start": 10_025.0})
+            store.set_json("paper_equity_high_water", {"value": 10_200.0})
         finally:
             store.conn.close()
 
@@ -36,7 +37,8 @@ class DashboardModeTests(unittest.TestCase):
         self.assertEqual(data["instance_label"], "PAPER")
         self.assertEqual(data["baseline"], 10_000.0)
         self.assertEqual(data["baseline_source"], "paper-starting-equity")
-        self.assertEqual(data["risk_reference"], 10_000.0)
+        self.assertEqual(data["risk_reference"], 10_200.0)
+        self.assertAlmostEqual(data["drawdown_pct"], 150.0 / 10_200.0 * 100)
         self.assertEqual(data["estimated_value"], 10_050.0)
         self.assertEqual(data["equity_source"], "paper-ledger")
 

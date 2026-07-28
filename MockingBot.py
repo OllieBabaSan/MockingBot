@@ -4060,8 +4060,36 @@ class RiskManager:
             return reference
 
         start = portfolio.value(platform.mid_price)
+        previous_session = self.store.get_json("session", {})
+        stored_high_water = self.store.get_json("paper_equity_high_water", {})
+        high_water = max(
+            start,
+            float(previous_session.get("paper_start", 0) or 0),
+            float(stored_high_water.get("value", 0) or 0),
+            self.settings.paper_starting_cash,
+        )
+        self.store.set_json(
+            "paper_equity_high_water",
+            {"value": high_water, "updated_at": utc_now()},
+        )
         self.store.set_json("session", {"started": utc_now(), "paper_start": start})
         return start
+
+    def record_paper_high_water(self, current_value: float) -> float:
+        if self.settings.live:
+            return current_value
+        stored = self.store.get_json("paper_equity_high_water", {})
+        reference = max(
+            float(stored.get("value", 0) or 0),
+            self.settings.paper_starting_cash,
+        )
+        if current_value <= reference:
+            return reference
+        self.store.set_json(
+            "paper_equity_high_water",
+            {"value": current_value, "updated_at": utc_now()},
+        )
+        return current_value
 
     def update_live_high_water(
         self, current_value: float, current_reference: float | None
@@ -5137,6 +5165,7 @@ class CopyTradingBot:
             self.token_risk.maintain()
             self._maintain_live_backup()
             paper_value = self.paper.value(self.platform.mid_price)
+            self.risk.record_paper_high_water(paper_value)
             risk_value = self.risk.current_value(self.paper, self.platform)
             if self.settings.live:
                 self.store.set_json(

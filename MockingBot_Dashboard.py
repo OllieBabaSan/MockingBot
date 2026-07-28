@@ -152,13 +152,14 @@ def bot_live_equity(conn: sqlite3.Connection) -> tuple[float | None, str, float 
 def wallet_statuses(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
     rows = conn.execute(
         """
-        SELECT wallet, tier, total_score, sample_size, realized_pnl
-        FROM marshal_wallet_scores s
-        WHERE id = (
-            SELECT MAX(id)
+        SELECT scores.wallet, scores.tier, scores.total_score,
+               scores.sample_size, scores.realized_pnl
+        FROM marshal_wallet_scores scores
+        JOIN (
+            SELECT wallet, MAX(id) AS latest_id
             FROM marshal_wallet_scores
-            WHERE wallet = s.wallet
-        )
+            GROUP BY wallet
+        ) latest ON latest.latest_id = scores.id
         """
     ).fetchall()
     return {
@@ -352,7 +353,13 @@ def dashboard_data() -> dict[str, Any]:
             baseline_source = "live-contributed-equity"
         else:
             starting_equity = PAPER_STARTING_EQUITY
-            risk_reference = starting_equity
+            paper_high_water = get_json(conn, "paper_equity_high_water", {})
+            session = get_json(conn, "session", {})
+            risk_reference = max(
+                starting_equity,
+                float(session.get("paper_start", 0) or 0),
+                float(paper_high_water.get("value", 0) or 0),
+            )
             baseline_source = "paper-starting-equity"
         stored_prices = latest_prices(conn)
         live_price_map, price_source = live_prices()

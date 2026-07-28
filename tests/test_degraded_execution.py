@@ -43,6 +43,7 @@ class DegradedExecutionTests(unittest.TestCase):
                 })()
                 bot.risk = type("Risk", (), {
                     "session_start_value": lambda *_args: 100.0,
+                    "record_paper_high_water": lambda _self, value: value,
                     "current_value": lambda *_args: 100.0,
                     "live_equity_available": lambda *_args: None,
                     "drawdown": lambda *_args: 0.0,

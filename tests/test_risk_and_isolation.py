@@ -31,6 +31,27 @@ class FakePlatform:
 
 
 class RiskAndIsolationTests(unittest.TestCase):
+    def test_paper_high_water_persists_across_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            configured = settings(Path(td), live=False)
+            store = core.Store(configured.db_path)
+            try:
+                risk = core.RiskManager(configured, store, core.Notifier(""))
+                platform = FakePlatform()
+                self.assertEqual(
+                    risk.session_start_value(FakePortfolio(), platform),
+                    10_000.0,
+                )
+                self.assertEqual(risk.record_paper_high_water(10_500.0), 10_500.0)
+                self.assertEqual(risk.record_paper_high_water(10_250.0), 10_500.0)
+                risk.session_start_value(FakePortfolio(), platform)
+                self.assertEqual(
+                    store.get_json("paper_equity_high_water", {})["value"],
+                    10_500.0,
+                )
+            finally:
+                store.conn.close()
+
     def test_warning_and_persistent_hard_breaker(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             configured = settings(
