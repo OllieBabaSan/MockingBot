@@ -161,6 +161,7 @@ class DashboardModeTests(unittest.TestCase):
         self.assertIn('id="mode-badge"', dashboard.HTML)
         self.assertIn('id="quarantine-section"', dashboard.HTML)
         self.assertIn('id="executions"', dashboard.HTML)
+        self.assertIn('Token Risk Alerts (last 24 hours)', dashboard.HTML)
         self.assertIn('id="timezone"', dashboard.HTML)
         self.assertIn('hour12: true', dashboard.HTML)
         self.assertIn('localStorage.getItem("mockingbot-timezone")', dashboard.HTML)

@@ -825,10 +825,6 @@ HTML = r"""<!doctype html>
       <h2>Quarantined Coins</h2>
       <div class="table-wrap"><table id="quarantines"></table></div>
     </section>
-    <section class="alert-panel" id="token-risk-section" hidden>
-      <h2>Token Risk Alerts</h2>
-      <div class="table-wrap"><table id="token-risk"></table></div>
-    </section>
     <section class="alert-panel" id="execution-intents-section" hidden>
       <h2>Execution Attention Required</h2>
       <div class="table-wrap"><table class="compact-table" id="execution-intents"></table></div>
@@ -836,6 +832,12 @@ HTML = r"""<!doctype html>
     <section class="alert-panel" id="parity-section" hidden>
       <h2>Signal Parity Attention</h2>
       <div class="table-wrap"><table class="compact-table" id="parity-alerts"></table></div>
+    </section>
+    <section class="alert-panel" id="token-risk-section" hidden>
+      <details>
+        <summary>Token Risk Alerts (last 24 hours)</summary>
+        <div class="table-wrap"><table id="token-risk"></table></div>
+      </details>
     </section>
     <section class="api-panel">
       <details>
