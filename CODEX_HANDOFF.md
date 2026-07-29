@@ -1,229 +1,303 @@
 # MockingBot Codex Handoff
 
-Last updated: 2026-07-16
+Last updated: 2026-07-29
 
-## 2026-07-16 Live-Readiness Audit Update
-
-The earlier status below is retained as project history. The deep live audit has
-since implemented and tested:
-
-- 15% drawdown warning and persistent 25% high-water breaker.
-- Isolated live startup and no-order preflight for the four-slot test account.
-- Normalized Paper/Live wallet scoring with imported Paper score history.
-- Durable copy-event inbox and deterministic Hyperliquid client order IDs.
-- Crash recovery for entries, exits, rollbacks, and reconciliation closes.
-- Atomic local cash/allocation ledger updates.
-- Per-coin quarantine that leaves the remaining book operating.
-- Synchronized same-side live adds and allocation-specific partial exits.
-- Separate Paper and Live dashboards plus non-blocking parity comparison.
-- Breaker-aligned live equity reporting with stale-data refusal.
-- Non-blocking token-risk refresh.
-- Verified SQLite online backups with retention and dashboard status.
-
-The dormant wallet-pause subsystem was deliberately removed. Poor wallet
-performance is controlled by score demotion and Candidate allocation limits.
-Run the complete test suite and `python .\MockingBot.py preflight-live` immediately
-before any live launch. Preflight performs reads only and submits no orders.
-
-## Project Goal
-
-Create and operate a profitable Hyperliquid copy-trading bot named `MockingBot`.
-
-Core design philosophy:
-- KISS: avoid overfit rules and fragile complexity.
-- Profitability matters more than win rate.
-- Scoring Engine should promote/demote wallets by copied-trade evidence over time.
-- Strong wallets should be allowed to breathe; avoid panic exits.
-- Candidate wallets are discovery only, not primary capital drivers.
-
-## Current Source Layout
+## Resume Here
 
 Workspace:
+
 `C:\Users\user\Desktop\MockingBot_Revamp_CodeX`
 
-Main files:
-- `MockingBot.py` - main bot, formerly `MockingBot_CodeX`
-- `MockingBot_Dashboard.py` - local dashboard
-- `MockingBot_Elite.py` - separate baseline comparison bot
-- `README.md`
-- `deferred_adjustments.md`
-- `CODEX_HANDOFF.md`
+Repository:
 
-Runtime data:
-- Main bot data/logs: `MockingBot_Data`
-- Elite bot data: `MockingBot_Elite_Data`
-
-Do not commit runtime data, logs, DB files, backups, credentials, or caches.
-
-## Git
-
-Repo:
 `https://github.com/OllieBabaSan/MockingBot.git`
 
-Branch:
-`main`
+Branch: `main`
 
-Recent pushed commits:
-- `7e87f2e Prepare MockingBot near-final live test build`
-- `10795a2 Tighten Candidate allocation exposure`
+Latest code commit before this handoff:
+`74767eb Track paper high water and optimize dashboard`
 
-## Current Running Processes
+The source working tree was clean before this documentation update.
 
-Last known after restart:
-- Main bot: `MockingBot.py`
-- Dashboard: `MockingBot_Dashboard.py`
-- Elite comparison bot: `MockingBot_Elite.py`
+The main Paper and Live bots currently run together. Paper is the canonical
+signal/roster source; Live imports Paper's completed canonical events in source
+order and applies its own capital, slot, execution, and exchange constraints.
+This is a diagnostic training arrangement. Live must eventually be able to
+select and score independently, but do not remove the current dependency until
+parity confidence is materially stronger.
 
-Always re-check with:
-```powershell
-Get-CimInstance Win32_Process | Where-Object { $_.Name -like 'python*' -and ($_.CommandLine -like '*MockingBot*') } | Select-Object ProcessId,Name,CommandLine
-```
+## Current Runtime State
 
-## Current Bot State / Settings
+Last dashboard snapshot on 2026-07-29:
 
-Main bot is still paper mode:
-- `HL_LIVE=false`
-- Default paper start remains `$10,000`
-- Dashboard URL: `http://127.0.0.1:8765`
+### Paper
 
-Important settings currently in source:
-- `MAX_POSITIONS=10`
-- `ROSTER_SIZE=150`
-- Staggered roster refresh enabled:
-  - `ROSTER_REFRESH_BATCH_SIZE=25`
-  - `ROSTER_REFRESH_BATCH_SECS=600`
-- Scoring Engine active by default.
-- Elite gate:
-  - score `>=65`
-  - copied-trade sample `>=8`
-  - historical-only wallets are capped at Core and cannot become Elite.
-- Candidate allocation was tightened:
-  - Candidate multiplier: `0.50x`
-  - Proven Candidate multiplier: `0.70x`
-  - Candidate max allocations: `1`
-  - Proven Candidate max allocations: `2`
-- Core multiplier: `1.15x`
-- Elite multiplier: `1.35x`
+- Dashboard: `http://127.0.0.1:8765`
+- Value: about `$11,825.28`
+- Fixed starting equity: `$10,000`
+- Persistent equity high-water: `$12,119.35`
+- Drawdown from high-water: about `2.43%`
+- Open tokens: `8`
 
-Dashboard valuation was fixed to apply `HL_LEVERAGE` to dollar PnL while leaving displayed percent as underlying trade move.
+### Live
 
-## Current Model Read
+- Dashboard: `http://127.0.0.1:8766`
+- Hyperliquid account: `0x2f7Fd044C323152488105dD01B93107b84f92C98`
+- API/agent wallet: `0x243954546255a5e18b19d9f7e281131a97fce44a`
+- Contributed starting equity: `$802.20`
+- Breaker high-water: about `$823.47`
+- Current equity: about `$653.55`
+- Drawdown: about `20.63%`
+- Warning threshold: `15%`
+- Persistent hard breaker: `25%`
+- Open tokens: `5`
+- Quarantined coins: `0`
+- Unresolved execution intents: `0`
 
-Confidence is relatively high for the first time in this build.
+Current Live positions at handoff:
 
-Observed structure:
-- Core is the profit engine.
-- Candidate is discovery and now sized appropriately.
-- Bench is negative and mostly filtered.
-- Elite is reachable but not cheap.
-- Simple Elite-only comparison bot has not outperformed the main model so far.
+| Coin | Side | Margin | Approx. open PnL |
+|---|---:|---:|---:|
+| PUMP | Long | `$77.38` | `-$21.11` |
+| BTC | Short | `$130.81` | `+$2.77` |
+| HYPE | Long | `$135.71` | `-$0.82` |
+| NEAR | Long | `$135.66` | `-$0.61` |
+| XRP | Short | `$67.63` | `+$5.53` |
 
-Recent Core sample check:
-- Current Core total: `15`
-- Core sample `>8`: `10`, all historical-only
-- Core sample `<8`: `5`, copied-evidence Core wallets
-- Copied-evidence Core close to Elite:
-  - `0x7c9309...c8fd`: score `75.1`, sample `7`, PnL `+$252.90`, win `71.4%`
-  - `0xec4a6f...cf62`: score `66.0`, sample `7`, PnL `+$43.98`, win `100%`
-  - `0xa445a0...329d`: score `65.5`, sample `6`, PnL `+$37.43`
-  - `0x17c3c8...a868`: score `67.7`, sample `4`, PnL `+$299.21`
+Live is operating normally but the drawdown is close enough to the 25% breaker
+to warrant careful monitoring. Do not reset the breaker baseline or force-close
+positions without explicit user authorization.
 
-Interpretation:
-- `c8fd` likely becomes Elite with one more non-damaging close.
-- `cf62` is the useful borderline test: high win rate, low PnL, may enter Elite but should demote if it fails to keep producing.
-- Do not over-weight win rate; profitability is the game.
+Always verify current processes and dashboards rather than trusting these
+snapshot values.
 
-## Recent Candidate Adjustment Rationale
+## Credentials and Security
 
-Candidate exposure was reduced because:
-- Core closed PnL was much stronger than Candidate.
-- Candidate had become too capital-heavy relative to quality.
-- `GRASS SHORT` from Candidate recovered, then failed to close and went deep red.
-- Another Candidate `BLUR LONG` went against market momentum.
+The active main credentials file is:
 
-Important: existing Candidate positions were not force-closed. The adjustment only affects future entries/adds.
+`MockingBot_Main_Live_Test.Hyper.txt`
 
-## Live Wiring Plan
+It contains secrets. Never print, quote, commit, or place its API key in logs or
+handoffs. Credential files, runtime databases, logs, backups, and caches must
+remain uncommitted.
 
-User intends to wire main bot to a separate small Hyperliquid live-test account soon.
+The main account uses Hyperliquid unified-account trading. The account wallet
+and API/agent wallet are different by design.
 
-Risk context:
-- Test account bank around `$500`.
-- Elite bot credentials/account must remain untouched.
-- User will provide separate main bot live-test credentials.
-- Suggested credential file:
-  `C:\Users\user\Documents\MockingBot_Main_Live_Test.Hyper.txt`
+Elite credentials are separate and must never be substituted into the main
+Live bot.
 
-Before live:
-1. Stop or confirm main bot state.
-2. Verify only one main bot process.
-3. Confirm credentials and wallet address are for the intended small test account.
-4. Confirm Elite bot remains isolated.
-5. Use conservative live sizing.
-6. Ensure only main bot gets `HL_LIVE=true`.
-7. Start and closely monitor first live signals.
+## Architecture and Safety Rules
 
-Suggested live-test posture:
-- Start boring.
-- Consider `MAX_POSITIONS=3` or `4` for first live test.
-- Keep Scoring Engine active.
-- Keep Candidate restrictions active.
-- Verify order minimums/leverage/sizing before allowing unattended operation.
+- Paper start: `$10,000`
+- Paper slots: `10`
+- Live slots: `6`
+- Both Paper and Live use an explicit `20%` per-token margin cap based on total
+  local book allocation basis, not remaining cash.
+- The old two-slice/slot-derived cap was removed because it produced a `33.3%`
+  Live token cap with six slots.
+- Existing over-cap positions were grandfathered during rollout but could not
+  receive additions.
+- Per-wallet margin cap: `35%` of total book basis.
+- Leverage: tier-controlled, currently capped at `5x`; normal active positions
+  have generally used `3x`.
+- Live drawdown warning: `15%`.
+- Live hard breaker: `25%` from persistent high-water. Breaker causes wind-down
+  and blocks new risk; it is not a reason to delete state or abandon the bot.
+- Opposite-side replacement is allowed only when the incoming wallet has a
+  strictly superior tier. A ranked reversal closes the incumbent side first.
+- Confirmed exchange fills are recorded even below normal minimum allocation.
+  Minimum allocation governs submission, never recognition of a real fill.
+- Unowned/mismatched coins are quarantined individually; the rest of the book
+  continues.
+- Duplicate main instances are blocked by the instance lock.
+- Dormant wallet pause functionality was deliberately removed. Wallet quality
+  is controlled through scoring, demotion, and tier allocation.
 
-## Deferred / Not Yet Implemented
+## Recent Important Incident
 
-Next coordinated paper/live maintenance window:
-- Refine parity classification for successful live executions:
-  - paper correctly records its midpoint estimate because it submits no exchange order
-  - live correctly records the confirmed exchange fill
-  - when both engines make the same decision, this price-source/reason difference must be
-    classified as expected environment variance, not `LOGIC_DIVERGENCE`
+Live accumulated `$239.26` of PUMP short margin under the old slot-derived
+token cap. PUMP moved sharply upward and caused most of the account's drawdown.
+The user chose to wait rather than manually trim it.
 
-High value but not installed:
-- Position replacement v1:
-  - let stronger Core/Elite signal free capacity from weaker active Candidate exposure
-  - only when blocked by cap/cash
-  - no opposite-side handling initially
-  - high bug risk, so not near-term until after live readiness
+The short later closed because of wallet action, not the breaker:
 
-Later:
-- Dashboard class-performance panel.
-- Possible Elite sample adjustment after 1-2 weeks if no Elite promotions:
-  - keep score `65`
-  - consider sample `8 -> 6`
-- Token market-cap/maturity filter only if token-risk PnL proves bad. Current stance: track first, restrict later.
+- Elite wallet `0x17c3c8...a868` exited its short.
+- The same wallet opened a PUMP long with Elite score about `79.6`.
+- Its superior-ranked reversal closed the remaining short allocations.
+- The three short slices realized roughly `-$110.85`.
+- A smaller PUMP long was then opened within the corrected 20% cap.
 
-## Useful Commands
+The wallet's Elite status was based on a relatively small completed sample and
+may demote if its recent decisions continue to perform poorly.
+
+## Scoring and Parity
+
+- Paper wallet history was imported into Live so Live did not start scoring at
+  zero.
+- Scoring uses normalized return rather than raw copied dollars, preventing
+  Paper's larger allocations from dominating Live outcomes.
+- Live consumes completed Paper events in canonical source order with Paper's
+  observed signal prices.
+- The parity monitor compares shared inputs and decisions. Expected differences
+  include slot/cash constraints, exchange minimums, fill prices, and Live-only
+  execution safety.
+- A Live trade does not have to appear as an open Paper position. The goal is
+  shared rules and explainable approximation, not identical books.
+- Paper midpoint versus Live exchange-fill price differences are expected
+  environment variance and should not be treated as decision defects.
+- After engine code changes, restart both Paper and Live so their code
+  fingerprints and comparison epoch remain aligned. The user explicitly
+  authorized this as routine maintenance.
+
+## Dashboard State
+
+- Paper and Live dashboards are separate and mobile-oriented.
+- Header shows only the last updated local date/time.
+- Timezone is selectable and times display in a 12-hour clock.
+- Open Positions is the persistent first data panel.
+- Recent Closes and Execution Confirmations contain compact trade information.
+- Wallet tier is shown with positions and execution confirmations.
+- Token Risk Alerts:
+  - show only the last 24 hours,
+  - are below actionable warning panels,
+  - are collapsed by default.
+- Quarantined Coins and other warning panels are below the primary trading data.
+- Paper Starting Equity remains fixed at `$10,000`.
+- Paper Drawdown now uses a persistent high-water stored in
+  `paper_equity_high_water`; it does not incorrectly show 0% merely because the
+  account remains above `$10,000`.
+- The dashboard latest-wallet-score query was optimized from more than 60
+  seconds to roughly 0.5 seconds.
+
+## Recent Commits
+
+- `74767eb Track paper high water and optimize dashboard`
+- `31edc14 Deemphasize token risk alerts`
+- `a03a5b0 Simplify dashboard status header`
+- `d9c2e8c Cap token exposure at twenty percent`
+- `c7c7ea0 Keep recovery events out of wallet scoring`
+- `31e8b5a Track parity price-source classification fix`
+- `353967d Show contributed live starting equity`
+- `51b1105 Handle unified account capital credits`
+
+Full test status at the latest change: `114` tests passed.
+
+## Start and Verification Procedure
 
 Check processes:
+
 ```powershell
-Get-CimInstance Win32_Process | Where-Object { $_.Name -like 'python*' -and ($_.CommandLine -like '*MockingBot*') } | Select-Object ProcessId,Name,CommandLine
+Get-CimInstance Win32_Process |
+  Where-Object { $_.Name -match '^python' -and $_.CommandLine -match 'MockingBot' } |
+  Select-Object ProcessId, Name, CommandLine
 ```
 
-Start main bot:
+Run tests:
+
+```powershell
+python -m unittest discover -s tests -q
+python -m py_compile .\MockingBot.py .\MockingBot_Dashboard.py .\MockingBot_Elite.py
+git diff --check
+```
+
+Before every Live start, with the Live engine stopped:
+
+```powershell
+python .\MockingBot.py preflight-live
+```
+
+Preflight is read-only and must report:
+
+- configuration pass,
+- no duplicate Live instance,
+- circuit breaker clear,
+- correct account/agent relationship,
+- viable six-slot sizing,
+- synchronized local/exchange positions,
+- `RESULT: PASS - no orders submitted`.
+
+Start Paper:
+
 ```powershell
 python .\MockingBot.py
 ```
 
-Start dashboard:
+Start Live only through the gated launcher:
+
 ```powershell
-python .\MockingBot_Dashboard.py
+.\Start-MockingBot_Live.ps1
 ```
 
-Check recent log:
+Start dashboards:
+
+```powershell
+.\Start-MockingBot_Paper_Dashboard.ps1
+.\Start-MockingBot_Live_Dashboard.ps1
+```
+
+Check recent logs:
+
 ```powershell
 Get-Content .\MockingBot_Data\mockingbot_live.log -Tail 80
+Get-Content .\MockingBot_Main_Live_Test_Data\mockingbot_live.log -Tail 100
 ```
 
-Syntax check:
+Check dashboard APIs:
+
 ```powershell
-python3.13 -m py_compile .\MockingBot.py .\MockingBot_Dashboard.py .\MockingBot_Elite.py
+Invoke-RestMethod http://127.0.0.1:8765/api/status
+Invoke-RestMethod http://127.0.0.1:8766/api/status
 ```
 
-Git push after changes:
-```powershell
-git status --short
-git add .
-git commit -m "message"
-git push
-```
+## Normal Restart Discipline
+
+For parity-relevant engine changes:
+
+1. Run targeted and full tests.
+2. Commit the change.
+3. Stop both Paper and Live engines.
+4. Run `preflight-live`.
+5. Start Paper and Live.
+6. Restart both dashboards if dashboard code changed.
+7. Verify both process command lines.
+8. Verify both dashboard APIs.
+9. Check logs for current cycles, synchronization, quarantine, unresolved
+   intents, breaker state, and code/parity noise.
+
+Do not restart Elite merely because main Paper/Live code changed unless the
+change affects Elite or it is no longer running as intended.
+
+## Deferred Work and Watch Items
+
+- Live remains dependent on Paper as its canonical event/roster source. Over the
+  next month, identify and fix Live scoring/selection defects so it can
+  eventually run independently.
+- Monitor whether the scoring engine demotes small-sample wallets quickly enough
+  after performance deterioration.
+- Continue watching the current Live drawdown and PUMP long. Do not infer a
+  breaker event from a normal trader exit or ranked reversal; trace execution
+  logs and `execution_audit`.
+- Continue reviewing Paper/Live parity, distinguishing explainable book-state
+  divergence from true logic divergence.
+- Paper records midpoint estimates while Live records actual fills. This is
+  acceptable, but any remaining false parity alerts around price-source reasons
+  should be refined during a maintenance window.
+- Cloud deployment/manual intervention design notes are still preliminary.
+  The future cloud checklist must cover remote dashboard access, persistent
+  storage, secrets, service supervision, alerts, backups, and an authenticated
+  remote command path for manual trade rejection/closure.
+- TrendBot has a separate handoff:
+  `C:\Users\user\Desktop\trend-bot\TRENDBOT_HANDOFF.md`
+
+## User Preferences and Operating Intent
+
+- Keep the bot as hands-off as practical.
+- Do not shut down the whole book for a single coin mismatch.
+- Do not force-close positions merely because they are temporarily losing.
+- Preserve strong-wallet autonomy while constraining concentration risk.
+- Treat the 15% level as warning and 25% as a serious diagnostic stop.
+- Maintain Paper/Live code parity automatically after repairs without asking
+  separately each time.
+- Prefer monitoring evidence over premature parameter changes; current Live
+  constraints should generally run for 1–2 weeks before relaxation.
