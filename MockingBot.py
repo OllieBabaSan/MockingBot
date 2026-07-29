@@ -3279,11 +3279,15 @@ class HyperliquidAdapter(PlatformAdapter):
                     leverage, coin, is_cross=True
                 )
                 if not isinstance(leverage_response, dict) or leverage_response.get("status") != "ok":
-                    return reject(
+                    result = reject(
                         f"Hyperliquid leverage update rejected: {str(leverage_response)[:300]}",
                         requested_size=size,
                         status="leverage_update_rejected",
                     )
+                    self.store.update_execution_intent(
+                        intent_key, self._execution_intent_state(result), result
+                    )
+                    return result
             self.store.update_execution_intent(intent_key, "SUBMITTING")
             result = self._exchange.market_open(  # type: ignore[union-attr]
                 coin, side == "LONG", size, slippage=self.settings.slippage,
@@ -5915,6 +5919,18 @@ class CopyTradingBot:
             leverage, leverage, intent_key,
         )
         if not execution:
+            updated_intent = self.store.execution_intent(intent_key)
+            if updated_intent is not None and updated_intent["state"] == "FAILED":
+                reason = execution.detail or execution.status or "exchange entry failed"
+                signal_id = self.store.log_signal(
+                    event.wallet, event.coin, event.side, event.kind,
+                    price, "SKIPPED", reason,
+                )
+                self.scoring_engine.observe_signal(
+                    event, signal_id, "SKIPPED", reason, price
+                )
+                print(f"[SKIP] {event.kind} {event.coin} {event.side}: {reason}")
+                return
             raise RuntimeError(
                 f"execution intent {intent_key} remains unresolved: "
                 f"{execution.detail or execution.status}"

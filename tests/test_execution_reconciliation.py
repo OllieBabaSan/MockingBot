@@ -335,13 +335,17 @@ class ExecutionReconciliationTests(unittest.TestCase):
         exchange.leverage_response = {"status": "err", "response": "rejected"}
         self.adapter._exchange = exchange
         self.adapter._confirmed_position = lambda _coin: (True, None)
+        intent_key = "copy-event:leverage-rejected:open"
 
-        result = self.adapter.open_position("BTC", "LONG", 12.0, 100.0, 3)
+        result = self.adapter.open_position(
+            "BTC", "LONG", 12.0, 100.0, 3, intent_key=intent_key
+        )
 
         self.assertFalse(result)
         self.assertEqual(result.status, "leverage_update_rejected")
         self.assertEqual(exchange.opens, 0)
         self.assertEqual(exchange.leverages, [3])
+        self.assertEqual(self.store.execution_intent(intent_key)["state"], "FAILED")
 
     def test_existing_exchange_leverage_mismatch_blocks_add(self) -> None:
         paper = core.PaperPortfolio(self.settings, self.store)
