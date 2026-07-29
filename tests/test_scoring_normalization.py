@@ -100,6 +100,12 @@ class ScoringNormalizationTests(unittest.TestCase):
                 engine = core.ScoringEngine(configured, store)
 
                 underwater = engine.score_wallet("wallet")
+                self.assertTrue(
+                    store.log_scoring_engine_wallet_score_if_changed(underwater)
+                )
+                self.assertFalse(
+                    store.log_scoring_engine_wallet_score_if_changed(underwater)
+                )
                 store.conn.execute(
                     """
                     UPDATE wallet_positions
@@ -109,6 +115,14 @@ class ScoringNormalizationTests(unittest.TestCase):
                 )
                 store.conn.commit()
                 recovered = engine.score_wallet("wallet")
+                self.assertTrue(
+                    store.log_scoring_engine_wallet_score_if_changed(recovered)
+                )
+                score_rows = int(
+                    store.conn.execute(
+                        "SELECT COUNT(*) FROM marshal_wallet_scores WHERE wallet = 'wallet'"
+                    ).fetchone()[0]
+                )
             finally:
                 store.conn.close()
 
@@ -116,6 +130,7 @@ class ScoringNormalizationTests(unittest.TestCase):
         self.assertIn("active=20.0%/1 penalty=-15.0", underwater.explanation)
         self.assertEqual(recovered.tier, "Elite")
         self.assertNotIn("active=", recovered.explanation)
+        self.assertEqual(score_rows, 2)
 
     def test_realized_component_clips_single_trade_outliers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

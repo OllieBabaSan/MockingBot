@@ -2247,6 +2247,30 @@ class Store:
         )
         self.conn.commit()
 
+    def log_scoring_engine_wallet_score_if_changed(
+        self,
+        score: "ScoringEngineScore",
+        minimum_delta: float = 0.5,
+    ) -> bool:
+        latest = self.conn.execute(
+            """
+            SELECT tier, total_score
+            FROM marshal_wallet_scores
+            WHERE wallet = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (score.wallet,),
+        ).fetchone()
+        if (
+            latest is not None
+            and str(latest["tier"]) == score.tier
+            and abs(float(latest["total_score"]) - score.total_score) < minimum_delta
+        ):
+            return False
+        self.log_scoring_engine_wallet_score(score)
+        return True
+
     def log_scoring_engine_signal(
         self,
         signal_id: int | None,
@@ -4877,6 +4901,12 @@ class WalletMonitor:
         self.store = store
         self.platform = platform
 
+    def _refresh_wallet_scores(self, wallets: list[str]) -> None:
+        engine = ScoringEngine(self.settings, self.store)
+        for wallet in wallets:
+            score = engine.score_wallet(wallet)
+            self.store.log_scoring_engine_wallet_score_if_changed(score)
+
     def scan(self, wallets: list[str]) -> tuple[list[CopyEvent], float]:
         if self.settings.live:
             imported = self.store.import_canonical_copy_events(
@@ -4884,6 +4914,7 @@ class WalletMonitor:
             )
             if imported:
                 print(f"[SIGNALS] Imported {imported} canonical paper event(s)")
+            self._refresh_wallet_scores(wallets)
             return self.store.pending_copy_events(), 0.0
 
         failures = 0
@@ -4969,6 +5000,7 @@ class WalletMonitor:
             time.sleep(self.settings.wallet_poll_delay)
 
         fail_ratio = failures / checked if checked else 0.0
+        self._refresh_wallet_scores(wallets)
         return self.store.pending_copy_events(), fail_ratio
 
 
