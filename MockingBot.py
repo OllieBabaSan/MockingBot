@@ -593,6 +593,8 @@ class Position:
     size: float
     entry_price: float
     leverage: float | None = None
+    unrealized_pnl: float | None = None
+    margin_used: float | None = None
 
 
 @dataclass(frozen=True)
@@ -747,6 +749,8 @@ class Store:
                 side TEXT NOT NULL,
                 size REAL NOT NULL,
                 entry_price REAL NOT NULL,
+                unrealized_pnl REAL,
+                margin_used REAL,
                 seen_at TEXT NOT NULL,
                 PRIMARY KEY (wallet, coin)
             );
@@ -1002,6 +1006,8 @@ class Store:
         self._ensure_column("pending_copy_events", "source_instance", "TEXT")
         self._ensure_column("pending_copy_events", "source_event_id", "INTEGER")
         self._ensure_column("pending_copy_events", "observed_price", "REAL")
+        self._ensure_column("wallet_positions", "unrealized_pnl", "REAL")
+        self._ensure_column("wallet_positions", "margin_used", "REAL")
         self.conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_copy_events_uid "
             "ON pending_copy_events(event_uid) WHERE event_uid IS NOT NULL"
@@ -1124,6 +1130,14 @@ class Store:
                 "SELECT wallet, sample, win_rate, profit_factor, updated_at "
                 "FROM roster_wallet_metrics ORDER BY wallet"
             ).fetchall()
+            wallet_positions = source.execute(
+                """
+                SELECT wallet, coin, side, size, entry_price,
+                       unrealized_pnl, margin_used, seen_at
+                FROM wallet_positions
+                ORDER BY wallet, coin
+                """
+            ).fetchall()
         finally:
             source.close()
         if not roster:
@@ -1139,6 +1153,16 @@ class Store:
                 "INSERT INTO roster_wallet_metrics(wallet, sample, win_rate, profit_factor, updated_at) "
                 "VALUES(?, ?, ?, ?, ?)",
                 [tuple(row) for row in metrics],
+            )
+            self.conn.execute("DELETE FROM wallet_positions")
+            self.conn.executemany(
+                """
+                INSERT INTO wallet_positions(
+                    wallet, coin, side, size, entry_price,
+                    unrealized_pnl, margin_used, seen_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [tuple(row) for row in wallet_positions],
             )
             self.conn.execute(
                 "INSERT INTO kv(key, value) VALUES('roster_refresh_cycle', '{}') "
@@ -1310,14 +1334,26 @@ class Store:
 
     def wallet_snapshot(self, wallet: str) -> dict[str, Position] | None:
         rows = self.conn.execute(
-            "SELECT coin, side, size, entry_price FROM wallet_positions WHERE wallet = ?",
+            """
+            SELECT coin, side, size, entry_price, unrealized_pnl, margin_used
+            FROM wallet_positions WHERE wallet = ?
+            """,
             (wallet,),
         ).fetchall()
         if not rows:
             seeded = self.get_json("seeded_wallets", [])
             return {} if wallet in seeded else None
         return {
-            r["coin"]: Position(r["coin"], r["side"], float(r["size"]), float(r["entry_price"]))
+            r["coin"]: Position(
+                r["coin"],
+                r["side"],
+                float(r["size"]),
+                float(r["entry_price"]),
+                unrealized_pnl=(
+                    None if r["unrealized_pnl"] is None else float(r["unrealized_pnl"])
+                ),
+                margin_used=None if r["margin_used"] is None else float(r["margin_used"]),
+            )
             for r in rows
         }
 
@@ -1326,11 +1362,17 @@ class Store:
             self.conn.execute("DELETE FROM wallet_positions WHERE wallet = ?", (wallet,))
             self.conn.executemany(
                 """
-                INSERT INTO wallet_positions(wallet, coin, side, size, entry_price, seen_at)
-                VALUES(?, ?, ?, ?, ?, ?)
+                INSERT INTO wallet_positions(
+                    wallet, coin, side, size, entry_price,
+                    unrealized_pnl, margin_used, seen_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
-                    (wallet, p.coin, p.side, p.size, p.entry_price, utc_now())
+                    (
+                        wallet, p.coin, p.side, p.size, p.entry_price,
+                        p.unrealized_pnl, p.margin_used, utc_now(),
+                    )
                     for p in positions.values()
                 ],
             )
@@ -1393,11 +1435,17 @@ class Store:
             self.conn.execute("DELETE FROM wallet_positions WHERE wallet = ?", (wallet,))
             self.conn.executemany(
                 """
-                INSERT INTO wallet_positions(wallet, coin, side, size, entry_price, seen_at)
-                VALUES(?, ?, ?, ?, ?, ?)
+                INSERT INTO wallet_positions(
+                    wallet, coin, side, size, entry_price,
+                    unrealized_pnl, margin_used, seen_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
-                    (wallet, p.coin, p.side, p.size, p.entry_price, utc_now())
+                    (
+                        wallet, p.coin, p.side, p.size, p.entry_price,
+                        p.unrealized_pnl, p.margin_used, utc_now(),
+                    )
                     for p in positions.values()
                 ],
             )
@@ -2822,6 +2870,8 @@ class HyperliquidAdapter(PlatformAdapter):
                     size=abs(size),
                     entry_price=float(pos.get("entryPx") or 0),
                     leverage=float(pos.get("leverage", {}).get("value") or 0) or None,
+                    unrealized_pnl=float(pos.get("unrealizedPnl") or 0),
+                    margin_used=float(pos.get("marginUsed") or 0) or None,
                 )
             return result
         except Exception as exc:
@@ -4235,6 +4285,13 @@ class ScoringEngineScore:
 
 
 class ScoringEngine:
+    REALIZED_WINDOW = 20
+    REALIZED_HALF_LIFE = 10.0
+    RETURN_CLIP_PCT = 5.0
+    ACTIVE_LOSS_THRESHOLD_PCT = 2.0
+    ACTIVE_DRAWDOWN_PENALTY_CAP = 15.0
+    ACTIVE_BREADTH_PENALTY_CAP = 5.0
+
     def __init__(self, settings: Settings, store: Store):
         self.settings = settings
         self.store = store
@@ -4242,6 +4299,45 @@ class ScoringEngine:
     @staticmethod
     def _clamp(value: float, low: float, high: float) -> float:
         return max(low, min(high, value))
+
+    def _active_risk(self, wallet: str) -> tuple[float, float, int]:
+        rows = self.store.conn.execute(
+            """
+            SELECT unrealized_pnl, margin_used
+            FROM wallet_positions
+            WHERE wallet = ?
+              AND unrealized_pnl IS NOT NULL
+              AND margin_used IS NOT NULL
+              AND margin_used > 0
+            """,
+            (wallet,),
+        ).fetchall()
+        if not rows:
+            return 0.0, 0.0, 0
+
+        total_margin = sum(float(row["margin_used"]) for row in rows)
+        total_pnl = sum(float(row["unrealized_pnl"]) for row in rows)
+        if total_margin <= 0:
+            return 0.0, 0.0, 0
+
+        drawdown_pct = max(0.0, -total_pnl / total_margin * 100.0)
+        materially_losing = sum(
+            1
+            for row in rows
+            if float(row["unrealized_pnl"]) / float(row["margin_used"]) * 100.0
+            <= -self.ACTIVE_LOSS_THRESHOLD_PCT
+        )
+        drawdown_penalty = self._clamp(
+            (drawdown_pct - self.ACTIVE_LOSS_THRESHOLD_PCT) * 1.25,
+            0.0,
+            self.ACTIVE_DRAWDOWN_PENALTY_CAP,
+        )
+        breadth_penalty = self._clamp(
+            max(0, materially_losing - 1) * 2.0,
+            0.0,
+            self.ACTIVE_BREADTH_PENALTY_CAP,
+        )
+        return drawdown_pct, drawdown_penalty + breadth_penalty, materially_losing
 
     def score_wallet(self, wallet: str) -> ScoringEngineScore:
         rows = self.store.conn.execute(
@@ -4361,6 +4457,19 @@ class ScoringEngine:
             * self.settings.scoring_reference_leverage
         )
         sample_weight = self._clamp(sample_size / 12.0, 0.0, 1.0)
+        weighted_rows = pnls[-self.REALIZED_WINDOW:]
+        weighted_values = [
+            self._clamp(value, -self.RETURN_CLIP_PCT, self.RETURN_CLIP_PCT)
+            for value in weighted_rows
+        ]
+        weighted_weights = [
+            0.5 ** (age / self.REALIZED_HALF_LIFE)
+            for age in reversed(range(len(weighted_values)))
+        ]
+        weighted_avg_pct = (
+            sum(value * weight for value, weight in zip(weighted_values, weighted_weights))
+            / sum(weighted_weights)
+        )
 
         if sample_size:
             win_rate = sum(1 for value in pnls if value > 0) / sample_size
@@ -4371,14 +4480,24 @@ class ScoringEngine:
             avg_pct = None
             worst_pct = 0.0
 
-        realized_component = self._clamp(realized / 250.0 * 25.0, -25.0, 25.0) * sample_weight
+        if weighted_avg_pct >= 0:
+            realized_component = self._clamp(
+                weighted_avg_pct / 2.0 * 15.0, 0.0, 15.0
+            ) * sample_weight
+        else:
+            realized_component = self._clamp(
+                weighted_avg_pct / 1.0 * 20.0, -20.0, 0.0
+            ) * sample_weight
         win_rate_component = 0.0
         if win_rate is not None:
             win_rate_component = self._clamp((win_rate - 0.50) * 45.0, -18.0, 18.0) * sample_weight
 
         recent_form_component = 0.0
         if pnls:
-            recent = pnls[-5:]
+            recent = [
+                self._clamp(value, -self.RETURN_CLIP_PCT, self.RETURN_CLIP_PCT)
+                for value in pnls[-5:]
+            ]
             recent_avg = sum(recent) / len(recent)
             recent_losses = sum(1 for value in recent if value < 0)
             recent_form_component = self._clamp(recent_avg / 0.50 * 10.0, -10.0, 10.0) * sample_weight
@@ -4399,14 +4518,28 @@ class ScoringEngine:
             if weak_expectancy and entry_count >= 15:
                 churn_penalty = -self._clamp((entry_count - 12) / 25.0 * 10.0, 0.0, 10.0)
 
-        total = 50.0 + realized_component + win_rate_component + recent_form_component + loss_penalty + churn_penalty
+        active_drawdown_pct, active_penalty, active_losers = self._active_risk(wallet)
+        total = (
+            50.0
+            + realized_component
+            + win_rate_component
+            + recent_form_component
+            + loss_penalty
+            + churn_penalty
+            - active_penalty
+        )
         total = round(self._clamp(total, 0.0, 100.0), 2)
 
         if sample_size < 3:
             tier = "Candidate" if total >= 50.0 else "Bench"
-        elif total >= 65.0 and sample_size >= 8:
+        elif (
+            total >= 68.0
+            and sample_size >= 8
+            and recent_form_component >= 0
+            and active_penalty < 5.0
+        ):
             tier = "Elite"
-        elif total >= 57.0 and sample_size >= 3:
+        elif total >= 57.0 and sample_size >= 3 and active_penalty < 15.0:
             tier = "Core"
         elif total >= 50.0:
             tier = "Candidate"
@@ -4417,6 +4550,7 @@ class ScoringEngine:
             f"sample={sample_size}",
             f"normalized=${realized:.2f}",
             f"return={normalized_return_pct:+.3f}%",
+            f"weighted_avg={weighted_avg_pct:+.3f}%",
             f"actual=${actual_realized:.2f}",
             f"score={total:.1f}",
         ]
@@ -4428,6 +4562,11 @@ class ScoringEngine:
             parts.append("loss-control penalty")
         if churn_penalty < 0:
             parts.append("weak-churn penalty")
+        if active_penalty > 0:
+            parts.append(
+                f"active={active_drawdown_pct:.1f}%/{active_losers} "
+                f"penalty=-{active_penalty:.1f}"
+            )
         explanation = "; ".join(parts)
 
         return ScoringEngineScore(

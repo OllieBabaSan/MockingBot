@@ -73,6 +73,59 @@ class ScoringNormalizationTests(unittest.TestCase):
         self.assertEqual(scores[0].total_score, scores[1].total_score)
         self.assertEqual(scores[0].realized_pnl, scores[1].realized_pnl)
 
+    def test_active_drawdown_caps_tier_and_recovery_restores_eligibility(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            configured = settings(Path(tmp))
+            store = core.Store(configured.db_path)
+            try:
+                for index in range(8):
+                    store.conn.execute(
+                        """
+                        INSERT INTO scoring_seed_signals(
+                            source_signal_id, ts, wallet, signal, paper_gain, pnl_pct
+                        ) VALUES(?, ?, 'wallet', 'EXIT', 20, 2)
+                        """,
+                        (index + 1, core.utc_now()),
+                    )
+                store.conn.execute(
+                    """
+                    INSERT INTO wallet_positions(
+                        wallet, coin, side, size, entry_price,
+                        unrealized_pnl, margin_used, seen_at
+                    ) VALUES('wallet', 'BTC', 'LONG', 1, 100, -20, 100, ?)
+                    """,
+                    (core.utc_now(),),
+                )
+                store.conn.commit()
+                engine = core.ScoringEngine(configured, store)
+
+                underwater = engine.score_wallet("wallet")
+                store.conn.execute(
+                    """
+                    UPDATE wallet_positions
+                    SET unrealized_pnl = -1
+                    WHERE wallet = 'wallet' AND coin = 'BTC'
+                    """
+                )
+                store.conn.commit()
+                recovered = engine.score_wallet("wallet")
+            finally:
+                store.conn.close()
+
+        self.assertEqual(underwater.tier, "Candidate")
+        self.assertIn("active=20.0%/1 penalty=-15.0", underwater.explanation)
+        self.assertEqual(recovered.tier, "Elite")
+        self.assertNotIn("active=", recovered.explanation)
+
+    def test_realized_component_clips_single_trade_outliers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            normal = self.score_for_gains(root / "normal", [1.0] * 8, [1.0] * 7 + [5.0])
+            outlier = self.score_for_gains(root / "outlier", [1.0] * 8, [1.0] * 7 + [50.0])
+
+        self.assertEqual(normal.total_score, outlier.total_score)
+        self.assertEqual(normal.tier, outlier.tier)
+
 
 if __name__ == "__main__":
     unittest.main()
