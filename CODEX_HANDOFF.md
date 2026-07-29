@@ -15,7 +15,7 @@ Repository:
 Branch: `main`
 
 Latest code commit before this handoff:
-`74767eb Track paper high water and optimize dashboard`
+`2d74b8c Resolve terminal leverage rejection intents`
 
 The source working tree was clean before this documentation update.
 
@@ -33,11 +33,11 @@ Last dashboard snapshot on 2026-07-29:
 ### Paper
 
 - Dashboard: `http://127.0.0.1:8765`
-- Value: about `$11,825.28`
+- Latest verified value after recovery: about `$11,098.34`
 - Fixed starting equity: `$10,000`
 - Persistent equity high-water: `$12,119.35`
-- Drawdown from high-water: about `2.43%`
-- Open tokens: `8`
+- Drawdown from high-water: about `8.42%`
+- Open tokens: `5`
 
 ### Live
 
@@ -46,11 +46,11 @@ Last dashboard snapshot on 2026-07-29:
 - API/agent wallet: `0x243954546255a5e18b19d9f7e281131a97fce44a`
 - Contributed starting equity: `$802.20`
 - Breaker high-water: about `$823.47`
-- Current equity: about `$653.55`
-- Drawdown: about `20.63%`
+- Current equity: about `$640.70`
+- Drawdown: about `22.20%`
 - Warning threshold: `15%`
 - Persistent hard breaker: `25%`
-- Open tokens: `5`
+- Open tokens: `4`
 - Quarantined coins: `0`
 - Unresolved execution intents: `0`
 
@@ -58,11 +58,10 @@ Current Live positions at handoff:
 
 | Coin | Side | Margin | Approx. open PnL |
 |---|---:|---:|---:|
-| PUMP | Long | `$77.38` | `-$21.11` |
-| BTC | Short | `$130.81` | `+$2.77` |
-| HYPE | Long | `$135.71` | `-$0.82` |
-| NEAR | Long | `$135.66` | `-$0.61` |
-| XRP | Short | `$67.63` | `+$5.53` |
+| BTC | Short | about `$131` | near flat |
+| HYPE | Long | about `$136` | losing |
+| NEAR | Long | about `$136` | profitable |
+| XRP | Short | about `$68` | profitable |
 
 Live is operating normally but the drawdown is close enough to the 25% breaker
 to warrant careful monitoring. Do not reset the breaker baseline or force-close
@@ -128,8 +127,8 @@ The short later closed because of wallet action, not the breaker:
 - The three short slices realized roughly `-$110.85`.
 - A smaller PUMP long was then opened within the corrected 20% cap.
 
-The wallet's Elite status was based on a relatively small completed sample and
-may demote if its recent decisions continue to perform poorly.
+The wallet's Elite status was based on a relatively small completed sample.
+After the active-risk scoring rollout it dynamically demoted to Core `64.4`.
 
 ## Scoring and Parity
 
@@ -144,11 +143,39 @@ may demote if its recent decisions continue to perform poorly.
   execution safety.
 - A Live trade does not have to appear as an open Paper position. The goal is
   shared rules and explainable approximation, not identical books.
+- Wallet realized performance now uses the most recent 20 completed exits with
+  a 10-trade half-life. Individual returns are clipped to `-5%/+5%`, and the
+  realized component is capped at `+15/-20` so old gains and single outliers do
+  not dominate indefinitely.
+- Scoring now includes a dynamic active-risk overlay based on the canonical
+  source wallet's current Hyperliquid margin and unrealized PnL. Material open
+  drawdown and the breadth of materially losing positions reduce the score.
+  An active penalty of `15` or more caps the wallet at Candidate. Recovery
+  automatically reduces or removes the cap.
+- Current wallet scores refresh after every canonical scan. An audit row is
+  appended only when the tier changes or the score moves by at least 0.5,
+  keeping dashboard tiers current without excessive database growth.
+- Wallet `0x17c3c8...a868` changed from Elite `80.5` to Core `64.4` after the
+  rollout. Its existing allocations correctly retain their historical Elite
+  entry tier while the dashboard's Current tier shows Core.
 - Paper midpoint versus Live exchange-fill price differences are expected
   environment variance and should not be treated as decision defects.
 - After engine code changes, restart both Paper and Live so their code
   fingerprints and comparison epoch remain aligned. The user explicitly
   authorized this as routine maintenance.
+
+## Post-Restart CASHCAT Intent Incident
+
+During canonical catch-up after the Windows restart, Live prepared a
+`CASHCAT SHORT` entry intent. Hyperliquid rejected the leverage update because
+cross margin is not allowed for that asset. No order was submitted and no fill
+occurred, but the early rejection path incorrectly left the durable intent in
+`PREPARED`, causing the Live loop to restart repeatedly.
+
+Commit `2d74b8c` now persists deterministic zero-fill leverage rejections as
+`FAILED` and consumes them as skipped signals during recovery. It does not
+retry with isolated margin, fabricate a fill, or alter existing positions.
+Targeted `47` execution tests and the full `116`-test suite passed.
 
 ## Dashboard State
 
@@ -172,6 +199,9 @@ may demote if its recent decisions continue to perform poorly.
 
 ## Recent Commits
 
+- `2d74b8c Resolve terminal leverage rejection intents`
+- `9877f96 Refresh dynamic wallet scores after scans`
+- `a40c1d5 Make wallet tiers respond to active losses`
 - `74767eb Track paper high water and optimize dashboard`
 - `31edc14 Deemphasize token risk alerts`
 - `a03a5b0 Simplify dashboard status header`
@@ -181,7 +211,76 @@ may demote if its recent decisions continue to perform poorly.
 - `353967d Show contributed live starting equity`
 - `51b1105 Handle unified account capital credits`
 
-Full test status at the latest change: `114` tests passed.
+Full test status at the latest change: `116` tests passed.
+
+## Windows Restart and Hummingbot Test Handoff
+
+The Windows restart completed. WSL 2 is installed, and Docker Desktop `4.84.0`
+was verified healthy with Docker Engine `29.6.2`. Only Docker's managed
+`docker-desktop` WSL distribution is present; no separate Ubuntu distribution
+is currently installed.
+
+Hummingbot/Hyperliquid testing is a separate evaluation:
+
+- Docker Desktop `4.84.0` is installed.
+- Hummingbot source and the initial paper setup are under:
+  `C:\Users\user\Documents\Codex\2026-07-29\i-d\outputs`
+- Hyperliquid's public API was verified without credentials. `HYPE-USDC` market
+  data is working.
+- Do not continue with the spot-only `_paper_trade` arrangement as the final
+  evaluation.
+- The target is realistic perpetual testing covering leverage, hourly funding,
+  margin, and liquidation.
+- Use Hummingbot's unmodified `perpetual_market_making` strategy with the
+  `hyperliquid_perpetual_testnet` connector.
+- Begin conservatively at `2x` leverage with a dedicated disposable testnet
+  wallet and faucet funds.
+- Never request, print, transmit, or store the wallet private key in chat. The
+  user must enter it locally into Hummingbot.
+- Compare testnet results against mainnet public prices, order books, and
+  funding because testnet liquidity may not represent mainnet.
+- WSL installation attempts from the non-administrator session failed.
+
+Post-restart Hummingbot preparation is complete:
+
+- Docker Compose validates, and `hummingbot/hummingbot:latest` is downloaded.
+- Static inspection of that exact image confirms
+  `hyperliquid_perpetual_testnet` and `perpetual_market_making` are present.
+- The old spot `_paper_trade` strategy was removed.
+- The replacement strategy is
+  `hyperliquid_hype_usd_perpetual_testnet.yml`: `HYPE-USD`, one-way mode,
+  `2x` leverage, one level per side, `0.25 HYPE`, `0.50%` spreads, `0.75%`
+  profit-taking, and a `3%` stop loss.
+- `start-testnet.ps1` refuses `_paper_trade`, refuses a mainnet connector file,
+  and requires the testnet derivative.
+- No connector credential file exists and no private key was requested,
+  printed, or stored.
+- Public comparison at validation time:
+  mainnet mark about `$53.65`, bid/ask about `$53.642/$53.645`, funding
+  `0.0000125`; testnet mark about `$73.98`, bid/ask about
+  `$73.983/$75.556`, funding `0.04`. Testnet is materially distorted.
+- No Hummingbot container is running. The user must connect the disposable
+  faucet-funded testnet wallet interactively before validation or start.
+
+Required user action before restart:
+
+```powershell
+wsl --install
+```
+
+Run that command from PowerShell as Administrator, then restart Windows.
+
+Post-restart checklist:
+
+1. Completed: verify `wsl --status`.
+2. Completed: start Docker Desktop and verify `docker info`.
+3. Completed: replace spot paper with perpetual testnet configuration.
+4. Completed: confirm no mainnet connector credentials are present.
+5. Required user action: run `start-testnet.ps1`.
+6. In Hummingbot, run `connect hyperliquid_perpetual_testnet` and enter the
+   disposable testnet wallet details locally.
+7. Confirm faucet balance, `HYPE-USD`, one-way mode, and `2x` leverage.
+8. Only then run `start`.
 
 ## Start and Verification Procedure
 
