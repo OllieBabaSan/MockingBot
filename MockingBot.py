@@ -286,6 +286,8 @@ class Settings:
     wind_down: bool = env_bool("WIND_DOWN", False)
     max_drawdown_pct: float = env_float("MAX_DRAWDOWN_PCT", 0.25)
     warning_drawdown_pct: float = env_float("WARNING_DRAWDOWN_PCT", 0.15)
+    weekly_max_drawdown_pct: float = env_float("WEEKLY_MAX_DRAWDOWN_PCT", 0.50)
+    weekly_warning_drawdown_pct: float = env_float("WEEKLY_WARNING_DRAWDOWN_PCT", 0.35)
     max_position_days: int = env_int("MAX_POSITION_DAYS", 7)
 
     hl_api_key: str = MAIN_CREDENTIALS["api_key"] or env_str("HL_API_KEY", "")
@@ -351,6 +353,8 @@ def settings_signature(settings: Settings) -> dict[str, Any]:
         "scoring_reference_leverage": settings.scoring_reference_leverage,
         "warning_drawdown_pct": settings.warning_drawdown_pct,
         "max_drawdown_pct": settings.max_drawdown_pct,
+        "weekly_warning_drawdown_pct": settings.weekly_warning_drawdown_pct,
+        "weekly_max_drawdown_pct": settings.weekly_max_drawdown_pct,
     }
 
 
@@ -416,7 +420,11 @@ def validate_settings(settings: Settings) -> None:
         if not 1 <= leverage <= settings.max_leverage_cap:
             errors.append(f"{tier} leverage must be between 1 and MAX_LEVERAGE_CAP")
     if not 0 < settings.warning_drawdown_pct < settings.max_drawdown_pct < 1:
-        errors.append("drawdown settings must satisfy 0 < warning < maximum < 1")
+        errors.append("daily drawdown settings must satisfy 0 < warning < maximum < 1")
+    if not 0 < settings.weekly_warning_drawdown_pct < settings.weekly_max_drawdown_pct < 1:
+        errors.append("weekly drawdown settings must satisfy 0 < warning < maximum < 1")
+    if settings.max_drawdown_pct >= settings.weekly_max_drawdown_pct:
+        errors.append("daily maximum drawdown must be below weekly maximum drawdown")
     if settings.poll_seconds <= 0 or settings.reconcile_seconds <= 0:
         errors.append("poll and reconciliation intervals must be positive")
     if settings.backup_interval_seconds <= 0:
@@ -754,6 +762,16 @@ class Store:
                 seen_at TEXT NOT NULL,
                 PRIMARY KEY (wallet, coin)
             );
+
+            CREATE TABLE IF NOT EXISTS live_equity_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                observed_unix REAL NOT NULL,
+                observed_at TEXT NOT NULL,
+                account_value REAL NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_live_equity_history_observed
+            ON live_equity_history(observed_unix);
 
             CREATE TABLE IF NOT EXISTS paper_positions (
                 coin TEXT PRIMARY KEY,
@@ -1222,6 +1240,27 @@ class Store:
             (key, json.dumps(value)),
         )
         self.conn.commit()
+
+    def record_live_equity(self, account_value: float, observed_unix: float) -> None:
+        observed_at = datetime.fromtimestamp(observed_unix, timezone.utc).isoformat()
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO live_equity_history(observed_unix, observed_at, account_value) "
+                "VALUES(?, ?, ?)",
+                (observed_unix, observed_at, account_value),
+            )
+            self.conn.execute(
+                "DELETE FROM live_equity_history WHERE observed_unix < ?",
+                (observed_unix - 8 * 86400,),
+            )
+
+    def live_equity_reference(self, window_seconds: float, observed_unix: float) -> float | None:
+        row = self.conn.execute(
+            "SELECT MAX(account_value) AS value FROM live_equity_history "
+            "WHERE observed_unix >= ? AND observed_unix <= ?",
+            (observed_unix - window_seconds, observed_unix),
+        ).fetchone()
+        return float(row["value"]) if row and row["value"] is not None else None
 
     def create_verified_backup(
         self, backup_dir: Path, retention_count: int
@@ -4210,7 +4249,20 @@ class RiskManager:
         self._live_equity_unavailable = not available
 
     def is_wind_down(self) -> bool:
-        return self.settings.wind_down or self.settings.circuit_breaker_file.exists()
+        return self.settings.wind_down or self._active_live_marker()
+
+    def _active_live_marker(self, observed_unix: float | None = None) -> bool:
+        marker = self.settings.circuit_breaker_file
+        if not marker.exists():
+            return False
+        if not self.settings.live:
+            return True
+        try:
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+            expires_unix = payload.get("expires_unix")
+            return expires_unix is None or float(expires_unix) > (observed_unix or unix_now())
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return True
 
     def drawdown(self, start_value: float, current_value: float) -> float:
         if start_value <= 0:
@@ -4253,6 +4305,94 @@ class RiskManager:
         }
         self.settings.circuit_breaker_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         msg = f"[CIRCUIT] Drawdown {dd:.1%} reached limit {self.settings.max_drawdown_pct:.0%}; wind-down active."
+        print(msg)
+        self.notifier.send(msg)
+        return True
+
+    def live_rolling_risk(
+        self, current_value: float, observed_unix: float | None = None
+    ) -> dict[str, float]:
+        now = observed_unix if observed_unix is not None else unix_now()
+        self.store.record_live_equity(current_value, now)
+        daily_reference = self.store.live_equity_reference(86400, now) or current_value
+        weekly_reference = self.store.live_equity_reference(7 * 86400, now) or current_value
+        return {
+            "observed_unix": now,
+            "current_value": current_value,
+            "daily_reference": daily_reference,
+            "weekly_reference": weekly_reference,
+            "daily_drawdown": self.drawdown(daily_reference, current_value),
+            "weekly_drawdown": self.drawdown(weekly_reference, current_value),
+        }
+
+    def check_live_warning(self, risk: dict[str, float]) -> None:
+        daily = risk["daily_drawdown"]
+        weekly = risk["weekly_drawdown"]
+        warning = (
+            daily >= self.settings.warning_drawdown_pct
+            or weekly >= self.settings.weekly_warning_drawdown_pct
+        )
+        if warning and not self._warning_active:
+            msg = (
+                f"[RISK-WARNING] Rolling drawdown: 24h {daily:.1%} "
+                f"(warning {self.settings.warning_drawdown_pct:.0%}), 7d {weekly:.1%} "
+                f"(warning {self.settings.weekly_warning_drawdown_pct:.0%}); trading continues."
+            )
+            print(msg)
+            self.notifier.send(msg)
+        elif not warning and self._warning_active:
+            msg = "[RISK] Rolling drawdown recovered below the 24h and 7d warning levels."
+            print(msg)
+            self.notifier.send(msg)
+        self._warning_active = warning
+
+    def check_live_circuit_breaker(self, risk: dict[str, float]) -> bool:
+        now = risk["observed_unix"]
+        marker = self.settings.circuit_breaker_file
+        if marker.exists():
+            if self._active_live_marker(now):
+                return True
+            marker.unlink(missing_ok=True)
+            msg = "[CIRCUIT] Rolling breaker expired; new entries may resume."
+            print(msg)
+            self.notifier.send(msg)
+
+        daily = risk["daily_drawdown"]
+        weekly = risk["weekly_drawdown"]
+        if weekly >= self.settings.weekly_max_drawdown_pct:
+            label, seconds, drawdown, reference, limit = (
+                "7d", 7 * 86400, weekly, risk["weekly_reference"],
+                self.settings.weekly_max_drawdown_pct,
+            )
+        elif daily >= self.settings.max_drawdown_pct:
+            label, seconds, drawdown, reference, limit = (
+                "24h", 86400, daily, risk["daily_reference"], self.settings.max_drawdown_pct,
+            )
+        else:
+            return False
+
+        expires_unix = now + seconds
+        payload = {
+            "tripped_at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+            "tripped_unix": now,
+            "expires_at": datetime.fromtimestamp(expires_unix, timezone.utc).isoformat(),
+            "expires_unix": expires_unix,
+            "reason": f"live rolling {label} drawdown",
+            "mode": "live",
+            "wallet": self.settings.hl_wallet_address,
+            "window": label,
+            "reference_value": round(reference, 2),
+            "current_value": round(risk["current_value"], 2),
+            "drawdown_pct": round(drawdown * 100, 2),
+            "limit_pct": round(limit * 100, 2),
+            "clear": "Automatic after expiry if the rolling breach is no longer present.",
+        }
+        self.settings.data_dir.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        msg = (
+            f"[CIRCUIT] {label} drawdown {drawdown:.1%} reached {limit:.0%}; "
+            f"wind-down active for {label}."
+        )
         print(msg)
         self.notifier.send(msg)
         return True
@@ -5360,12 +5500,18 @@ class CopyTradingBot:
             equity_available = session_start is not None and risk_value is not None
             self.risk.live_equity_available(equity_available)
             dd = self.risk.drawdown(session_start, risk_value) if equity_available else 0.0
-            self.risk.check_warning(dd)
-            breaker_tripped = (
-                self.risk.check_circuit_breaker(session_start, risk_value)
-                if equity_available
-                else False
-            )
+            rolling_risk: dict[str, float] | None = None
+            if self.settings.live and equity_available:
+                rolling_risk = self.risk.live_rolling_risk(risk_value)
+                self.risk.check_live_warning(rolling_risk)
+                breaker_tripped = self.risk.check_live_circuit_breaker(rolling_risk)
+            else:
+                self.risk.check_warning(dd)
+                breaker_tripped = (
+                    self.risk.check_circuit_breaker(session_start, risk_value)
+                    if equity_available
+                    else False
+                )
             wind_down = self.risk.is_wind_down() or breaker_tripped or (
                 self.settings.live and not equity_available
             )
@@ -5433,7 +5579,14 @@ class CopyTradingBot:
                 if event.event_id is not None:
                     self.store.acknowledge_copy_event(event.event_id)
 
-            tag = f" dd={dd:.1%}" if dd >= 0.01 else ""
+            if self.settings.live and rolling_risk is not None:
+                tag = (
+                    f" dd24h={rolling_risk['daily_drawdown']:.1%}"
+                    f" dd7d={rolling_risk['weekly_drawdown']:.1%}"
+                    f" hwm_dd={dd:.1%}"
+                )
+            else:
+                tag = f" dd={dd:.1%}" if dd >= 0.01 else ""
             live_tag = f" live=${risk_value:,.2f}" if self.settings.live and risk_value is not None else ""
             print(f"[{time.strftime('%H:%M:%S')}] wallets={len(scan_wallets)} roster={len(wallets)} events={len(events)} paper=${paper_value:,.2f}{live_tag}{tag}")
             self._sleep_remaining(cycle_start)
@@ -6254,10 +6407,18 @@ def run_live_preflight(
     except Exception as exc:
         record(False, "runtime paths", str(exc))
 
+    marker_active = settings.circuit_breaker_file.exists()
+    if marker_active:
+        try:
+            marker_payload = json.loads(settings.circuit_breaker_file.read_text(encoding="utf-8"))
+            expires_unix = marker_payload.get("expires_unix")
+            marker_active = expires_unix is None or float(expires_unix) > unix_now()
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            marker_active = True
     record(
-        not settings.circuit_breaker_file.exists(),
+        not marker_active,
         "circuit breaker",
-        "clear" if not settings.circuit_breaker_file.exists() else "wind-down marker is active",
+        "clear" if not marker_active else "wind-down marker is active",
     )
 
     if settings.scoring_seed_db_path.resolve() == settings.db_path.resolve():
@@ -6470,6 +6631,10 @@ def reset_live_risk_baseline(
                     "manual_reset": True,
                 },
             )
+            with store.conn:
+                store.conn.execute("DELETE FROM live_equity_history")
+            store.record_live_equity(capital.account_value, unix_now())
+            settings.circuit_breaker_file.unlink(missing_ok=True)
             print(
                 f"Live risk baseline reset to verified equity "
                 f"${capital.account_value:,.2f}; no orders submitted."

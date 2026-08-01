@@ -396,6 +396,23 @@ def dashboard_data() -> dict[str, Any]:
             if risk_reference and estimated_value is not None
             else None
         )
+        daily_drawdown = weekly_drawdown = None
+        if MODE == "live" and estimated_value is not None:
+            now = time.time()
+            references: dict[str, float] = {}
+            for label, seconds in (("daily", 86400), ("weekly", 7 * 86400)):
+                row = conn.execute(
+                    "SELECT MAX(account_value) AS value FROM live_equity_history "
+                    "WHERE observed_unix >= ? AND observed_unix <= ?",
+                    (now - seconds, now),
+                ).fetchone()
+                references[label] = float(row["value"] or estimated_value)
+            daily_drawdown = max(
+                0.0, (references["daily"] - estimated_value) / references["daily"] * 100.0
+            )
+            weekly_drawdown = max(
+                0.0, (references["weekly"] - estimated_value) / references["weekly"] * 100.0
+            )
 
         counts = conn.execute(
             """
@@ -577,6 +594,8 @@ def dashboard_data() -> dict[str, Any]:
                 if MODE == "live" and estimated_value is None else ""
             ),
             "drawdown_pct": None if drawdown is None else max(0.0, drawdown),
+            "daily_drawdown_pct": daily_drawdown,
+            "weekly_drawdown_pct": weekly_drawdown,
             "baseline": starting_equity,
             "baseline_source": baseline_source,
             "risk_reference": risk_reference,
@@ -922,13 +941,19 @@ HTML = r"""<!doctype html>
       const cards = [
         [data.mode === "live" ? "Live Equity" : "Paper Value", fmtMoney(data.estimated_value), data.estimated_value === null || data.estimated_value === undefined ? "bad" : clsNum(data.estimated_value - data.baseline)],
         ["Starting Equity", fmtMoney(data.baseline), ""],
-        ["Drawdown", fmtPct(data.drawdown_pct === null || data.drawdown_pct === undefined ? null : -data.drawdown_pct), data.drawdown_pct > 0 ? "bad" : ""],
+        [data.mode === "live" ? "High-water DD" : "Drawdown", fmtPct(data.drawdown_pct === null || data.drawdown_pct === undefined ? null : -data.drawdown_pct), data.drawdown_pct > 0 ? "bad" : ""],
         ["Cash", fmtMoney(data.cash), ""],
         ["Positions", String(data.positions.length), ""],
         ["Realized PnL", fmtMoney(data.realized_pnl), clsNum(data.realized_pnl)],
         ["Open PnL", fmtMoney(data.open_pnl), clsNum(data.open_pnl)],
         ["Closed Trades", String(c.exits ?? 0), ""],
       ];
+      if (data.mode === "live") {
+        cards.splice(3, 0,
+          ["24h Drawdown", fmtPct(data.daily_drawdown_pct == null ? null : -data.daily_drawdown_pct), data.daily_drawdown_pct > 0 ? "bad" : ""],
+          ["7d Drawdown", fmtPct(data.weekly_drawdown_pct == null ? null : -data.weekly_drawdown_pct), data.weekly_drawdown_pct > 0 ? "bad" : ""]
+        );
+      }
       document.getElementById("stats").innerHTML = cards.map(([label, value, klass]) => `<div class="stat"><div class="label">${label}</div><div class="value ${klass}">${value}</div></div>`).join("");
 
       const liveOperationsSection = document.getElementById("live-operations-section");

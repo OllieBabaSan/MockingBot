@@ -68,6 +68,8 @@ class DashboardModeTests(unittest.TestCase):
                     "source": "risk-manager",
                 },
             )
+            store.record_live_equity(500.0, 900.0)
+            store.record_live_equity(475.0, 1_000.0)
             store.quarantine_coin("BTC", "test mismatch", "size differs")
             result = core.ExecutionResult(
                 True, 0.1, 0.1, 100.0, "7", "filled", True, "confirmed"
@@ -90,6 +92,8 @@ class DashboardModeTests(unittest.TestCase):
         self.assertEqual(data["estimated_value"], 475.0)
         self.assertEqual(data["equity_source"], "bot-risk-feed")
         self.assertAlmostEqual(data["drawdown_pct"], 335.3 / 810.3 * 100)
+        self.assertAlmostEqual(data["daily_drawdown_pct"], 5.0)
+        self.assertAlmostEqual(data["weekly_drawdown_pct"], 5.0)
         self.assertEqual(data["account_wallet"], f"{TEST_USER[:8]}...{TEST_USER[-4:]}")
         self.assertEqual(data["counts"]["quarantined"], 1)
         self.assertEqual(data["quarantines"][0]["coin"], "BTC")

@@ -1,6 +1,6 @@
 # MockingBot Codex Handoff
 
-Last updated: 2026-07-29
+Last updated: 2026-07-31
 
 ## Resume Here
 
@@ -14,8 +14,7 @@ Repository:
 
 Branch: `main`
 
-Latest code commit before this handoff:
-`2d74b8c Resolve terminal leverage rejection intents`
+Latest code commit before this handoff: see `git log -1` (rolling live breaker update).
 
 The source working tree was clean before this documentation update.
 
@@ -47,9 +46,14 @@ Last dashboard snapshot on 2026-07-29:
 - Contributed starting equity: `$802.20`
 - Breaker high-water: about `$823.47`
 - Current equity: about `$640.70`
-- Drawdown: about `22.20%`
-- Warning threshold: `15%`
-- Persistent hard breaker: `25%`
+- The persistent high-water drawdown remains diagnostic only.
+- Rolling 24-hour warning/breaker: `15%` / `25%`; a trip blocks new entries
+  for 24 hours and does not force liquidation.
+- Rolling 7-day warning/breaker: `35%` / `50%`; a trip blocks new entries for
+  seven days and does not force liquidation.
+- Live equity samples are persisted in `live_equity_history`. An expired marker
+  clears automatically when its rolling breach is gone; a continuing breach
+  retrips the applicable window.
 - Open tokens: `4`
 - Quarantined coins: `0`
 - Unresolved execution intents: `0`
@@ -63,9 +67,8 @@ Current Live positions at handoff:
 | NEAR | Long | about `$136` | profitable |
 | XRP | Short | about `$68` | profitable |
 
-Live is operating normally but the drawdown is close enough to the 25% breaker
-to warrant careful monitoring. Do not reset the breaker baseline or force-close
-positions without explicit user authorization.
+The all-time high-water drawdown does not itself stop Live. Do not reset risk
+history or force-close positions without explicit user authorization.
 
 Always verify current processes and dashboards rather than trusting these
 snapshot values.
@@ -395,7 +398,8 @@ change affects Elite or it is no longer running as intended.
 - Do not shut down the whole book for a single coin mismatch.
 - Do not force-close positions merely because they are temporarily losing.
 - Preserve strong-wallet autonomy while constraining concentration risk.
-- Treat the 15% level as warning and 25% as a serious diagnostic stop.
+- Treat a 25% loss inside 24 hours as catastrophic and a 50% loss inside seven
+  days as a viability-level event. A 25% weekly loss alone must not stop Live.
 - Maintain Paper/Live code parity automatically after repairs without asking
   separately each time.
 - Prefer monitoring evidence over premature parameter changes; current Live

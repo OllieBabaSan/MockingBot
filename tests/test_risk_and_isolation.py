@@ -52,7 +52,7 @@ class RiskAndIsolationTests(unittest.TestCase):
             finally:
                 store.conn.close()
 
-    def test_warning_and_persistent_hard_breaker(self) -> None:
+    def test_live_daily_breaker_expires_when_rolling_breach_clears(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             configured = settings(
                 Path(td), live=True, warning_drawdown_pct=0.15, max_drawdown_pct=0.25
@@ -60,29 +60,43 @@ class RiskAndIsolationTests(unittest.TestCase):
             store = core.Store(configured.db_path)
             try:
                 risk = core.RiskManager(configured, store, core.Notifier(""))
-                platform = FakePlatform(500.0)
-                baseline = risk.session_start_value(FakePortfolio(), platform)
-                self.assertEqual(baseline, 500.0)
-                risk.check_warning(risk.drawdown(baseline, 425.0))
+                first = risk.live_rolling_risk(500.0, 1_000_000.0)
+                self.assertEqual(first["daily_drawdown"], 0.0)
+                snapshot = risk.live_rolling_risk(374.0, 1_000_000.0 + 23 * 3600)
                 self.assertFalse(configured.circuit_breaker_file.exists())
-                self.assertTrue(risk.check_circuit_breaker(baseline, 375.0))
+                self.assertTrue(risk.check_live_circuit_breaker(snapshot))
                 payload = json.loads(configured.circuit_breaker_file.read_text(encoding="utf-8"))
                 self.assertEqual(payload["mode"], "live")
-                self.assertEqual(payload["drawdown_pct"], 25.0)
+                self.assertEqual(payload["window"], "24h")
+                self.assertAlmostEqual(payload["drawdown_pct"], 25.2, places=1)
                 first_marker = configured.circuit_breaker_file.read_text(encoding="utf-8")
-                self.assertTrue(risk.check_circuit_breaker(baseline, 350.0))
+                self.assertTrue(risk.check_live_circuit_breaker(snapshot))
                 self.assertEqual(
                     configured.circuit_breaker_file.read_text(encoding="utf-8"),
                     first_marker,
                 )
-                platform.value = 700.0
-                self.assertEqual(risk.session_start_value(FakePortfolio(), platform), 700.0)
-                self.assertEqual(
-                    store.get_json("live_risk_baseline", {})["high_water_value"], 700.0
-                )
-                self.assertEqual(risk.update_live_high_water(750.0, 700.0), 750.0)
-                self.assertEqual(risk.update_live_high_water(725.0, 750.0), 750.0)
-                self.assertAlmostEqual(risk.drawdown(750.0, 562.5), 0.25)
+                recovered = risk.live_rolling_risk(374.0, payload["expires_unix"] + 1)
+                self.assertFalse(risk.check_live_circuit_breaker(recovered))
+                self.assertFalse(configured.circuit_breaker_file.exists())
+            finally:
+                store.conn.close()
+
+    def test_live_weekly_breaker_trips_at_fifty_percent(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            configured = settings(Path(td), live=True)
+            store = core.Store(configured.db_path)
+            try:
+                risk = core.RiskManager(configured, store, core.Notifier(""))
+                start = 2_000_000.0
+                risk.live_rolling_risk(500.0, start)
+                risk.live_rolling_risk(260.0, start + 6 * 86400 - 3600)
+                snapshot = risk.live_rolling_risk(249.0, start + 6 * 86400)
+                self.assertLess(snapshot["daily_drawdown"], configured.max_drawdown_pct)
+                self.assertGreaterEqual(snapshot["weekly_drawdown"], 0.50)
+                self.assertTrue(risk.check_live_circuit_breaker(snapshot))
+                payload = json.loads(configured.circuit_breaker_file.read_text(encoding="utf-8"))
+                self.assertEqual(payload["window"], "7d")
+                self.assertEqual(payload["expires_unix"], snapshot["observed_unix"] + 7 * 86400)
             finally:
                 store.conn.close()
 
