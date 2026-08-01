@@ -72,6 +72,7 @@ class SignalSafetyTests(unittest.TestCase):
     def test_strictly_superior_tier_closes_incumbent_before_replacement(self) -> None:
         self.paper.open("incumbent", "BTC", "LONG", 100.0, 100.0, leverage=3)
         bot = self.bot(score("incumbent", "Candidate", 56.0))
+        bot._median_core_score = lambda: 55.0
         held = {"BTC"}
         allowed = bot._apply_ranked_opposite_override(
             core.CopyEvent("ENTRY", "incoming", "BTC", "SHORT", event_id=7),
@@ -92,6 +93,83 @@ class SignalSafetyTests(unittest.TestCase):
         )
         self.assertFalse(allowed)
         self.assertIsNotNone(self.paper.position("BTC"))
+
+    def test_candidate_new_coin_cap_allows_add_to_core_position(self) -> None:
+        scores = {
+            "candidate": score("candidate", "Candidate", 56.0),
+            "core": score("core", "Core", 68.0),
+        }
+        bot = self.bot(scores["candidate"])
+        bot.scoring_engine = type(
+            "Scores", (), {"score_wallet": lambda _self, wallet: scores[wallet]}
+        )()
+        for coin in ("BTC", "ETH", "SOL"):
+            self.paper.open("candidate", coin, "LONG", 100.0, 10.0, leverage=3)
+        blocked = bot._candidate_slot_decision(
+            core.CopyEvent("ENTRY", "candidate", "XRP", "LONG"), scores["candidate"]
+        )
+        self.assertEqual(blocked.action, "SKIP")
+        self.paper.open("core", "HYPE", "LONG", 100.0, 10.0, leverage=3)
+        allowed = bot._candidate_slot_decision(
+            core.CopyEvent("ADD", "candidate", "HYPE", "LONG"), scores["candidate"]
+        )
+        self.assertEqual(allowed.action, "EXECUTE")
+
+    def test_elite_preempts_weakest_candidate_before_core(self) -> None:
+        scores = {
+            "candidate-low": score("candidate-low", "Candidate", 55.0),
+            "candidate-high": score("candidate-high", "Candidate", 58.0),
+            "core": score("core", "Core", 62.0),
+        }
+        configured = core.replace(self.settings, max_positions=3)
+        bot = self.bot(scores["candidate-low"])
+        bot.settings = configured
+        bot.scoring_engine = type(
+            "Scores", (), {"score_wallet": lambda _self, wallet: scores[wallet]}
+        )()
+        self.paper.open("candidate-low", "BTC", "LONG", 100.0, 10.0, leverage=3)
+        self.paper.open("candidate-high", "ETH", "LONG", 100.0, 10.0, leverage=3)
+        self.paper.open("core", "SOL", "LONG", 100.0, 10.0, leverage=3)
+        allowed = bot._apply_full_book_preemption(
+            core.CopyEvent("ENTRY", "elite", "XRP", "LONG", event_id=8),
+            score("elite", "Elite", 82.0),
+            {"BTC", "ETH", "SOL"},
+        )
+        self.assertTrue(allowed)
+        self.assertIsNone(self.paper.position("BTC"))
+        self.assertIsNotNone(self.paper.position("ETH"))
+        self.assertIsNotNone(self.paper.position("SOL"))
+
+    def test_only_above_median_core_preempts_candidate(self) -> None:
+        scores = {
+            "candidate": score("candidate", "Candidate", 56.0),
+            "core-60": score("core-60", "Core", 60.0),
+            "core-70": score("core-70", "Core", 70.0),
+            "core-80": score("core-80", "Core", 80.0),
+        }
+        configured = core.replace(self.settings, max_positions=1)
+        bot = self.bot(scores["candidate"])
+        bot.settings = configured
+        bot.scoring_engine = type(
+            "Scores", (), {"score_wallet": lambda _self, wallet: scores[wallet]}
+        )()
+        self.store.replace_roster(
+            ["core-60", "core-70", "core-80"],
+            {
+                wallet: core.WalletMetrics(False, True, 20, 0.6, 2.0)
+                for wallet in ("core-60", "core-70", "core-80")
+            },
+        )
+        self.paper.open("candidate", "BTC", "LONG", 100.0, 10.0, leverage=3)
+        self.assertFalse(bot._apply_full_book_preemption(
+            core.CopyEvent("ENTRY", "incoming", "ETH", "LONG"),
+            score("incoming", "Core", 70.0), {"BTC"},
+        ))
+        self.assertTrue(bot._apply_full_book_preemption(
+            core.CopyEvent("ENTRY", "incoming", "ETH", "LONG", event_id=9),
+            score("incoming", "Core", 71.0), {"BTC"},
+        ))
+        self.assertIsNone(self.paper.position("BTC"))
 
 
 if __name__ == "__main__":

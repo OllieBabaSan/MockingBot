@@ -232,6 +232,7 @@ class Settings:
     scoring_engine_core_leverage: int = env_int("SCORING_ENGINE_CORE_LEVERAGE", 3)
     scoring_engine_elite_leverage: int = env_int("SCORING_ENGINE_ELITE_LEVERAGE", 3)
     max_positions: int = env_int("MAX_POSITIONS", 4 if env_bool("HL_LIVE", False) else 10)
+    candidate_position_cap: int = env_int("CANDIDATE_POSITION_CAP", 3)
     max_slices_per_coin: int = env_int("MAX_SLICES_PER_COIN", 5)
     max_coin_margin_pct: float = env_float("MAX_COIN_MARGIN_PCT", 0.20)
     max_wallet_margin_pct: float = env_float("MAX_WALLET_MARGIN_PCT", 0.35)
@@ -334,6 +335,7 @@ def settings_signature(settings: Settings) -> dict[str, Any]:
         "core_leverage": settings.scoring_engine_core_leverage,
         "elite_leverage": settings.scoring_engine_elite_leverage,
         "max_positions": settings.max_positions,
+        "candidate_position_cap": settings.candidate_position_cap,
         "max_wallet_margin_pct": settings.max_wallet_margin_pct,
         "live_margin_reserve_pct": settings.live_margin_reserve_pct,
         "live_size_tolerance_pct": settings.live_size_tolerance_pct,
@@ -397,6 +399,8 @@ def validate_settings(settings: Settings) -> None:
     errors: list[str] = []
     if settings.max_positions <= 0:
         errors.append("MAX_POSITIONS must be positive")
+    if settings.candidate_position_cap < 0:
+        errors.append("CANDIDATE_POSITION_CAP cannot be negative")
     if settings.live_entry_event_max_age_seconds <= 0:
         errors.append("LIVE_ENTRY_EVENT_MAX_AGE_SECS must be positive")
     if not 0 < settings.max_wallet_margin_pct <= 1:
@@ -5724,7 +5728,18 @@ class CopyTradingBot:
             (self._tier_rank(score.tier) for score in incumbent_scores), default=0
         )
         incoming_rank = self._tier_rank(incoming_score.tier)
-        if incoming_rank <= highest_rank:
+        if incoming_score.tier == "Elite":
+            qualified = highest_rank < self._tier_rank("Elite")
+        elif incoming_score.tier == "Core":
+            median = self._median_core_score()
+            qualified = (
+                highest_rank <= self._tier_rank("Candidate")
+                and median is not None
+                and incoming_score.total_score > median
+            )
+        else:
+            qualified = False
+        if not qualified:
             return False
 
         incumbent_summary = ", ".join(
@@ -5758,6 +5773,136 @@ class CopyTradingBot:
             return False
         if live_held is not None:
             live_held.discard(event.coin)
+        return True
+
+    def _position_wallet_scores(self, coin: str) -> list[ScoringEngineScore]:
+        wallets = sorted({
+            str(row["source_wallet"])
+            for row in self.store.open_position_slices(coin)
+        })
+        return [self.scoring_engine.score_wallet(wallet) for wallet in wallets]
+
+    def _candidate_slot_decision(
+        self, event: CopyEvent, incoming_score: ScoringEngineScore
+    ) -> TradeDecision:
+        if incoming_score.tier != "Candidate" or self.settings.candidate_position_cap == 0:
+            return TradeDecision("EXECUTE")
+        existing = self.paper.position(event.coin)
+        if existing is not None:
+            incumbent_scores = self._position_wallet_scores(event.coin)
+            if any(score.tier in {"Core", "Elite"} for score in incumbent_scores):
+                return TradeDecision("EXECUTE")
+            # An add to an existing Candidate-only coin does not consume a new slot.
+            return TradeDecision("EXECUTE")
+
+        candidate_coins = 0
+        for coin in self.store.paper_positions():
+            scores = self._position_wallet_scores(coin)
+            if scores and all(
+                self._tier_rank(score.tier) <= self._tier_rank("Candidate")
+                for score in scores
+            ):
+                candidate_coins += 1
+        if candidate_coins >= self.settings.candidate_position_cap:
+            return TradeDecision(
+                "SKIP",
+                f"Candidate position cap: {candidate_coins}/{self.settings.candidate_position_cap}",
+            )
+        return TradeDecision("EXECUTE")
+
+    def _median_core_score(self) -> float | None:
+        core_scores = sorted(
+            score.total_score
+            for wallet in self.store.roster()
+            for score in [self.scoring_engine.score_wallet(wallet)]
+            if score.tier == "Core"
+        )
+        if not core_scores:
+            return None
+        middle = len(core_scores) // 2
+        if len(core_scores) % 2:
+            return core_scores[middle]
+        return (core_scores[middle - 1] + core_scores[middle]) / 2.0
+
+    def _apply_full_book_preemption(
+        self,
+        event: CopyEvent,
+        incoming_score: ScoringEngineScore,
+        live_held: set[str] | None,
+    ) -> bool:
+        if self.paper.position(event.coin) is not None:
+            return True
+        positions = self.store.paper_positions()
+        if len(positions) < self.settings.max_positions:
+            return True
+
+        eligible_ranks: set[int]
+        qualification = ""
+        if incoming_score.tier == "Elite":
+            eligible_ranks = {
+                self._tier_rank("Bench"),
+                self._tier_rank("Candidate"),
+                self._tier_rank("Core"),
+            }
+        elif incoming_score.tier == "Core":
+            median = self._median_core_score()
+            if median is None or incoming_score.total_score <= median:
+                return False
+            eligible_ranks = {
+                self._tier_rank("Bench"), self._tier_rank("Candidate")
+            }
+            qualification = f" above Core median {median:.1f}"
+        else:
+            return False
+
+        victims: list[tuple[int, float, str, list[ScoringEngineScore]]] = []
+        for coin in positions:
+            scores = self._position_wallet_scores(coin)
+            if not scores:
+                continue
+            strongest_rank = max(self._tier_rank(score.tier) for score in scores)
+            if strongest_rank not in eligible_ranks:
+                continue
+            strongest_score = max(
+                score.total_score
+                for score in scores
+                if self._tier_rank(score.tier) == strongest_rank
+            )
+            victims.append((strongest_rank, strongest_score, coin, scores))
+        if not victims:
+            return False
+
+        _, _, victim_coin, victim_scores = min(victims, key=lambda item: (item[0], item[1]))
+        victim_summary = ", ".join(
+            f"{score.tier} {score.total_score:.1f}" for score in victim_scores
+        )
+        print(
+            f"[RANKED-PREEMPTION] {event.coin}: incoming {incoming_score.tier} "
+            f"{incoming_score.total_score:.1f}{qualification} replaces "
+            f"{victim_coin} ({victim_summary})"
+        )
+        for row in list(self.store.open_position_slices(victim_coin)):
+            self.reconciler._force_close(
+                victim_coin,
+                str(row["source_wallet"]),
+                str(row["side"]),
+                (
+                    f"ranked slot preemption by {event.wallet}: "
+                    f"{incoming_score.tier} {incoming_score.total_score:.1f}"
+                ),
+                (
+                    f"ranked-preemption:event:{self._event_identity(event)}:"
+                    f"slice:{int(row['id'])}:close"
+                    if self._event_identity(event) is not None else None
+                ),
+            )
+        if self.paper.position(victim_coin) is not None:
+            print(
+                f"[RANKED-PREEMPTION] {victim_coin}: close incomplete; replacement blocked"
+            )
+            return False
+        if live_held is not None:
+            live_held.discard(victim_coin)
         return True
 
     def _handle_entry(self, event: CopyEvent, wind_down: bool, live_held: set[str] | None) -> None:
@@ -5864,6 +6009,34 @@ class CopyTradingBot:
             return
 
         is_add = event.kind == "ADD"
+        candidate_decision = self._candidate_slot_decision(event, scoring_score)
+        if candidate_decision.action != "EXECUTE":
+            signal_id = self.store.log_signal(
+                event.wallet, event.coin, event.side, event.kind,
+                event.entry_price, "SKIPPED", candidate_decision.reason,
+            )
+            self.scoring_engine.observe_signal(
+                event, signal_id, "SKIPPED", candidate_decision.reason, event.entry_price
+            )
+            print(f"[SKIP] {event.kind} {event.coin} {event.side}: {candidate_decision.reason}")
+            return
+
+        if (
+            self.paper.position(event.coin) is None
+            and len(self.store.paper_positions()) >= self.settings.max_positions
+            and not self._apply_full_book_preemption(event, scoring_score, live_held)
+        ):
+            reason = "position cap; no eligible ranked preemption"
+            signal_id = self.store.log_signal(
+                event.wallet, event.coin, event.side, event.kind,
+                event.entry_price, "SKIPPED", reason,
+            )
+            self.scoring_engine.observe_signal(
+                event, signal_id, "SKIPPED", reason, event.entry_price
+            )
+            print(f"[SKIP] {event.kind} {event.coin} {event.side}: {reason}")
+            return
+
         decision = self.risk.allow_entry(
             event.wallet,
             event.coin,

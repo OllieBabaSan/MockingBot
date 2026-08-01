@@ -372,6 +372,16 @@ change affects Elite or it is no longer running as intended.
 
 ## Deferred Work and Watch Items
 
+- Candidate-only coin positions are capped at three. Candidate additions to an
+  existing same-side Core/Elite-owned coin remain eligible and do not consume a
+  new Candidate slot.
+- When the book is full, Elite entries may preempt the weakest non-Elite coin
+  position. Core entries may preempt only a Bench/Candidate coin and only when
+  the incoming Core score is strictly above the current roster Core median.
+  Preemption closes every allocation on the victim coin before replacement;
+  an incomplete close blocks the incoming entry. Candidate entries never
+  preempt.
+
 - Live remains dependent on Paper as its canonical event/roster source. Over the
   next month, identify and fix Live scoring/selection defects so it can
   eventually run independently.
