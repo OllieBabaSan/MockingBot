@@ -14,7 +14,8 @@
   "policies": [
     "no_stop",
     "stop_12_pct",
-    "stop_15_pct"
+    "stop_15_pct",
+    "stop_20_pct"
   ],
   "primary_slippage_bps": 10,
   "sensitivity_slippage_bps": [0, 25],

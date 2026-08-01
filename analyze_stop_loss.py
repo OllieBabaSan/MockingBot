@@ -255,7 +255,7 @@ def main() -> int:
         for trade in trades:
             row = dict(trade)
             row["no_stop_return_pct"] = float(trade["pnl_pct"])
-            for threshold in (12.0, 15.0):
+            for threshold in (12.0, 15.0, 20.0):
                 result = stop_result(trade, candle_map[str(trade["coin"])], threshold, slippage)
                 key = f"stop_{int(threshold)}"
                 row[f"{key}_stopped"] = result["stopped"]
@@ -267,6 +267,7 @@ def main() -> int:
             "no_stop": summarize(rows, "no_stop"),
             "stop_12": summarize(rows, "stop_12"),
             "stop_15": summarize(rows, "stop_15"),
+            "stop_20": summarize(rows, "stop_20"),
             "by_entry_tier": {},
         }
         worst_no_stop = min(rows, key=lambda row: float(row["no_stop_return_pct"]))
@@ -279,14 +280,14 @@ def main() -> int:
         }
         leave_worst_out.update({
             policy: summarize(without_worst, policy)
-            for policy in ("no_stop", "stop_12", "stop_15")
+            for policy in ("no_stop", "stop_12", "stop_15", "stop_20")
         })
         scenario["leave_worst_trade_out"] = leave_worst_out
         for tier in ("Core", "Elite"):
             subset = [row for row in rows if row["marshal_tier"] == tier]
             scenario["by_entry_tier"][tier] = {
                 policy: summarize(subset, policy)
-                for policy in ("no_stop", "stop_12", "stop_15")
+                for policy in ("no_stop", "stop_12", "stop_15", "stop_20")
             }
         all_reports["scenarios"][f"slippage_{slippage:g}_bps"] = scenario
         detail_rows.extend(rows)

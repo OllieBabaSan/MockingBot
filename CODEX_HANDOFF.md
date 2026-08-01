@@ -381,6 +381,10 @@ change affects Elite or it is no longer running as intended.
   `-72.24%` CASHCAT trade. Removing it changes the totals to about `-117.07`,
   `-131.28`, and `-118.11`, respectively. Elite-only results were slightly
   worse with either stop. Do not deploy a stop based on this discovery sample.
+- A 20% stop was added to the comparison. At 10 bps it produced `-148.73`,
+  stopping four trades. Only the `-72.24%` CASHCAT outlier benefited; the other
+  three crossed `-20%` and later recovered to roughly `-15%` to `-17%`.
+  Excluding CASHCAT, the 20% policy was about 11.58 points worse than no stop.
 - `stop_loss_samples.json` freezes a prospective validation cohort of the next
   200 completed Core/Elite lifecycles opened after `2026-08-01 17:46:38`.
   Re-run it into a separate output directory after the target is reached.
