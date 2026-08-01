@@ -1,0 +1,22 @@
+{
+  "discovery": {
+    "description": "Frozen completed Core/Elite shadow lifecycles available for the first analysis.",
+    "closed_before": "2026-08-01 17:46:38",
+    "target_trades": 201,
+    "status": "complete"
+  },
+  "prospective_validation": {
+    "description": "Disjoint Core/Elite lifecycles opened after the discovery cutoff. No stop policy is changed while this cohort accumulates.",
+    "opened_after": "2026-08-01 17:46:38",
+    "target_trades": 200,
+    "status": "collecting"
+  },
+  "policies": [
+    "no_stop",
+    "stop_12_pct",
+    "stop_15_pct"
+  ],
+  "primary_slippage_bps": 10,
+  "sensitivity_slippage_bps": [0, 25],
+  "candle_interval": "15m"
+}

@@ -372,6 +372,19 @@ change affects Elite or it is no longer running as intended.
 
 ## Deferred Work and Watch Items
 
+- Stop-loss research is active; no stop has been enabled. The frozen discovery
+  cohort contains 201 completed Core/Elite shadow lifecycles through
+  `2026-08-01 17:46:38`. `analyze_stop_loss.py` compares no stop, 12%, and 15%
+  using cached 15-minute Hyperliquid candles and 0/10/25 bps stop slippage.
+- At 10 bps, combined normalized returns were approximately `-189.31` with no
+  stop, `-147.31` at 12%, and `-134.14` at 15%. This result is dominated by one
+  `-72.24%` CASHCAT trade. Removing it changes the totals to about `-117.07`,
+  `-131.28`, and `-118.11`, respectively. Elite-only results were slightly
+  worse with either stop. Do not deploy a stop based on this discovery sample.
+- `stop_loss_samples.json` freezes a prospective validation cohort of the next
+  200 completed Core/Elite lifecycles opened after `2026-08-01 17:46:38`.
+  Re-run it into a separate output directory after the target is reached.
+
 - Candidate-only coin positions are capped at three. Candidate additions to an
   existing same-side Core/Elite-owned coin remain eligible and do not consume a
   new Candidate slot.
