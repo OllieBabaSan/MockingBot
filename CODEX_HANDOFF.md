@@ -93,7 +93,7 @@ Live bot.
 
 - Paper start: `$10,000`
 - Paper slots: `10`
-- Live slots: `6`
+- Live slots: `7`
 - Both Paper and Live use an explicit `20%` per-token margin cap based on total
   local book allocation basis, not remaining cash.
 - The old two-slice/slot-derived cap was removed because it produced a `33.3%`
@@ -315,7 +315,7 @@ Preflight is read-only and must report:
 - no duplicate Live instance,
 - circuit breaker clear,
 - correct account/agent relationship,
-- viable six-slot sizing,
+- viable configured slot sizing (currently seven),
 - synchronized local/exchange positions,
 - `RESULT: PASS - no orders submitted`.
 
