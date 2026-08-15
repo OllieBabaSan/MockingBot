@@ -83,17 +83,19 @@ def classify(paper: dict[str, Any], live: dict[str, Any], delta_seconds: float) 
         return "CONFIG_DIVERGENCE", "shared decision policy differs"
     if paper["code_fingerprint"] != live["code_fingerprint"]:
         return "CODE_DIVERGENCE", "source versions differ"
-    if paper["wallet_tier"] != live["wallet_tier"] or abs(
-        float(paper["wallet_score"]) - float(live["wallet_score"])
-    ) > 0.05:
+    if paper["wallet_tier"] != live["wallet_tier"]:
         return "SCORE_DIVERGENCE", "wallet tier or score differs"
-    if paper["action"] != live["action"] or (paper.get("reason") or "") != (live.get("reason") or ""):
+    if paper["action"] != live["action"]:
         reasons = {(paper.get("reason") or ""), (live.get("reason") or "")}
         if reasons & STATE_REASONS or any(
             reason.startswith(STATE_REASON_PREFIXES) for reason in reasons
         ):
             return "EXPECTED_STATE_VARIANCE", "capacity, holdings, or risk state differs"
         return "LOGIC_DIVERGENCE", "same inputs produced a different decision"
+    if abs(float(paper["wallet_score"]) - float(live["wallet_score"])) > 0.05:
+        return "EXPECTED_STATE_VARIANCE", "active-book scoring inputs differ"
+    if (paper.get("reason") or "") != (live.get("reason") or ""):
+        return "EXPECTED_STATE_VARIANCE", "same decision with environment-specific detail"
     if delta_seconds > 45:
         return "TIMING_VARIANCE", f"observed {delta_seconds:.0f}s apart"
     paper_price = paper.get("observed_price")
@@ -164,7 +166,7 @@ def build_report(
     paper_db: Path,
     live_db: Path,
     hours: float = 24.0,
-    tolerance_seconds: int = 180,
+    tolerance_seconds: int = 300,
     unmatched_grace_seconds: int = 300,
     not_before: str | None = None,
 ) -> dict[str, Any]:
@@ -216,7 +218,7 @@ def main() -> int:
     parser.add_argument("--live-db", type=Path, default=DEFAULT_LIVE_DB)
     parser.add_argument("--log", type=Path, default=DEFAULT_LOG)
     parser.add_argument("--hours", type=float, default=24.0)
-    parser.add_argument("--tolerance-seconds", type=int, default=180)
+    parser.add_argument("--tolerance-seconds", type=int, default=300)
     args = parser.parse_args()
 
     report = build_report(args.paper_db, args.live_db, args.hours, args.tolerance_seconds)

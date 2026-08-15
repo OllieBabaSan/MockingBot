@@ -213,6 +213,25 @@ class Settings:
     token_risk_top_n: int = env_int("TOKEN_RISK_TOP_N", 2500)
     token_risk_refresh_seconds: int = env_int("TOKEN_RISK_REFRESH_SECS", 24 * 3600)
     token_risk_retry_seconds: int = env_int("TOKEN_RISK_RETRY_SECS", 6 * 3600)
+    position_risk_shadow_enabled: bool = env_bool("POSITION_RISK_SHADOW_ENABLED", True)
+    position_risk_interval_seconds: int = env_int("POSITION_RISK_INTERVAL_SECS", 300)
+    position_risk_benchmarks: str = env_str("POSITION_RISK_BENCHMARKS", "BTC,ETH,SOL")
+    position_risk_watch_loss_pct: float = env_float("POSITION_RISK_WATCH_LOSS_PCT", 0.07)
+    position_risk_add_freeze_loss_pct: float = env_float(
+        "POSITION_RISK_ADD_FREEZE_LOSS_PCT", 0.10
+    )
+    position_risk_impaired_loss_pct: float = env_float(
+        "POSITION_RISK_IMPAIRED_LOSS_PCT", 0.15
+    )
+    position_risk_relative_weakness_pct: float = env_float(
+        "POSITION_RISK_RELATIVE_WEAKNESS_PCT", 0.04
+    )
+    position_risk_exit_relative_pct: float = env_float(
+        "POSITION_RISK_EXIT_RELATIVE_PCT", 0.05
+    )
+    position_risk_watch_minutes: int = env_int("POSITION_RISK_WATCH_MINUTES", 120)
+    position_risk_impaired_minutes: int = env_int("POSITION_RISK_IMPAIRED_MINUTES", 240)
+    position_risk_exit_minutes: int = env_int("POSITION_RISK_EXIT_MINUTES", 360)
 
     roster_size: int = env_int("ROSTER_SIZE", 150)
     max_follow: int = env_int("MAX_FOLLOW", 0)
@@ -431,6 +450,25 @@ def validate_settings(settings: Settings) -> None:
         errors.append("daily maximum drawdown must be below weekly maximum drawdown")
     if settings.poll_seconds <= 0 or settings.reconcile_seconds <= 0:
         errors.append("poll and reconciliation intervals must be positive")
+    if settings.position_risk_interval_seconds <= 0:
+        errors.append("POSITION_RISK_INTERVAL_SECS must be positive")
+    if not (
+        0 < settings.position_risk_watch_loss_pct
+        < settings.position_risk_add_freeze_loss_pct
+        < settings.position_risk_impaired_loss_pct
+        < 1
+    ):
+        errors.append("position risk loss thresholds must satisfy 0 < watch < freeze < impaired < 1")
+    if not 0 < settings.position_risk_relative_weakness_pct < 1:
+        errors.append("POSITION_RISK_RELATIVE_WEAKNESS_PCT must be between 0 and 1")
+    if not settings.position_risk_relative_weakness_pct <= settings.position_risk_exit_relative_pct < 1:
+        errors.append("POSITION_RISK_EXIT_RELATIVE_PCT must be at least the relative weakness threshold")
+    if not (
+        0 <= settings.position_risk_watch_minutes
+        <= settings.position_risk_impaired_minutes
+        <= settings.position_risk_exit_minutes
+    ):
+        errors.append("position risk durations must satisfy watch <= impaired <= exit")
     if settings.backup_interval_seconds <= 0:
         errors.append("BACKUP_INTERVAL_SECS must be positive")
     if settings.backup_retention_count < 2:
@@ -882,6 +920,36 @@ class Store:
                 source TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS position_risk_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                observed_unix REAL NOT NULL,
+                observed_at TEXT NOT NULL,
+                coin TEXT NOT NULL,
+                side TEXT NOT NULL,
+                opened_at TEXT NOT NULL,
+                entry_price REAL NOT NULL,
+                mark_price REAL NOT NULL,
+                relative_anchor_price REAL NOT NULL,
+                return_pct REAL NOT NULL,
+                benchmark_symbols TEXT NOT NULL,
+                benchmark_entry_prices TEXT NOT NULL,
+                benchmark_return_pct REAL,
+                relative_return_pct REAL,
+                funding REAL,
+                open_interest REAL,
+                open_interest_change_pct REAL,
+                day_volume REAL,
+                minutes_below_5 REAL NOT NULL,
+                minutes_below_10 REAL NOT NULL,
+                minutes_below_15 REAL NOT NULL,
+                state TEXT NOT NULL,
+                reasons TEXT NOT NULL,
+                shadow_action TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_position_risk_latest
+            ON position_risk_snapshots(coin, side, opened_at, id);
+
             CREATE TABLE IF NOT EXISTS marshal_wallet_scores (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts TEXT NOT NULL,
@@ -1030,6 +1098,11 @@ class Store:
         self._ensure_column("pending_copy_events", "observed_price", "REAL")
         self._ensure_column("wallet_positions", "unrealized_pnl", "REAL")
         self._ensure_column("wallet_positions", "margin_used", "REAL")
+        self._ensure_column(
+            "position_risk_snapshots",
+            "relative_anchor_price",
+            "REAL NOT NULL DEFAULT 0",
+        )
         self.conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_copy_events_uid "
             "ON pending_copy_events(event_uid) WHERE event_uid IS NOT NULL"
@@ -2261,6 +2334,50 @@ class Store:
         )
         self.conn.commit()
 
+    def latest_position_risk_snapshot(
+        self, coin: str, side: str, opened_at: str
+    ) -> sqlite3.Row | None:
+        return self.conn.execute(
+            """
+            SELECT * FROM position_risk_snapshots
+            WHERE coin = ? AND side = ? AND opened_at = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (coin, side, opened_at),
+        ).fetchone()
+
+    def record_position_risk_snapshot(self, snapshot: dict[str, Any]) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO position_risk_snapshots(
+                observed_unix, observed_at, coin, side, opened_at,
+                entry_price, mark_price, relative_anchor_price, return_pct, benchmark_symbols,
+                benchmark_entry_prices, benchmark_return_pct,
+                relative_return_pct, funding, open_interest,
+                open_interest_change_pct, day_volume, minutes_below_5,
+                minutes_below_10, minutes_below_15, state, reasons,
+                shadow_action
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                snapshot["observed_unix"], snapshot["observed_at"],
+                snapshot["coin"], snapshot["side"], snapshot["opened_at"],
+                snapshot["entry_price"], snapshot["mark_price"],
+                snapshot["relative_anchor_price"], snapshot["return_pct"],
+                snapshot["benchmark_symbols"],
+                snapshot["benchmark_entry_prices"],
+                snapshot.get("benchmark_return_pct"),
+                snapshot.get("relative_return_pct"), snapshot.get("funding"),
+                snapshot.get("open_interest"),
+                snapshot.get("open_interest_change_pct"),
+                snapshot.get("day_volume"), snapshot["minutes_below_5"],
+                snapshot["minutes_below_10"], snapshot["minutes_below_15"],
+                snapshot["state"], snapshot["reasons"],
+                snapshot["shadow_action"],
+            ),
+        )
+        self.conn.commit()
+
     def log_scoring_engine_wallet_score(self, score: "ScoringEngineScore") -> None:
         self.conn.execute(
             """
@@ -2713,6 +2830,9 @@ class PlatformAdapter(ABC):
     def mid_price(self, coin: str) -> float | None:
         raise NotImplementedError
 
+    def market_contexts(self) -> dict[str, dict[str, float | None]]:
+        return {}
+
     @abstractmethod
     def account_value(self) -> float | None:
         raise NotImplementedError
@@ -2746,6 +2866,8 @@ class HyperliquidAdapter(PlatformAdapter):
         self.retry = RetryClient(store, self.name)
         self._mids: dict[str, Any] = {}
         self._mids_ts = 0.0
+        self._market_contexts: dict[str, dict[str, float | None]] = {}
+        self._market_contexts_ts = 0.0
         self._exchange = None
         self._info = None
         self._sz_decimals: dict[str, int] = {}
@@ -2961,6 +3083,42 @@ class HyperliquidAdapter(PlatformAdapter):
         except Exception:
             return None
 
+    def market_contexts(self) -> dict[str, dict[str, float | None]]:
+        if self._market_contexts and unix_now() - self._market_contexts_ts < 30:
+            return self._market_contexts
+        payload = self._post_info({"type": "metaAndAssetCtxs"}, "market_contexts")
+        if not isinstance(payload, list) or len(payload) != 2:
+            return self._market_contexts
+        meta, contexts = payload
+        universe = meta.get("universe", []) if isinstance(meta, dict) else []
+        if not isinstance(contexts, list):
+            return self._market_contexts
+
+        def number(value: Any) -> float | None:
+            try:
+                return float(value) if value is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        parsed: dict[str, dict[str, float | None]] = {}
+        for asset, context in zip(universe, contexts):
+            if not isinstance(asset, dict) or not isinstance(context, dict):
+                continue
+            coin = str(asset.get("name") or "")
+            if not coin:
+                continue
+            parsed[coin] = {
+                "funding": number(context.get("funding")),
+                "open_interest": number(context.get("openInterest")),
+                "day_volume": number(context.get("dayNtlVlm")),
+                "mark_price": number(context.get("markPx")),
+                "oracle_price": number(context.get("oraclePx")),
+            }
+        if parsed:
+            self._market_contexts = parsed
+            self._market_contexts_ts = unix_now()
+        return self._market_contexts
+
     def _init_sdk(self) -> None:
         if self._exchange is not None:
             return
@@ -3053,7 +3211,7 @@ class HyperliquidAdapter(PlatformAdapter):
                 withdrawable=available,
                 available_margin=available,
             )
-        except (AttributeError, TypeError, ValueError) as exc:
+        except Exception as exc:
             self.store.log_api_failure(self.name, "unified_capital", "", str(exc))
             return None
 
@@ -3181,7 +3339,8 @@ class HyperliquidAdapter(PlatformAdapter):
                 False, requested_size=requested_size, status=status, detail=detail
             )
             self.store.log_execution(
-                coin, side, "OPEN", result, leverage, requested_leverage
+                coin, side, "OPEN", result, leverage, requested_leverage,
+                reference_price=price, price_source="decision_price",
             )
             return result
 
@@ -3190,13 +3349,19 @@ class HyperliquidAdapter(PlatformAdapter):
         except RuntimeError as exc:
             result = ExecutionResult(False, status="leverage_mismatch", detail=str(exc))
             self.store.quarantine_coin(coin, "mixed local leverage", str(exc))
-            self.store.log_execution(coin, side, "OPEN", result, leverage, requested_leverage)
+            self.store.log_execution(
+                coin, side, "OPEN", result, leverage, requested_leverage,
+                reference_price=price, price_source="decision_price",
+            )
             return result
         if existing_leverage is not None and abs(existing_leverage - leverage) > 1e-8:
             detail = f"existing={existing_leverage:g}x effective={leverage:g}x"
             result = ExecutionResult(False, status="leverage_mismatch", detail=detail)
             self.store.quarantine_coin(coin, "position leverage mismatch", detail)
-            self.store.log_execution(coin, side, "OPEN", result, leverage, requested_leverage)
+            self.store.log_execution(
+                coin, side, "OPEN", result, leverage, requested_leverage,
+                reference_price=price, price_source="decision_price",
+            )
             return result
         if notional_usd < self.settings.min_order_notional or price <= 0:
             return reject(
@@ -3265,7 +3430,10 @@ class HyperliquidAdapter(PlatformAdapter):
         if not self.settings.live:
             print(f"[DRY] ENTRY {coin} {side} size={size} notional~${notional_usd:.2f}")
             result = ExecutionResult(True, size, size, price, status="paper", confirmed=True)
-            self.store.log_execution(coin, side, "OPEN", result, leverage, requested_leverage)
+            self.store.log_execution(
+                coin, side, "OPEN", result, leverage, requested_leverage,
+                reference_price=price, price_source="decision_price",
+            )
             return result
 
         intent_key = intent_key or f"adhoc:open:{uuid.uuid4().hex}"
@@ -3383,7 +3551,10 @@ class HyperliquidAdapter(PlatformAdapter):
             self.store.update_execution_intent(
                 intent_key, self._execution_intent_state(execution), execution
             )
-            self.store.log_execution(coin, side, "OPEN", execution, leverage, requested_leverage)
+            self.store.log_execution(
+                coin, side, "OPEN", execution, leverage, requested_leverage,
+                reference_price=price, price_source="decision_price",
+            )
             return execution
         except Exception as exc:
             self.store.log_api_failure(self.name, "open_position", coin, str(exc))
@@ -3430,7 +3601,10 @@ class HyperliquidAdapter(PlatformAdapter):
             self.store.update_execution_intent(
                 intent_key, self._execution_intent_state(result), result
             )
-            self.store.log_execution(coin, side, "OPEN", result, leverage, requested_leverage)
+            self.store.log_execution(
+                coin, side, "OPEN", result, leverage, requested_leverage,
+                reference_price=price, price_source="decision_price",
+            )
             return result
 
     @staticmethod
@@ -3914,6 +4088,251 @@ class HyperliquidAdapter(PlatformAdapter):
             "filled" if filled_size > 0 else "unfilled",
             False,
         )
+
+# ---------------------------------------------------------------------------
+# Position-risk shadow monitor
+# ---------------------------------------------------------------------------
+
+
+class PositionRiskMonitor:
+    """Persist position-health evidence without changing trading decisions."""
+
+    def __init__(self, settings: Settings, store: Store, platform: PlatformAdapter):
+        self.settings = settings
+        self.store = store
+        self.platform = platform
+        self.benchmarks = tuple(
+            dict.fromkeys(
+                coin.strip().upper()
+                for coin in settings.position_risk_benchmarks.split(",")
+                if coin.strip()
+            )
+        )
+
+    @staticmethod
+    def _json_dict(value: Any) -> dict[str, float]:
+        try:
+            parsed = json.loads(str(value or "{}"))
+            return {
+                str(key): float(number)
+                for key, number in parsed.items()
+                if number is not None and float(number) > 0
+            }
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+
+    def _evaluate(
+        self,
+        side: str,
+        return_pct: float,
+        relative_return_pct: float | None,
+        minutes_below_5: float,
+        minutes_below_10: float,
+        previous_return_pct: float | None,
+        funding: float | None,
+        open_interest_change_pct: float | None,
+    ) -> tuple[str, list[str], str]:
+        watch = self.settings.position_risk_watch_loss_pct * 100
+        freeze = self.settings.position_risk_add_freeze_loss_pct * 100
+        impaired = self.settings.position_risk_impaired_loss_pct * 100
+        relative = self.settings.position_risk_relative_weakness_pct * 100
+        exit_relative = self.settings.position_risk_exit_relative_pct * 100
+        loss = max(0.0, -return_pct)
+        reasons: list[str] = []
+        if loss >= watch:
+            reasons.append(f"loss>={watch:.1f}%")
+        if relative_return_pct is not None and relative_return_pct <= -relative:
+            reasons.append(f"relative_weakness>={relative:.1f}%")
+
+        state = "HEALTHY"
+        action = "NONE"
+        if loss >= watch or (
+            relative_return_pct is not None and relative_return_pct <= -relative
+        ):
+            state, action = "WATCH", "MONITOR"
+        if loss >= freeze or (
+            loss >= watch
+            and relative_return_pct is not None
+            and relative_return_pct <= -relative
+            and minutes_below_5 >= self.settings.position_risk_watch_minutes
+        ):
+            state, action = "ADD_FROZEN", "WOULD_FREEZE_ADDS"
+            reasons.append("addition_freeze_threshold")
+        if (
+            loss >= impaired
+            and minutes_below_10 >= self.settings.position_risk_impaired_minutes
+        ):
+            state, action = "THESIS_IMPAIRED", "WOULD_REQUIRE_REVIEW"
+            reasons.append(
+                f"minutes_below_10>={self.settings.position_risk_impaired_minutes}"
+            )
+
+        worsening = (
+            previous_return_pct is not None
+            and return_pct <= previous_return_pct - 0.5
+        )
+        adverse_funding_oi = (
+            funding is not None
+            and open_interest_change_pct is not None
+            and open_interest_change_pct >= 2.0
+            and ((side == "LONG" and funding > 0) or (side == "SHORT" and funding < 0))
+        )
+        if (
+            state == "THESIS_IMPAIRED"
+            and minutes_below_10 >= self.settings.position_risk_exit_minutes
+            and relative_return_pct is not None
+            and relative_return_pct <= -exit_relative
+            and (worsening or adverse_funding_oi)
+        ):
+            state, action = "EXIT_CANDIDATE", "WOULD_EXIT"
+            reasons.append(
+                "confirmation=" + ("worsening_price" if worsening else "adverse_funding_oi")
+            )
+        return state, list(dict.fromkeys(reasons)), action
+
+    def observe(self, now: float | None = None) -> int:
+        if not self.settings.position_risk_shadow_enabled:
+            return 0
+        now = unix_now() if now is None else now
+        positions = self.store.paper_positions()
+        if not positions:
+            return 0
+        contexts_method = getattr(self.platform, "market_contexts", None)
+        contexts = contexts_method() if callable(contexts_method) else {}
+        contexts = contexts if isinstance(contexts, dict) else {}
+        prices: dict[str, float] = {}
+        for coin in set(positions) | set(self.benchmarks):
+            price = self.platform.mid_price(coin)
+            if price is not None and float(price) > 0:
+                prices[coin] = float(price)
+
+        recorded = 0
+        for coin, position in positions.items():
+            side = str(position["side"])
+            opened_at = str(position["opened_at"])
+            previous = self.store.latest_position_risk_snapshot(coin, side, opened_at)
+            if (
+                previous is not None
+                and now - float(previous["observed_unix"])
+                < self.settings.position_risk_interval_seconds
+            ):
+                continue
+            mark = prices.get(coin)
+            entry = float(position["entry_price"])
+            if mark is None or entry <= 0:
+                continue
+            direction = 1.0 if side == "LONG" else -1.0
+            return_pct = (mark - entry) / entry * direction * 100.0
+            relative_anchor = (
+                float(previous["relative_anchor_price"])
+                if previous is not None
+                and float(previous["relative_anchor_price"] or 0) > 0
+                else mark
+            )
+            monitored_return = (
+                (mark - relative_anchor) / relative_anchor * direction * 100.0
+                if relative_anchor > 0 else 0.0
+            )
+
+            benchmark_symbols = [b for b in self.benchmarks if b != coin and b in prices]
+            benchmark_entries = (
+                self._json_dict(previous["benchmark_entry_prices"])
+                if previous is not None
+                else {}
+            )
+            for benchmark in benchmark_symbols:
+                benchmark_entries.setdefault(benchmark, prices[benchmark])
+            benchmark_returns = [
+                (prices[symbol] - benchmark_entries[symbol])
+                / benchmark_entries[symbol]
+                * direction
+                * 100.0
+                for symbol in benchmark_symbols
+                if benchmark_entries.get(symbol, 0) > 0
+            ]
+            benchmark_return = (
+                sum(benchmark_returns) / len(benchmark_returns)
+                if benchmark_returns else None
+            )
+            relative_return = (
+                monitored_return - benchmark_return
+                if benchmark_return is not None else None
+            )
+
+            context = contexts.get(coin, {})
+            funding = context.get("funding") if isinstance(context, dict) else None
+            open_interest = (
+                context.get("open_interest") if isinstance(context, dict) else None
+            )
+            day_volume = context.get("day_volume") if isinstance(context, dict) else None
+            previous_oi = previous["open_interest"] if previous is not None else None
+            oi_change = None
+            if open_interest is not None and previous_oi not in (None, 0):
+                oi_change = (
+                    (float(open_interest) - float(previous_oi))
+                    / float(previous_oi)
+                    * 100.0
+                )
+
+            delta_minutes = 0.0
+            if previous is not None:
+                delta_minutes = max(
+                    0.0,
+                    min(
+                        now - float(previous["observed_unix"]),
+                        self.settings.position_risk_interval_seconds * 2,
+                    ) / 60.0,
+                )
+            below_5 = float(previous["minutes_below_5"] if previous else 0.0)
+            below_10 = float(previous["minutes_below_10"] if previous else 0.0)
+            below_15 = float(previous["minutes_below_15"] if previous else 0.0)
+            if return_pct <= -5.0:
+                below_5 += delta_minutes
+            if return_pct <= -10.0:
+                below_10 += delta_minutes
+            if return_pct <= -15.0:
+                below_15 += delta_minutes
+            state, reasons, action = self._evaluate(
+                side, return_pct, relative_return, below_5, below_10,
+                float(previous["return_pct"]) if previous is not None else None,
+                float(funding) if funding is not None else None,
+                oi_change,
+            )
+            observed_at = datetime.fromtimestamp(now, timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            self.store.record_position_risk_snapshot(
+                {
+                    "observed_unix": now,
+                    "observed_at": observed_at,
+                    "coin": coin,
+                    "side": side,
+                    "opened_at": opened_at,
+                    "entry_price": entry,
+                    "mark_price": mark,
+                    "relative_anchor_price": relative_anchor,
+                    "return_pct": return_pct,
+                    "benchmark_symbols": json.dumps(benchmark_symbols),
+                    "benchmark_entry_prices": json.dumps(
+                        benchmark_entries, sort_keys=True, separators=(",", ":")
+                    ),
+                    "benchmark_return_pct": benchmark_return,
+                    "relative_return_pct": relative_return,
+                    "funding": funding,
+                    "open_interest": open_interest,
+                    "open_interest_change_pct": oi_change,
+                    "day_volume": day_volume,
+                    "minutes_below_5": below_5,
+                    "minutes_below_10": below_10,
+                    "minutes_below_15": below_15,
+                    "state": state,
+                    "reasons": json.dumps(reasons, separators=(",", ":")),
+                    "shadow_action": action,
+                }
+            )
+            recorded += 1
+        return recorded
+
 
 # ---------------------------------------------------------------------------
 # Portfolio and risk
@@ -5172,8 +5591,8 @@ class Reconciler:
         if not slices:
             return
 
-        now = unix_now()
-        for pos in list(slices):
+        eligible: dict[int, tuple[sqlite3.Row, str]] = {}
+        for pos in slices:
             coin = str(pos["coin"])
             try:
                 opened = datetime.strptime(pos["opened_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
@@ -5181,16 +5600,13 @@ class Reconciler:
             except Exception:
                 age_days = 0
             if age_days > self.settings.max_position_days:
-                self._force_close(
-                    coin, pos["source_wallet"], pos["side"], "position timeout",
-                    f"reconcile:slice:{int(pos['id'])}:close",
-                )
+                eligible[int(pos["id"])] = (pos, "position timeout")
 
         for wallet in wallets:
             current = self.platform.positions(wallet)
             if current is None:
                 continue
-            for pos in list(self.store.open_position_slices()):
+            for pos in slices:
                 coin = str(pos["coin"])
                 if pos["source_wallet"] != wallet:
                     continue
@@ -5198,10 +5614,120 @@ class Reconciler:
                 if source and source.side == pos["side"]:
                     continue
                 reason = "source closed" if source is None else "source flipped"
+                eligible.setdefault(int(pos["id"]), (pos, f"reconcile: {reason}"))
+
+        grouped: dict[tuple[str, str], list[tuple[sqlite3.Row, str]]] = {}
+        for pos, reason in eligible.values():
+            grouped.setdefault((str(pos["coin"]), str(pos["side"])), []).append(
+                (pos, reason)
+            )
+
+        for (coin, side), rows in grouped.items():
+            price = self.platform.mid_price(coin)
+            all_side_slices = [
+                pos for pos in self.store.open_position_slices(coin)
+                if str(pos["side"]) == side
+            ]
+            all_slices_are_dust = (
+                price is not None
+                and bool(all_side_slices)
+                and all(
+                    float(pos["filled_size"] or 0) * price
+                    < self.settings.min_order_notional
+                    for pos in all_side_slices
+                )
+            )
+            sweep_size = sum(float(pos["filled_size"] or 0) for pos in all_side_slices)
+            if (
+                self.settings.live
+                and price is not None
+                and all_slices_are_dust
+                and sweep_size * price >= self.settings.min_order_notional
+            ):
+                reasons = {int(pos["id"]): reason for pos, reason in rows}
+                sweep_rows = [
+                    (
+                        pos,
+                        reasons.get(
+                            int(pos["id"]),
+                            "residual companion swept with sub-minimum exit",
+                        ),
+                    )
+                    for pos in all_side_slices
+                ]
+                self._force_close_group(coin, side, sweep_rows, price)
+                continue
+            for pos, reason in rows:
                 self._force_close(
-                    coin, wallet, pos["side"], f"reconcile: {reason}",
+                    coin, str(pos["source_wallet"]), side, reason,
                     f"reconcile:slice:{int(pos['id'])}:close",
                 )
+
+    def _force_close_group(
+        self,
+        coin: str,
+        side: str,
+        rows: list[tuple[sqlite3.Row, str]],
+        price: float,
+    ) -> None:
+        slice_ids = sorted(int(pos["id"]) for pos, _ in rows)
+        wallets = list(dict.fromkeys(str(pos["source_wallet"]) for pos, _ in rows))
+        aggregate_size = sum(float(pos["filled_size"] or 0) for pos, _ in rows)
+        all_coin_slices = self.store.open_position_slices(coin)
+        closing_entire_position = {
+            int(pos["id"]) for pos in all_coin_slices if str(pos["side"]) == side
+        } == set(slice_ids)
+        close_size = None if closing_entire_position else aggregate_size
+        intent_key = f"reconcile:aggregate:{coin}:{side}:{'-'.join(map(str, slice_ids))}:close"
+        reason = f"aggregate residual close slices={','.join(map(str, slice_ids))}"
+
+        if self.settings.live and self.store.coin_quarantine(coin) is not None:
+            quarantine = self.store.coin_quarantine(coin)
+            detail = f"{reason}; coin quarantined: {quarantine['reason']}"
+            for wallet in wallets:
+                self.store.log_signal(wallet, coin, side, "EXIT", price, "SKIPPED", detail)
+            print(f"[RECONCILE] Skip {coin} {side}: {detail}")
+            return
+
+        if isinstance(self.platform, HyperliquidAdapter):
+            execution = self.platform.close_position(
+                coin, close_size, price, intent_key
+            )
+        else:
+            execution = self.platform.close_position(coin, close_size, price)
+        if not execution:
+            current_intent = self.store.execution_intent(intent_key)
+            if current_intent is not None and current_intent["state"] in {
+                "PREPARED", "SUBMITTING", "AMBIGUOUS",
+            }:
+                raise RuntimeError(
+                    f"aggregate reconciliation intent {intent_key} remains unresolved: "
+                    f"{execution.detail or execution.status}"
+                )
+            for wallet in wallets:
+                self.store.log_signal(
+                    wallet, coin, side, "EXIT", price, "SKIPPED",
+                    f"{reason}; live close failed",
+                )
+            print(f"[RECONCILE] Aggregate close failed {coin} {side}")
+            return
+
+        exit_price = execution.avg_fill_price or price
+        price_source = "exchange_fill" if execution.avg_fill_price else "midpoint_estimate"
+        for wallet in wallets:
+            while self.paper.owns_position(wallet, coin, side):
+                gain, pnl_pct, _ = self.paper.close(wallet, coin, side, exit_price)
+                if gain is None:
+                    break
+                self.store.log_signal(
+                    wallet, coin, side, "EXIT", exit_price, "EXECUTED",
+                    f"{reason}; price_source={price_source} quote={price:g}",
+                    gain, pnl_pct,
+                )
+        print(
+            f"[RECONCILE] Closed aggregate residual {coin} {side}: "
+            f"size={aggregate_size:g} slices={','.join(map(str, slice_ids))}"
+        )
 
     def _force_close(
         self, coin: str, wallet: str, side: str, reason: str,
@@ -5315,6 +5841,7 @@ class CopyTradingBot:
         self.risk = RiskManager(settings, self.store, self.notifier)
         self.scoring_engine = ScoringEngine(settings, self.store)
         self.token_risk = TokenRiskMonitor(settings, self.store)
+        self.position_risk = PositionRiskMonitor(settings, self.store, self.platform)
         self.roster = RosterService(settings, self.store, self.platform)
         self.monitor = WalletMonitor(settings, self.store, self.platform)
         self.reconciler = Reconciler(settings, self.store, self.platform, self.paper, self.risk)
@@ -5544,6 +6071,17 @@ class CopyTradingBot:
                 else:
                     self._reconcile_live_book(live_positions)
                     live_held = set(live_positions.keys())
+            position_risk = getattr(self, "position_risk", None)
+            if position_risk is not None:
+                try:
+                    recorded = position_risk.observe()
+                    if recorded:
+                        print(f"[POSITION-RISK] recorded {recorded} shadow snapshot(s)")
+                except Exception as exc:
+                    self.store.log_api_failure(
+                        self.platform.name, "position_risk_shadow", "", str(exc)
+                    )
+                    print(f"[POSITION-RISK] shadow snapshot failed: {exc}")
             if unix_now() - last_reconcile >= self.settings.reconcile_seconds:
                 if not self.settings.live or live_held is not None:
                     self.reconciler.run(scan_wallets)

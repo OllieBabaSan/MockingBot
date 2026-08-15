@@ -184,6 +184,24 @@ class ParityTests(unittest.TestCase):
         self.assertEqual(result["classification"], "EXPECTED_ENVIRONMENT_VARIANCE")
         self.assertIn(result["classification"], compare.NON_ISSUE_CLASSIFICATIONS)
 
+    def test_same_action_with_dynamic_score_and_reason_is_expected_variance(self) -> None:
+        paper = self.row(1, "paper-main", "2026-07-15 01:00:00")
+        live = self.row(2, "live-main", "2026-07-15 01:00:10")
+        live["wallet_score"] = 59.2
+        live["reason"] = "position cap; active risk 7.5"
+
+        result = compare.compare([paper], [live], 180)[0]
+
+        self.assertEqual(result["classification"], "EXPECTED_STATE_VARIANCE")
+
+    def test_five_minute_window_matches_delayed_cycle(self) -> None:
+        paper = self.row(1, "paper-main", "2026-07-15 01:00:00")
+        live = self.row(2, "live-main", "2026-07-15 01:03:10")
+
+        result = compare.compare([paper], [live], 300)[0]
+
+        self.assertEqual(result["classification"], "TIMING_VARIANCE")
+
     def test_policy_fingerprint_excludes_slots_but_includes_leverage(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             base = settings(Path(td), max_positions=10)
@@ -218,10 +236,20 @@ class ParityTests(unittest.TestCase):
         self.assertEqual(result["classification"], "PENDING_MATCH")
         self.assertIn("PENDING_MATCH", compare.NON_ISSUE_CLASSIFICATIONS)
 
-    def test_same_signal_different_score_is_alert(self) -> None:
+    def test_same_tier_score_drift_is_expected_variance(self) -> None:
         paper = self.row(1, "paper-main", "2026-07-15 01:00:00")
         live = self.row(2, "live-main", "2026-07-15 01:00:10")
         live["wallet_score"] = 61.0
+
+        result = compare.compare([paper], [live], 180)[0]
+
+        self.assertEqual(result["classification"], "EXPECTED_STATE_VARIANCE")
+        self.assertIn(result["classification"], compare.NON_ISSUE_CLASSIFICATIONS)
+
+    def test_same_signal_different_tier_is_alert(self) -> None:
+        paper = self.row(1, "paper-main", "2026-07-15 01:00:00")
+        live = self.row(2, "live-main", "2026-07-15 01:00:10")
+        live["wallet_tier"] = "Candidate"
 
         result = compare.compare([paper], [live], 180)[0]
 

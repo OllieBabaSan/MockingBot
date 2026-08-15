@@ -163,10 +163,92 @@ class DashboardModeTests(unittest.TestCase):
 
         self.assertEqual([row["coin"] for row in data["token_risk_alerts"]], ["NEW"])
 
+    def test_recent_closes_are_ordered_by_close_time_not_slice_id(self) -> None:
+        configured = settings(self.root / "recent-closes")
+        store = core.Store(configured.db_path)
+        try:
+            with store.conn:
+                store.conn.execute(
+                    """
+                    INSERT INTO paper_position_slices(
+                        coin, side, source_wallet, entry_price, cost_basis,
+                        leverage, opened_at, status, closed_at, exit_price,
+                        paper_gain, pnl_pct
+                    ) VALUES('KAITO','LONG',?,1.0,10.0,2.0,
+                             '2026-08-01 00:00:00','CLOSED',
+                             '2026-08-13 12:53:26',0.7,-6.0,-30.0)
+                    """,
+                    (TEST_USER,),
+                )
+                for index in range(11):
+                    store.conn.execute(
+                        """
+                        INSERT INTO paper_position_slices(
+                            coin, side, source_wallet, entry_price, cost_basis,
+                            leverage, opened_at, status, closed_at, exit_price,
+                            paper_gain, pnl_pct
+                        ) VALUES(?,?,?,1.0,10.0,2.0,
+                                 '2026-08-02 00:00:00','CLOSED',
+                                 ?,1.01,0.2,1.0)
+                        """,
+                        (f"COIN{index}", "LONG", TEST_USER, f"2026-08-12 12:{index:02d}:00"),
+                    )
+        finally:
+            store.conn.close()
+
+        with patch.object(dashboard, "MODE", "paper"), patch.object(
+            dashboard, "DB_PATH", configured.db_path
+        ), patch.object(dashboard, "live_prices", return_value=({}, "stored")):
+            data = dashboard.dashboard_data()
+
+        self.assertEqual(data["recent_closes"][0]["coin"], "KAITO")
+        self.assertEqual(len(data["recent_closes"]), 10)
+
+    def test_dashboard_exposes_latest_position_risk_shadow_state(self) -> None:
+        configured = settings(self.root / "position-risk")
+        store = core.Store(configured.db_path)
+        try:
+            store.commit_paper_open(
+                {"cash": 90.0, "realized_pnl": 0.0},
+                "RISK", "LONG", 100.0, 10.0, TEST_USER, 3.0,
+            )
+            opened_at = str(store.open_position_slices("RISK")[0]["opened_at"])
+            store.record_position_risk_snapshot(
+                {
+                    "observed_unix": 1_000.0,
+                    "observed_at": "2026-08-13 00:00:00",
+                    "coin": "RISK", "side": "LONG", "opened_at": opened_at,
+                    "entry_price": 100.0, "mark_price": 88.0,
+                    "relative_anchor_price": 100.0,
+                    "return_pct": -12.0, "benchmark_symbols": '["BTC"]',
+                    "benchmark_entry_prices": '{"BTC":100}',
+                    "benchmark_return_pct": 0.0, "relative_return_pct": -12.0,
+                    "funding": 0.0001, "open_interest": 1000.0,
+                    "open_interest_change_pct": 3.0, "day_volume": 1_000_000.0,
+                    "minutes_below_5": 60.0, "minutes_below_10": 30.0,
+                    "minutes_below_15": 0.0, "state": "ADD_FROZEN",
+                    "reasons": '["addition_freeze_threshold"]',
+                    "shadow_action": "WOULD_FREEZE_ADDS",
+                }
+            )
+        finally:
+            store.conn.close()
+
+        with patch.object(dashboard, "MODE", "paper"), patch.object(
+            dashboard, "DB_PATH", configured.db_path
+        ), patch.object(dashboard, "live_prices", return_value=({"RISK": 88.0}, "live")):
+            data = dashboard.dashboard_data()
+
+        self.assertEqual(data["positions"][0]["risk_state"], "ADD_FROZEN")
+        self.assertEqual(data["position_risk"][0]["shadow_action"], "WOULD_FREEZE_ADDS")
+        self.assertEqual(data["position_risk"][0]["reasons"], ["addition_freeze_threshold"])
+
     def test_html_has_unambiguous_mode_and_safety_panels(self) -> None:
         self.assertIn('id="mode-badge"', dashboard.HTML)
         self.assertIn('id="quarantine-section"', dashboard.HTML)
         self.assertIn('id="executions"', dashboard.HTML)
+        self.assertIn('id="position-risk"', dashboard.HTML)
+        self.assertIn('Position Risk Shadow', dashboard.HTML)
         self.assertIn('Token Risk Alerts (last 24 hours)', dashboard.HTML)
         self.assertIn('id="timezone"', dashboard.HTML)
         self.assertIn('hour12: true', dashboard.HTML)

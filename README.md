@@ -24,7 +24,7 @@ Start the live bot only through its preflight-gated launcher:
 # equivalent: python .\MockingBot.py start-live
 ```
 
-`start-live` forces live mode, four slots, the `live-main` instance identity,
+`start-live` forces live mode, seven slots, the `live-main` instance identity,
 and `MockingBot_Main_Live_Test_Data/` regardless of the calling shell's paper
 defaults. It holds the duplicate-instance lock throughout preflight and startup,
 and cannot continue to the trading loop unless every preflight gate passes.
@@ -161,11 +161,26 @@ use their perpetuals margin summary; Unified and Portfolio Margin accounts use
 USDC total and `tokenToAvailableAfterMaintenance` from the spot clearinghouse,
 which Hyperliquid defines as the authoritative unified balance state. Missing or
 internally inconsistent availability data blocks entries.
-The live 15% warning and 25% breaker use a persistent equity high-water mark,
-including gains observed after a restart. After an intentional deposit or
-withdrawal, explicitly rebase it to verified current equity with the no-order
-command `python .\MockingBot.py reset-live-risk-baseline`. The command is blocked
-while another live bot instance owns the data directory.
+Live drawdown protection uses persisted rolling equity history. The 24-hour
+window warns at 15% and blocks new entries for 24 hours at 25%; the seven-day
+window warns at 35% and blocks new entries for seven days at 50%. Neither
+breaker force-liquidates positions. The persistent all-time high-water remains
+diagnostic, and intentional deposits or withdrawals should be recorded through
+the supported capital-adjustment workflow rather than by resetting risk history.
+
+Position-level intervention research runs in shadow mode by default. Every five
+minutes (`POSITION_RISK_INTERVAL_SECS`), each open lifecycle records its signed
+unlevered return, time below 5%/10%/15% loss, BTC/ETH/SOL-relative return,
+funding, open interest, and volume in `position_risk_snapshots`. The states are
+`HEALTHY`, `WATCH`, `ADD_FROZEN`, `THESIS_IMPAIRED`, and `EXIT_CANDIDATE`.
+Shadow actions such as `WOULD_FREEZE_ADDS` and `WOULD_EXIT` are evidence only:
+they do not suppress signals or submit orders. The dashboards display the
+latest lifecycle state and evidence under **Position Risk Shadow**. Defaults
+watch at 7% loss, flag an addition freeze at 10%, require at least four hours
+below 10% plus a 15% loss for thesis impairment, and require six hours,
+benchmark-relative weakness, and price/funding confirmation for an exit
+candidate. Set `POSITION_RISK_SHADOW_ENABLED=0` to disable collection.
+
 Wallet quality is scored from allocation-independent percentage returns. Each
 copied exit is projected onto a fixed `$1,000` margin position at `3x` for the
 profitability component (`SCORING_REFERENCE_MARGIN_USD` and

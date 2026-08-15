@@ -1,6 +1,192 @@
 # MockingBot Codex Handoff
 
-Last updated: 2026-07-31
+Last updated: 2026-08-15
+
+## Immediate Restart Handoff - 2026-08-15
+
+Read this section first. Older sections below are historical and contain stale
+runtime snapshots.
+
+### Do Not Lose the Dirty MockingBot Worktree
+
+MockingBot is at committed HEAD `3305d51` (`Document seven-slot live
+configuration`), but the worktree is intentionally dirty. Do not reset,
+checkout, restore, or overwrite these files:
+
+- `CODEX_HANDOFF.md`
+- `MockingBot.py`
+- `MockingBot_Compare.py`
+- `MockingBot_Dashboard.py`
+- `README.md`
+- `tests/test_dashboard_modes.py`
+- `tests/test_execution_reconciliation.py`
+- `tests/test_position_risk_shadow.py`
+- `tests/test_sqlite_and_parity.py`
+
+The uncommitted work includes subsequent reconciliation/dashboard repairs and
+tests. The full suite passed after the latest work: `133` tests.
+
+### Position-Risk Shadow Layer
+
+A lifecycle-specific, observational position-risk monitor is now implemented.
+It writes five-minute snapshots to `position_risk_snapshots` for every open
+Paper and Live position and evaluates:
+
+- signed unlevered return from the actual entry;
+- cumulative time below 5%, 10%, and 15% loss;
+- performance since monitoring began versus BTC, ETH, and SOL;
+- Hyperliquid funding, open interest/change, and 24-hour notional volume;
+- `HEALTHY`, `WATCH`, `ADD_FROZEN`, `THESIS_IMPAIRED`, and
+  `EXIT_CANDIDATE` counterfactual states.
+
+This is deliberately shadow-only. `WOULD_FREEZE_ADDS`,
+`WOULD_REQUIRE_REVIEW`, and `WOULD_EXIT` never alter signal acceptance or place
+orders. Both dashboards expose the latest state, relative return, underwater
+duration, action, and evidence in the **Position Risk Shadow** table. Tests are
+in `tests/test_position_risk_shadow.py` and `tests/test_dashboard_modes.py`.
+
+Default thresholds are 7% watch, 10% addition-freeze candidate, 15% impairment,
+four hours below 10% for impairment, and six hours below 10% plus at least 5%
+relative weakness and worsening price or adverse funding/open-interest
+confirmation for an exit candidate. Collect a meaningful sample before any
+state is connected to execution.
+
+Deployment verification on 2026-08-15:
+
+- Full suite: `133` tests passed; compilation and `git diff --check` passed.
+- Live preflight: passed with synchronized positions and no orders submitted.
+- Paper and Live engines were restarted silently and each recorded four initial
+  position-risk snapshots.
+- Paper and Live dashboards were restarted on ports `8765` and `8766` and each
+  API matched all four open lifecycles to four risk snapshots.
+- Initial lifecycles were BTC long, ETH long, SOL long, and PUMP short; all were
+  `HEALTHY`. Relative returns begin at zero by design and become meaningful
+  after subsequent five-minute samples.
+
+### KAITO Close and Dashboard Repair
+
+The large `KAITO LONG` is no longer open. Both Paper and Live closed it on
+2026-08-13 after the source wallet exited:
+
+- Live close: `698 KAITO` at `0.448245`, confirmed by execution audit with
+  `remaining=0`.
+- Live slices `156` and `157` realized `-$119.66` and `-$26.19`, or
+  `-$145.85` combined.
+- Paper slices `312` and `313` realized `-$1,364.45` and `-$1,002.80` under
+  Paper's larger allocation scale.
+- The exchange-backed `live_position_snapshot` contains BTC, ETH, SOL, and
+  RENDER only; KAITO is absent because the close completed.
+
+KAITO disappeared from both dashboards' Recent Closes even though it closed
+most recently. Root cause: `MockingBot_Dashboard.py` sorted closed slices by
+descending slice `id`, not `closed_at`. Older KAITO slices were excluded by the
+ten-row limit after newer slices had been created.
+
+Uncommitted fix:
+
+```sql
+ORDER BY datetime(slices.closed_at) DESC, slices.id DESC
+```
+
+Regression test
+`test_recent_closes_are_ordered_by_close_time_not_slice_id` was added. Both
+dashboard processes were restarted after the edit. Direct database queries
+now put the two KAITO slices first in Recent Closes for both instances.
+
+The final HTTP API verification was aborted/timed out because of the local
+port collision described below. Do not interpret that timeout as a bot or
+database failure. The SQL correction and all `129` tests passed.
+
+### StonkBot Is a Separate VPS System
+
+StonkBot began as OndoBot and is now in a separate private repository:
+
+- Local repository: `C:\Users\user\Documents\StonkBot`
+- GitHub: `https://github.com/OllieBabaSan/StonkBot`
+- Current clean HEAD: `2fee64c` (`Add VPS monitoring dashboard`)
+- VPS: `root@159.195.216.100`
+- VPS host: `v2202608391116492811`
+- SSH key: `C:\Users\user\Documents\OndoBot Keys\netcup_ondo_ed25519`
+  (never print or commit its contents)
+
+Verified active VPS services:
+
+- `stonkbot-event-collector.service`
+- `stonkbot-primary-source.service`
+- `stonkbot-benzinga.service`
+- `stonkbot-commodity.service`
+- `stonkbot-dashboard.service`
+
+The StonkBot dashboard is read-only and binds only to VPS
+`127.0.0.1:8765`. The VPS firewall still exposes only SSH. The dashboard was
+verified at HTTP 200 and its live API reported a roughly 148 MB database,
+29,245 Benzinga earnings snapshots, 250,946 ten-second price points, 189
+primary-source detections, and 127,089 commodity price snapshots at deployment.
+
+### Aborted Local StonkBot Process
+
+The attempt to make Windows the permanent StonkBot collector host was
+explicitly abandoned. A `Start-StonkBot.ps1` five-process supervisor was
+created and committed in the StonkBot repository during investigation, but the
+user decided collection must remain on the VPS. Do not run that supervisor and
+do not run the five StonkBot collectors locally.
+
+One legacy local collector predates that decision and was still running at
+handoff as PID `21496`:
+
+```text
+C:\Users\user\Documents\Codex\2026-07-29\ondo_forward_collector.py
+```
+
+It is not the authoritative integrated collector stack. After restart, leave
+it stopped; the four VPS collectors are authoritative. Do not restart it.
+
+Testing of third-party Git-repository bots, including Hummingbot, remains on
+hold. MockingBot and StonkBot are not on hold.
+
+### Dashboard Port Collision and Correct URLs
+
+The first StonkBot SSH tunnel incorrectly used local port `8765`, which is
+already MockingBot Paper's port. At handoff, SSH PID `35824` still used:
+
+```text
+-L 8765:127.0.0.1:8765
+```
+
+This caused `localhost:8765` to resolve inconsistently between the VPS
+StonkBot dashboard and local MockingBot Paper dashboard. It also explains why
+KAITO could never appear on the visible StonkBot screen: StonkBot monitors
+earnings data, not Hyperliquid copy trades.
+
+After restart, use three distinct ports:
+
+- MockingBot Paper: `http://127.0.0.1:8765`
+- MockingBot Live: `http://127.0.0.1:8766`
+- StonkBot VPS tunnel: `http://localhost:8775`
+
+Start the StonkBot tunnel with:
+
+```powershell
+ssh -N -o ServerAliveInterval=30 -o ExitOnForwardFailure=yes -L 8775:127.0.0.1:8765 -i "C:\Users\user\Documents\OndoBot Keys\netcup_ondo_ed25519" root@159.195.216.100
+```
+
+Do not reuse local port `8765` for the tunnel.
+
+### Processes at Handoff
+
+These process IDs are only diagnostic snapshots and will change after a
+Windows restart:
+
+- MockingBot Paper engine: PID `25184`
+- MockingBot Live engine: PID `27168`
+- MockingBot dashboards: PIDs `37572` and `5004`
+- Conflicting old StonkBot SSH tunnel: PID `35824`
+- Obsolete local Ondo collector: PID `21496`
+
+For an application/session restart rather than a Windows restart, do not stop
+the two MockingBot engines. Stop/recreate only the conflicting SSH tunnel as
+needed. For a Windows restart, use the normal MockingBot preflight and launch
+discipline documented below, then establish the StonkBot tunnel on port 8775.
 
 ## Resume Here
 
@@ -14,9 +200,10 @@ Repository:
 
 Branch: `main`
 
-Latest code commit before this handoff: see `git log -1` (rolling live breaker update).
+Latest committed MockingBot revision is `3305d51`; newer work is uncommitted as
+documented in the Immediate Restart Handoff above.
 
-The source working tree was clean before this documentation update.
+The source working tree is not clean. Preserve and inspect all existing edits.
 
 The main Paper and Live bots currently run together. Paper is the canonical
 signal/roster source; Live imports Paper's completed canonical events in source
@@ -24,6 +211,15 @@ order and applies its own capital, slot, execution, and exchange constraints.
 This is a diagnostic training arrangement. Live must eventually be able to
 select and score independently, but do not remove the current dependency until
 parity confidence is materially stronger.
+
+On 2026-08-06, Live closed the trapped `0.25 HYPE LONG` residual at `55.751`.
+Execution intent `reconcile:aggregate:HYPE:LONG:61-102:close` is confirmed,
+the exchange reported `remaining=0`, and no HYPE slices remain open. The
+reconciler now sweeps same-side residual slices together when each slice is
+below the order minimum but their combined reduce-only close is viable. Once
+any dust slice is eligible to exit, other individually uncloseable companion
+slices may be included so the net exchange position can be flattened without
+adding exposure first. Regression coverage is included in the `128`-test suite.
 
 ## Current Runtime State
 
@@ -103,9 +299,11 @@ Live bot.
 - Per-wallet margin cap: `35%` of total book basis.
 - Leverage: tier-controlled, currently capped at `5x`; normal active positions
   have generally used `3x`.
-- Live drawdown warning: `15%`.
-- Live hard breaker: `25%` from persistent high-water. Breaker causes wind-down
-  and blocks new risk; it is not a reason to delete state or abandon the bot.
+- Live rolling 24-hour warning/breaker: `15%` / `25%`; a trip blocks new
+  entries for 24 hours without force-closing positions.
+- Live rolling seven-day warning/breaker: `35%` / `50%`; a trip blocks new
+  entries for seven days without force-closing positions.
+- Persistent high-water drawdown is diagnostic only.
 - Opposite-side replacement is allowed only when the incoming wallet has a
   strictly superior tier. A ranked reversal closes the incumbent side first.
 - Confirmed exchange fills are recorded even below normal minimum allocation.

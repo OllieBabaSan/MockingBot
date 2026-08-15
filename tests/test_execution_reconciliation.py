@@ -528,6 +528,24 @@ class ExecutionReconciliationTests(unittest.TestCase):
 
         self.assertIsNone(snapshot)
 
+    def test_unified_capital_contains_transport_failure(self) -> None:
+        class FailingInfo:
+            def spot_user_state(self, _wallet):
+                raise RuntimeError("429 Too Many Requests")
+
+        self.adapter._live_account_mode = lambda: "unifiedAccount"
+        self.adapter._info = FailingInfo()
+        self.adapter._exchange = object()
+
+        snapshot = core.HyperliquidAdapter.capital_snapshot(self.adapter)
+
+        self.assertIsNone(snapshot)
+        failure = self.store.conn.execute(
+            "SELECT operation, error FROM api_failures ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(failure["operation"], "unified_capital")
+        self.assertIn("429", failure["error"])
+
     def test_preflight_caps_order_by_verified_usable_margin(self) -> None:
         exchange = FakeExchange([])
         self.adapter._exchange = exchange
@@ -564,6 +582,13 @@ class ExecutionReconciliationTests(unittest.TestCase):
         self.assertEqual(result.filled_size, 0.12)
         self.assertEqual(exchange.opens, 1)
         self.assertIsNone(self.store.coin_quarantine("BTC"))
+        audit = self.store.conn.execute(
+            """SELECT reference_price, slippage_bps, price_source
+               FROM execution_audit ORDER BY id DESC LIMIT 1"""
+        ).fetchone()
+        self.assertEqual(audit["reference_price"], 100.0)
+        self.assertAlmostEqual(audit["slippage_bps"], 100.0)
+        self.assertEqual(audit["price_source"], "decision_price")
 
     def test_failed_submission_with_no_position_change_is_clean_failure(self) -> None:
         exchange = FakeExchange([])
@@ -804,6 +829,43 @@ class ExecutionReconciliationTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(signal["action"], "SKIPPED")
         self.assertIn("deferred sub-minimum partial close", signal["reason"])
+
+    def test_reconciler_aggregates_eligible_dust_slices_into_one_close(self) -> None:
+        paper = core.PaperPortfolio(self.settings, self.store)
+        for wallet in ("wallet-a", "wallet-b"):
+            paper.open(
+                wallet, "BTC", "LONG", 100, 2,
+                leverage=3, filled_size=0.06, confirmed_exchange_fill=True,
+            )
+
+        requested_sizes: list[float | None] = []
+        self.adapter.positions = lambda wallet: (
+            {} if wallet == "wallet-a"
+            else {"BTC": core.Position("BTC", "LONG", 1.0, 100.0)}
+        )
+        self.adapter.mid_price = lambda _coin: 100.0
+
+        def close_position(_coin, size=None, _price=None, _intent_key=None):
+            requested_sizes.append(size)
+            return core.ExecutionResult(
+                True, 0.12, 0.12, 99.0, status="filled", confirmed=True,
+            )
+
+        self.adapter.close_position = close_position
+        reconciler = core.Reconciler(
+            self.settings, self.store, self.adapter, paper,
+            core.RiskManager(self.settings, self.store, core.Notifier("")),
+        )
+
+        reconciler.run(["wallet-a", "wallet-b"])
+
+        self.assertEqual(requested_sizes, [None])
+        self.assertIsNone(paper.position("BTC"))
+        signals = self.store.conn.execute(
+            "SELECT action, reason FROM signals ORDER BY id"
+        ).fetchall()
+        self.assertEqual([row["action"] for row in signals], ["EXECUTED", "EXECUTED"])
+        self.assertTrue(all("aggregate residual close" in row["reason"] for row in signals))
 
     def test_reconciler_does_not_close_quarantined_live_coin(self) -> None:
         paper = core.PaperPortfolio(self.settings, self.store)
