@@ -44,6 +44,26 @@ Open the paper dashboard at `http://127.0.0.1:8765` and the live dashboard at
 `http://127.0.0.1:8766`. Each process is read-only and connects only to its
 own instance database.
 
+## Automatic Recovery
+
+Register the hidden per-user supervisor once from Administrator PowerShell:
+
+```powershell
+.\Install-MockingBot_Resilience.ps1
+```
+
+The installer also sets Windows Update to notify before download/install and
+disables scheduled automatic restart behavior. Updates must then be initiated
+manually during a maintenance window.
+
+The `MockingBot Supervisor` scheduled task starts at user logon and checks every
+minute that Paper, Live, and both dashboards are present. Live always restarts
+through its normal preflight-gated launcher. The supervisor uses instance-lock
+PIDs for the engines and ports `8765`/`8766` for the dashboards, so it does not
+duplicate healthy processes. Its event log is `MockingBot_Supervisor.log`.
+Disable the scheduled task before intentionally stopping MockingBot for
+maintenance.
+
 ## Elite Comparison Bot
 
 ```powershell

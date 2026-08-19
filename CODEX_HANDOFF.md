@@ -1,30 +1,51 @@
 # MockingBot Codex Handoff
 
-Last updated: 2026-08-15
+Last updated: 2026-08-19
 
-## Immediate Restart Handoff - 2026-08-15
+## Immediate Restart Handoff - 2026-08-19
 
 Read this section first. Older sections below are historical and contain stale
 runtime snapshots.
 
-### Do Not Lose the Dirty MockingBot Worktree
+### Repository Status
 
-MockingBot is at committed HEAD `3305d51` (`Document seven-slot live
-configuration`), but the worktree is intentionally dirty. Do not reset,
-checkout, restore, or overwrite these files:
+The reconciliation, dashboard, and position-risk work was committed as
+`e52ee8c` (`Harden live reconciliation and add position risk shadow`). The
+Windows recovery scripts described below are also committed; `git log -1` is
+the authoritative current revision. The latest application suite passed all
+`133` tests.
 
-- `CODEX_HANDOFF.md`
-- `MockingBot.py`
-- `MockingBot_Compare.py`
-- `MockingBot_Dashboard.py`
-- `README.md`
-- `tests/test_dashboard_modes.py`
-- `tests/test_execution_reconciliation.py`
-- `tests/test_position_risk_shadow.py`
-- `tests/test_sqlite_and_parity.py`
+### Windows Restart and Automatic Recovery
 
-The uncommitted work includes subsequent reconciliation/dashboard repairs and
-tests. The full suite passed after the latest work: `133` tests.
+On 2026-08-19, both bots and dashboards stopped because Windows Update rebooted
+the computer, not because MockingBot crashed. System event `1074` recorded a
+planned service-pack restart from `MoUsoCoreWorker.exe` at `01:44:17`, followed
+by a planned OS-upgrade restart from `TrustedInstaller.exe` at `01:48:17`.
+Both logs ended normally without a traceback.
+
+The machine now has these local Group Policy registry values under
+`HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU`:
+
+- `AUOptions=2` (notify before download/install);
+- `NoAutoUpdate=0`;
+- `NoAutoRebootWithLoggedOnUsers=1`;
+- `AlwaysAutoRebootAtScheduledTime=0`.
+
+`Install-MockingBot_Resilience.ps1` applies those settings, refreshes computer
+policy, and registers the hidden `MockingBot Supervisor` scheduled task. The
+task runs at logon for `lenovo\user`, at highest privilege, and executes
+`Start-MockingBot_Supervisor.ps1`. The supervisor checks every minute:
+
+- Paper and Live engine PIDs from their instance-lock files;
+- Paper dashboard port `8765`;
+- Live dashboard port `8766`.
+
+Live always restarts through `Start-MockingBot_Live.ps1`, preserving the full
+preflight gate. Healthy processes are not duplicated. Supervisor events are in
+the ignored `MockingBot_Supervisor.log`. A controlled test stopped the Paper
+dashboard PID; the supervisor detected the missing port on its next cycle and
+restored the API successfully. Disable the scheduled task before deliberately
+stopping MockingBot for maintenance.
 
 ### Position-Risk Shadow Layer
 
