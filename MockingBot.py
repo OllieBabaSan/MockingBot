@@ -256,6 +256,20 @@ class Settings:
     max_coin_margin_pct: float = env_float("MAX_COIN_MARGIN_PCT", 0.20)
     max_wallet_margin_pct: float = env_float("MAX_WALLET_MARGIN_PCT", 0.35)
     max_allocations_per_wallet_coin_side: int = env_int("MAX_ALLOCATIONS_PER_WALLET_COIN_SIDE", 2)
+    add_requires_profit: bool = env_bool("ADD_REQUIRES_PROFIT", True)
+    max_adds_per_wallet_coin_side: int = env_int("MAX_ADDS_PER_WALLET_COIN_SIDE", 1)
+    add_min_unlevered_pnl_pct: float = env_float("ADD_MIN_UNLEVERED_PNL_PCT", 0.0)
+    max_risk_per_trade_pct: float = env_float("MAX_RISK_PER_TRADE_PCT", 0.0075)
+    assumed_stop_loss_pct: float = env_float("ASSUMED_STOP_LOSS_PCT", 0.04)
+    live_daily_entry_lockout_pct: float = env_float("LIVE_DAILY_ENTRY_LOCKOUT_PCT", 0.03)
+    live_weekly_entry_lockout_pct: float = env_float("LIVE_WEEKLY_ENTRY_LOCKOUT_PCT", 0.08)
+    live_starting_equity_usd: float = env_float("LIVE_STARTING_EQUITY_USD", 0.0)
+    live_min_equity_pct_of_start: float = env_float("LIVE_MIN_EQUITY_PCT_OF_START", 0.50)
+    block_shorts_in_uptrend: bool = env_bool("BLOCK_SHORTS_IN_UPTREND", True)
+    trend_filter_benchmarks: str = env_str("TREND_FILTER_BENCHMARKS", "BTC,ETH")
+    trend_filter_short_ma_seconds: int = env_int("TREND_FILTER_SHORT_MA_SECS", 6 * 3600)
+    trend_filter_long_ma_seconds: int = env_int("TREND_FILTER_LONG_MA_SECS", 24 * 3600)
+    trend_filter_min_gain_pct: float = env_float("TREND_FILTER_MIN_GAIN_PCT", 0.01)
     same_wallet_add_threshold_pct: float = env_float("SAME_WALLET_ADD_THRESHOLD_PCT", 25.0)
     live_entry_event_max_age_seconds: int = env_int("LIVE_ENTRY_EVENT_MAX_AGE_SECS", 300)
     min_slot_usd: float = env_float("MIN_SLOT_USD", 5.0)
@@ -326,6 +340,10 @@ class Settings:
         return self.data_dir / "circuit_breaker.json"
 
     @property
+    def live_equity_floor_usd(self) -> float:
+        return self.live_starting_equity_usd * self.live_min_equity_pct_of_start
+
+    @property
     def monitor_log_path(self) -> Path:
         return Path(env_str("MOCKINGBOT_MONITOR_LOG", str(self.data_dir / "mockingbot_live.log")))
 
@@ -361,6 +379,20 @@ def settings_signature(settings: Settings) -> dict[str, Any]:
         "max_slices_per_coin": settings.max_slices_per_coin,
         "max_coin_margin_pct": settings.max_coin_margin_pct,
         "max_allocations_per_wallet_coin_side": settings.max_allocations_per_wallet_coin_side,
+        "add_requires_profit": settings.add_requires_profit,
+        "max_adds_per_wallet_coin_side": settings.max_adds_per_wallet_coin_side,
+        "add_min_unlevered_pnl_pct": settings.add_min_unlevered_pnl_pct,
+        "max_risk_per_trade_pct": settings.max_risk_per_trade_pct,
+        "assumed_stop_loss_pct": settings.assumed_stop_loss_pct,
+        "live_daily_entry_lockout_pct": settings.live_daily_entry_lockout_pct,
+        "live_weekly_entry_lockout_pct": settings.live_weekly_entry_lockout_pct,
+        "live_starting_equity_usd": settings.live_starting_equity_usd,
+        "live_min_equity_pct_of_start": settings.live_min_equity_pct_of_start,
+        "block_shorts_in_uptrend": settings.block_shorts_in_uptrend,
+        "trend_filter_benchmarks": settings.trend_filter_benchmarks,
+        "trend_filter_short_ma_seconds": settings.trend_filter_short_ma_seconds,
+        "trend_filter_long_ma_seconds": settings.trend_filter_long_ma_seconds,
+        "trend_filter_min_gain_pct": settings.trend_filter_min_gain_pct,
         "same_wallet_add_threshold_pct": settings.same_wallet_add_threshold_pct,
         "live_entry_event_max_age_seconds": settings.live_entry_event_max_age_seconds,
         "scoring_engine_active": settings.scoring_engine_active,
@@ -428,6 +460,26 @@ def validate_settings(settings: Settings) -> None:
         errors.append("MAX_SLICES_PER_COIN must be positive")
     if not 0 < settings.max_coin_margin_pct <= 1:
         errors.append("MAX_COIN_MARGIN_PCT must be between 0 and 1")
+    if settings.max_adds_per_wallet_coin_side < 0:
+        errors.append("MAX_ADDS_PER_WALLET_COIN_SIDE cannot be negative")
+    if settings.add_min_unlevered_pnl_pct < 0:
+        errors.append("ADD_MIN_UNLEVERED_PNL_PCT cannot be negative")
+    if not 0 < settings.max_risk_per_trade_pct < 1:
+        errors.append("MAX_RISK_PER_TRADE_PCT must be between 0 and 1")
+    if not 0 < settings.assumed_stop_loss_pct < 1:
+        errors.append("ASSUMED_STOP_LOSS_PCT must be between 0 and 1")
+    if not 0 <= settings.live_daily_entry_lockout_pct < settings.max_drawdown_pct:
+        errors.append("LIVE_DAILY_ENTRY_LOCKOUT_PCT must be between 0 and MAX_DRAWDOWN_PCT")
+    if not 0 <= settings.live_weekly_entry_lockout_pct < settings.weekly_max_drawdown_pct:
+        errors.append("LIVE_WEEKLY_ENTRY_LOCKOUT_PCT must be between 0 and WEEKLY_MAX_DRAWDOWN_PCT")
+    if settings.live_starting_equity_usd < 0:
+        errors.append("LIVE_STARTING_EQUITY_USD cannot be negative")
+    if not 0 < settings.live_min_equity_pct_of_start <= 1:
+        errors.append("LIVE_MIN_EQUITY_PCT_OF_START must be between 0 and 1")
+    if not 0 <= settings.trend_filter_min_gain_pct < 1:
+        errors.append("TREND_FILTER_MIN_GAIN_PCT must be between 0 and 1")
+    if not 0 < settings.trend_filter_short_ma_seconds < settings.trend_filter_long_ma_seconds:
+        errors.append("trend filter windows must satisfy 0 < short < long")
     if not 0.001 <= settings.slippage <= 0.02:
         errors.append("SLIPPAGE must be between 0.001 (0.1%) and 0.02 (2%)")
     if not 1 <= settings.max_leverage_cap <= 5:
@@ -3344,6 +3396,19 @@ class HyperliquidAdapter(PlatformAdapter):
             )
             return result
 
+        marker_active = False
+        if self.settings.circuit_breaker_file.exists():
+            try:
+                payload = json.loads(
+                    self.settings.circuit_breaker_file.read_text(encoding="utf-8")
+                )
+                expires_unix = payload.get("expires_unix")
+                marker_active = expires_unix is None or float(expires_unix) > unix_now()
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                marker_active = True
+        if self.settings.wind_down or marker_active:
+            return reject("wind-down active", status="wind_down")
+
         try:
             existing_leverage = self.store.position_leverage(coin)
         except RuntimeError as exc:
@@ -4748,6 +4813,189 @@ class RiskManager:
             "weekly_drawdown": self.drawdown(weekly_reference, current_value),
         }
 
+    def entry_lockout_reason(self, rolling_risk: dict[str, float] | None) -> str | None:
+        if not self.settings.live or rolling_risk is None:
+            return None
+        current = rolling_risk["current_value"]
+        floor = self.settings.live_equity_floor_usd
+        if floor > 0 and current <= floor:
+            return (
+                f"live equity floor: ${current:,.2f} <= ${floor:,.2f} "
+                f"({self.settings.live_min_equity_pct_of_start:.0%} of "
+                f"${self.settings.live_starting_equity_usd:,.2f} starting equity)"
+            )
+        daily = rolling_risk["daily_drawdown"]
+        weekly = rolling_risk["weekly_drawdown"]
+        if (
+            self.settings.live_weekly_entry_lockout_pct > 0
+            and weekly >= self.settings.live_weekly_entry_lockout_pct
+        ):
+            return (
+                f"weekly entry lockout: 7d drawdown {weekly:.1%} >= "
+                f"{self.settings.live_weekly_entry_lockout_pct:.1%}"
+            )
+        if (
+            self.settings.live_daily_entry_lockout_pct > 0
+            and daily >= self.settings.live_daily_entry_lockout_pct
+        ):
+            return (
+                f"daily entry lockout: 24h drawdown {daily:.1%} >= "
+                f"{self.settings.live_daily_entry_lockout_pct:.1%}"
+            )
+        return None
+
+    @staticmethod
+    def _slice_unlevered_pnl_pct(row: sqlite3.Row, price: float) -> float | None:
+        entry = float(row["entry_price"])
+        if entry <= 0 or price <= 0:
+            return None
+        pnl = (price - entry) / entry * 100
+        if str(row["side"]) == "SHORT":
+            pnl = -pnl
+        return pnl
+
+    def add_decision(
+        self, wallet: str, coin: str, side: str, price: float
+    ) -> TradeDecision:
+        if not self.settings.add_requires_profit:
+            return TradeDecision("EXECUTE")
+        wallet_slices = [
+            row for row in self.store.open_position_slices(coin)
+            if str(row["source_wallet"]) == wallet and str(row["side"]) == side
+        ]
+        if not wallet_slices:
+            return TradeDecision("SKIP", "add blocked: no existing wallet slice")
+        max_total_allocations = 1 + max(0, self.settings.max_adds_per_wallet_coin_side)
+        if len(wallet_slices) >= max_total_allocations:
+            return TradeDecision(
+                "SKIP",
+                (
+                    "add blocked: max adds reached "
+                    f"({len(wallet_slices) - 1}/{self.settings.max_adds_per_wallet_coin_side})"
+                ),
+            )
+        first_slice = min(wallet_slices, key=lambda row: str(row["opened_at"]))
+        pnl_pct = self._slice_unlevered_pnl_pct(first_slice, price)
+        if pnl_pct is None:
+            return TradeDecision("SKIP", "add blocked: first slice pnl unavailable")
+        if pnl_pct <= self.settings.add_min_unlevered_pnl_pct:
+            return TradeDecision(
+                "SKIP",
+                (
+                    "add blocked: first slice not profitable "
+                    f"({pnl_pct:+.2f}% <= {self.settings.add_min_unlevered_pnl_pct:+.2f}%)"
+                ),
+            )
+        return TradeDecision("EXECUTE")
+
+    def cap_trade_cost_by_risk(
+        self,
+        requested_cost: float,
+        account_value: float | None,
+        leverage: float,
+    ) -> tuple[float | None, str | None]:
+        if requested_cost <= 0:
+            return None, "risk sizing blocked: no requested cost"
+        if (
+            self.settings.max_risk_per_trade_pct <= 0
+            or self.settings.assumed_stop_loss_pct <= 0
+            or leverage <= 0
+        ):
+            return round(requested_cost, 2), None
+        equity = account_value if account_value is not None else requested_cost
+        if equity <= 0:
+            return None, "risk sizing blocked: equity unavailable"
+        max_loss = equity * self.settings.max_risk_per_trade_pct
+        max_cost = max_loss / (leverage * self.settings.assumed_stop_loss_pct)
+        capped = min(requested_cost, max_cost)
+        if capped < self.settings.min_slot_usd:
+            return (
+                None,
+                (
+                    "risk sizing blocked: capped slot "
+                    f"${capped:.2f} < ${self.settings.min_slot_usd:.2f}"
+                ),
+            )
+        reason = None
+        if capped < requested_cost:
+            reason = (
+                f"risk capped slot ${requested_cost:.2f}->${capped:.2f} "
+                f"(max loss {self.settings.max_risk_per_trade_pct:.2%}, "
+                f"assumed stop {self.settings.assumed_stop_loss_pct:.2%})"
+            )
+        return round(capped, 2), reason
+
+    def record_trend_samples(self, platform: PlatformAdapter) -> None:
+        if not self.settings.block_shorts_in_uptrend:
+            return
+        now = unix_now()
+        benchmarks = [
+            coin.strip().upper()
+            for coin in self.settings.trend_filter_benchmarks.split(",")
+            if coin.strip()
+        ]
+        if not benchmarks:
+            return
+        samples = self.store.get_json("trend_filter_samples", {})
+        if not isinstance(samples, dict):
+            samples = {}
+        keep_after = now - max(
+            self.settings.trend_filter_long_ma_seconds * 3,
+            self.settings.trend_filter_short_ma_seconds * 3,
+            86400,
+        )
+        changed = False
+        for coin in benchmarks:
+            price = platform.mid_price(coin)
+            if not price or price <= 0:
+                continue
+            rows = [
+                row for row in samples.get(coin, [])
+                if isinstance(row, dict) and float(row.get("ts", 0) or 0) >= keep_after
+            ]
+            if not rows or now - float(rows[-1].get("ts", 0) or 0) >= 300:
+                rows.append({"ts": now, "price": float(price)})
+                changed = True
+            samples[coin] = rows
+        if changed:
+            self.store.set_json("trend_filter_samples", samples)
+
+    def short_trend_filter_reason(self, side: str) -> str | None:
+        if side != "SHORT" or not self.settings.block_shorts_in_uptrend:
+            return None
+        now = unix_now()
+        samples = self.store.get_json("trend_filter_samples", {})
+        if not isinstance(samples, dict):
+            return None
+        short_after = now - self.settings.trend_filter_short_ma_seconds
+        long_after = now - self.settings.trend_filter_long_ma_seconds
+        confirming: list[str] = []
+        for coin in [
+            item.strip().upper()
+            for item in self.settings.trend_filter_benchmarks.split(",")
+            if item.strip()
+        ]:
+            rows = [
+                row for row in samples.get(coin, [])
+                if isinstance(row, dict) and float(row.get("price", 0) or 0) > 0
+            ]
+            short_rows = [row for row in rows if float(row.get("ts", 0) or 0) >= short_after]
+            long_rows = [row for row in rows if float(row.get("ts", 0) or 0) >= long_after]
+            if not short_rows or len(long_rows) < 2:
+                continue
+            short_avg = sum(float(row["price"]) for row in short_rows) / len(short_rows)
+            long_avg = sum(float(row["price"]) for row in long_rows) / len(long_rows)
+            oldest = min(long_rows, key=lambda row: float(row.get("ts", 0) or 0))
+            latest = max(long_rows, key=lambda row: float(row.get("ts", 0) or 0))
+            gain = (float(latest["price"]) - float(oldest["price"])) / float(oldest["price"])
+            if short_avg > long_avg and gain >= self.settings.trend_filter_min_gain_pct:
+                confirming.append(
+                    f"{coin} short_ma>long_ma and {gain:+.1%} over trend window"
+                )
+        if confirming:
+            return "short blocked in broad uptrend: " + "; ".join(confirming)
+        return None
+
     def check_live_warning(self, risk: dict[str, float]) -> None:
         daily = risk["daily_drawdown"]
         weekly = risk["weekly_drawdown"]
@@ -6046,6 +6294,13 @@ class CopyTradingBot:
             wind_down = self.risk.is_wind_down() or breaker_tripped or (
                 self.settings.live and not equity_available
             )
+            entry_lockout = getattr(self.risk, "entry_lockout_reason", None)
+            entry_lockout_reason = (
+                entry_lockout(rolling_risk) if entry_lockout is not None else None
+            )
+            record_trends = getattr(self.risk, "record_trend_samples", None)
+            if record_trends is not None:
+                record_trends(self.platform)
 
             roster_check_interval = (
                 min(self.settings.roster_refresh_batch_seconds, 60)
@@ -6102,7 +6357,9 @@ class CopyTradingBot:
 
             for event in events:
                 if event.kind in {"ENTRY", "ADD"}:
-                    self._handle_entry(event, wind_down, live_held)
+                    self._handle_entry(
+                        event, wind_down, live_held, entry_lockout_reason
+                    )
                     if (
                         live_held is not None
                         and self.paper.position(event.coin) is not None
@@ -6443,7 +6700,13 @@ class CopyTradingBot:
             live_held.discard(victim_coin)
         return True
 
-    def _handle_entry(self, event: CopyEvent, wind_down: bool, live_held: set[str] | None) -> None:
+    def _handle_entry(
+        self,
+        event: CopyEvent,
+        wind_down: bool,
+        live_held: set[str] | None,
+        entry_lockout_reason: str | None = None,
+    ) -> None:
         self.token_risk.observe(event)
         event_identity = self._event_identity(event)
         recovery_key = (
@@ -6494,6 +6757,17 @@ class CopyTradingBot:
             print(f"[SKIP] {event.kind} {event.coin} {event.side}: live positions unknown")
             return
 
+        if entry_lockout_reason:
+            signal_id = self.store.log_signal(
+                event.wallet, event.coin, event.side, event.kind,
+                event.entry_price, "SKIPPED", entry_lockout_reason,
+            )
+            self.scoring_engine.observe_signal(
+                event, signal_id, "SKIPPED", entry_lockout_reason, event.entry_price
+            )
+            print(f"[SKIP] {event.kind} {event.coin} {event.side}: {entry_lockout_reason}")
+            return
+
         scoring_decision, scoring_score = self.scoring_engine.active_entry_decision(event)
         if scoring_decision.action != "EXECUTE":
             signal_id = self.store.log_signal(event.wallet, event.coin, event.side, event.kind, None, "SKIPPED", scoring_decision.reason)
@@ -6511,6 +6785,26 @@ class CopyTradingBot:
                 event, signal_id, "SKIPPED", reason, event.entry_price
             )
             print(f"[SKIP] {event.kind} {event.coin} {event.side}: {reason}")
+            return
+
+        price = self.platform.mid_price(event.coin) or event.entry_price
+        if not price:
+            signal_id = self.store.log_signal(event.wallet, event.coin, event.side, event.kind, None, "SKIPPED", "no price")
+            self.scoring_engine.observe_signal(event, signal_id, "SKIPPED", "no price", event.entry_price)
+            print(f"[SKIP] {event.kind} {event.coin}: no price")
+            return
+
+        trend_filter = getattr(self.risk, "short_trend_filter_reason", None)
+        trend_reason = trend_filter(event.side) if trend_filter is not None else None
+        if trend_reason:
+            signal_id = self.store.log_signal(
+                event.wallet, event.coin, event.side, event.kind,
+                price, "SKIPPED", trend_reason,
+            )
+            self.scoring_engine.observe_signal(
+                event, signal_id, "SKIPPED", trend_reason, price
+            )
+            print(f"[SKIP] {event.kind} {event.coin} {event.side}: {trend_reason}")
             return
 
         if not self._apply_ranked_opposite_override(
@@ -6547,6 +6841,23 @@ class CopyTradingBot:
             return
 
         is_add = event.kind == "ADD"
+        if is_add:
+            add_control = getattr(self.risk, "add_decision", None)
+            add_decision = (
+                add_control(event.wallet, event.coin, event.side, price)
+                if add_control is not None else TradeDecision("EXECUTE")
+            )
+            if add_decision.action != "EXECUTE":
+                signal_id = self.store.log_signal(
+                    event.wallet, event.coin, event.side, event.kind,
+                    price, "SKIPPED", add_decision.reason,
+                )
+                self.scoring_engine.observe_signal(
+                    event, signal_id, "SKIPPED", add_decision.reason, price
+                )
+                print(f"[SKIP] {event.kind} {event.coin} {event.side}: {add_decision.reason}")
+                return
+
         candidate_decision = self._candidate_slot_decision(event, scoring_score)
         if candidate_decision.action != "EXECUTE":
             signal_id = self.store.log_signal(
@@ -6588,13 +6899,6 @@ class CopyTradingBot:
             signal_id = self.store.log_signal(event.wallet, event.coin, event.side, event.kind, None, "SKIPPED", decision.reason)
             self.scoring_engine.observe_signal(event, signal_id, "SKIPPED", decision.reason, event.entry_price)
             print(f"[SKIP] {event.kind} {event.coin} {event.side}: {decision.reason}")
-            return
-
-        price = self.platform.mid_price(event.coin) or event.entry_price
-        if not price:
-            signal_id = self.store.log_signal(event.wallet, event.coin, event.side, event.kind, None, "SKIPPED", "no price")
-            self.scoring_engine.observe_signal(event, signal_id, "SKIPPED", "no price", event.entry_price)
-            print(f"[SKIP] {event.kind} {event.coin}: no price")
             return
 
         multiplier = self.scoring_engine.allocation_multiplier(scoring_score)
@@ -6645,6 +6949,27 @@ class CopyTradingBot:
             self.scoring_engine.observe_signal(event, signal_id, "SKIPPED", "paper rejected", price)
             print(f"[SKIP] {event.kind} {event.coin}: paper rejected")
             return
+
+        risk_cap = getattr(self.risk, "cap_trade_cost_by_risk", None)
+        if risk_cap is not None:
+            cost, risk_cap_reason = risk_cap(
+                cost,
+                wallet_equity if wallet_equity is not None else self.paper.value(self.platform.mid_price),
+                effective_leverage,
+            )
+        else:
+            risk_cap_reason = None
+        if cost is None:
+            reason = risk_cap_reason or "risk sizing blocked"
+            signal_id = self.store.log_signal(
+                event.wallet, event.coin, event.side, event.kind,
+                price, "SKIPPED", reason,
+            )
+            self.scoring_engine.observe_signal(event, signal_id, "SKIPPED", reason, price)
+            print(f"[SKIP] {event.kind} {event.coin} {event.side}: {reason}")
+            return
+        if risk_cap_reason:
+            allocation_reason += "; " + risk_cap_reason
 
         notional = cost * effective_leverage
         execution_key = (

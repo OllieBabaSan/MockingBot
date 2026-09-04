@@ -318,6 +318,50 @@ class ExecutionReconciliationTests(unittest.TestCase):
         self.assertEqual(unsynchronized.reason, "local position missing live")
         self.assertEqual(unowned.reason, "coin already held")
 
+    def test_add_requires_profitable_first_slice_and_allows_only_one_add(self) -> None:
+        configured = settings(
+            Path(self.temp.name),
+            live=True,
+            add_requires_profit=True,
+            max_adds_per_wallet_coin_side=1,
+            add_min_unlevered_pnl_pct=0.0,
+        )
+        paper = core.PaperPortfolio(configured, self.store)
+        risk = core.RiskManager(configured, self.store, core.Notifier(""))
+        paper.open("wallet-a", "BTC", "LONG", 100.0, 10.0, leverage=3)
+
+        losing = risk.add_decision("wallet-a", "BTC", "LONG", 99.0)
+        winning = risk.add_decision("wallet-a", "BTC", "LONG", 101.0)
+        paper.open(
+            "wallet-a", "BTC", "LONG", 101.0, 10.0,
+            allow_same_wallet_add=True, leverage=3,
+        )
+        second_add = risk.add_decision("wallet-a", "BTC", "LONG", 102.0)
+
+        self.assertEqual(losing.action, "SKIP")
+        self.assertIn("first slice not profitable", losing.reason)
+        self.assertEqual(winning.action, "EXECUTE")
+        self.assertEqual(second_add.action, "SKIP")
+        self.assertIn("max adds reached", second_add.reason)
+
+    def test_live_open_position_is_guarded_by_wind_down_at_adapter_boundary(self) -> None:
+        configured = settings(Path(self.temp.name), live=True, wind_down=True)
+        store = core.Store(configured.db_path)
+        try:
+            adapter = core.HyperliquidAdapter(configured, store)
+            exchange = FakeExchange([fill_response()])
+            adapter._exchange = exchange
+            adapter._sz_decimals["BTC"] = 3
+            adapter._max_leverage["BTC"] = 50
+
+            result = adapter.open_position("BTC", "LONG", 12.0, 100.0, 3)
+
+            self.assertFalse(result)
+            self.assertEqual(result.status, "wind_down")
+            self.assertEqual(exchange.opens, 0)
+        finally:
+            store.conn.close()
+
     def test_preflight_rejects_asset_leverage_above_exchange_maximum(self) -> None:
         exchange = FakeExchange([])
         self.adapter._exchange = exchange

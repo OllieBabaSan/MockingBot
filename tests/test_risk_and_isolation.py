@@ -100,6 +100,54 @@ class RiskAndIsolationTests(unittest.TestCase):
             finally:
                 store.conn.close()
 
+    def test_live_entry_lockout_trips_before_full_circuit_breaker(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            configured = settings(
+                Path(td),
+                live=True,
+                live_daily_entry_lockout_pct=0.03,
+                live_weekly_entry_lockout_pct=0.08,
+                max_drawdown_pct=0.25,
+                weekly_max_drawdown_pct=0.50,
+            )
+            store = core.Store(configured.db_path)
+            try:
+                risk = core.RiskManager(configured, store, core.Notifier(""))
+                start = 2_000_000.0
+                risk.live_rolling_risk(500.0, start)
+                daily = risk.live_rolling_risk(480.0, start + 3600)
+                weekly = risk.live_rolling_risk(450.0, start + 6 * 86400)
+
+                self.assertIn("daily entry lockout", risk.entry_lockout_reason(daily))
+                self.assertIn("weekly entry lockout", risk.entry_lockout_reason(weekly))
+                self.assertFalse(configured.circuit_breaker_file.exists())
+            finally:
+                store.conn.close()
+
+    def test_live_equity_floor_blocks_entries_at_half_starting_equity(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            configured = settings(
+                Path(td),
+                live=True,
+                live_starting_equity_usd=802.20,
+                live_min_equity_pct_of_start=0.50,
+            )
+            store = core.Store(configured.db_path)
+            try:
+                risk = core.RiskManager(configured, store, core.Notifier(""))
+                allowed = risk.entry_lockout_reason(
+                    risk.live_rolling_risk(401.11, 2_000_000.0)
+                )
+                blocked = risk.entry_lockout_reason(
+                    risk.live_rolling_risk(401.10, 2_000_100.0)
+                )
+
+                self.assertIsNone(allowed)
+                self.assertIn("live equity floor", blocked)
+                self.assertIn("$401.10", blocked)
+            finally:
+                store.conn.close()
+
     def test_manual_live_risk_reset_uses_verified_equity(self) -> None:
         class ResetPlatform:
             def validate_live_credentials(self):
