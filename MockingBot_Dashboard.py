@@ -173,35 +173,6 @@ def wallet_statuses(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
     }
 
 
-def position_risk_statuses(
-    conn: sqlite3.Connection,
-) -> dict[tuple[str, str, str], dict[str, Any]]:
-    rows = conn.execute(
-        """
-        SELECT snapshots.*
-        FROM position_risk_snapshots snapshots
-        JOIN (
-            SELECT coin, side, opened_at, MAX(id) AS latest_id
-            FROM position_risk_snapshots
-            GROUP BY coin, side, opened_at
-        ) latest ON latest.latest_id = snapshots.id
-        ORDER BY snapshots.id DESC
-        """
-    ).fetchall()
-    result: dict[tuple[str, str, str], dict[str, Any]] = {}
-    for row in rows:
-        key = (str(row["coin"]), str(row["side"]), str(row["opened_at"]))
-        if key in result:
-            continue
-        value = dict(row)
-        try:
-            value["reasons"] = json.loads(str(value.get("reasons") or "[]"))
-        except json.JSONDecodeError:
-            value["reasons"] = []
-        result[key] = value
-    return result
-
-
 def status_label(status: dict[str, Any] | None) -> str:
     if not status:
         return "Unscored"
@@ -398,19 +369,6 @@ def dashboard_data() -> dict[str, Any]:
         statuses = wallet_statuses(conn)
         allocations = open_allocations(conn, prices, statuses)
         positions = aggregate_positions(allocations)
-        position_risk_map = position_risk_statuses(conn)
-        position_risk: list[dict[str, Any]] = []
-        for position in positions:
-            snapshot = position_risk_map.get(
-                (
-                    position["coin"], position["side"],
-                    position["position_opened_at"],
-                )
-            )
-            position["risk_state"] = snapshot.get("state") if snapshot else "PENDING"
-            position["risk_action"] = snapshot.get("shadow_action") if snapshot else "NONE"
-            if snapshot:
-                position_risk.append(snapshot)
         live_position_snapshot = (
             get_json(conn, "live_position_snapshot", {}) if MODE == "live" else {}
         )
@@ -637,7 +595,6 @@ def dashboard_data() -> dict[str, Any]:
             "risk_reference": risk_reference,
             "counts": dict(counts) if counts else {},
             "positions": positions,
-            "position_risk": position_risk,
             "allocations": allocations,
             "recent_closes": recent_closes,
             "recent_failures": recent_failures,
@@ -870,10 +827,6 @@ HTML = r"""<!doctype html>
       <h2>Open Positions</h2>
       <div class="table-wrap"><table class="compact-table" id="positions"></table></div>
     </section>
-    <section id="position-risk-section">
-      <h2>Position Risk Shadow</h2>
-      <div class="table-wrap"><table class="compact-table" id="position-risk"></table></div>
-    </section>
     <section>
       <h2>Recent Closes</h2>
       <div class="table-wrap"><table class="compact-table" id="closes"></table></div>
@@ -917,7 +870,6 @@ HTML = r"""<!doctype html>
     const fmtMoney = v => v === null || v === undefined ? "n/a" : `${v < 0 ? "-" : ""}$${Math.abs(v).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
     const fmtPct = v => v === null || v === undefined ? "n/a" : `${v >= 0 ? "+" : ""}${v.toFixed(2)}%`;
     const clsNum = v => v > 0 ? "good" : v < 0 ? "bad" : "";
-    const riskClass = state => ["THESIS_IMPAIRED", "EXIT_CANDIDATE"].includes(state) ? "bad" : (["WATCH", "ADD_FROZEN"].includes(state) ? "warn" : "good");
     const shortWallet = w => !w ? "unknown" : (w.length > 14 ? `${w.slice(0, 8)}...${w.slice(-4)}` : w);
     const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const listCell = values => `<div class="cell-list">${(Array.isArray(values) ? values : [values]).map(v => `<span>${esc(v)}</span>`).join("")}</div>`;
@@ -1053,10 +1005,9 @@ HTML = r"""<!doctype html>
           </tr>`), "No quarantined coins.");
       }
 
-      table(document.getElementById("positions"), ["Market", "Health", "Opened", "Margin", "Entry", "Last", "Open PnL", "Source", "Entry / Current"],
+      table(document.getElementById("positions"), ["Market", "Opened", "Margin", "Entry", "Last", "Open PnL", "Source", "Entry / Current"],
         data.positions.map(p => `<tr>
           <td data-label="Market"><strong>${esc(p.coin)}</strong> <span class="pill">${esc(p.side)}</span>${p.allocation_count > 1 ? ` <span class="muted">×${p.allocation_count}</span>` : ""}</td>
-          <td data-label="Health" class="${riskClass(p.risk_state)}">${esc((p.risk_state || "PENDING").replaceAll("_", " "))}</td>
           <td data-label="Opened" class="muted">${listCell((p.opened_times || []).map(fmtTradeTime))}</td>
           <td data-label="Margin">${fmtMoney(p.cost_basis)}</td>
           <td data-label="Entry">${Number(p.entry_price).toLocaleString(undefined, {maximumFractionDigits: 6})}</td>
@@ -1065,18 +1016,6 @@ HTML = r"""<!doctype html>
           <td data-label="Source" class="muted">${listCell(p.wallets || [])}</td>
           <td data-label="Entry / Current" class="muted">${listCell((p.wallet_statuses || []).map((current, i) => `${(p.entry_statuses || [])[i] || "Legacy"} / ${current}`))}</td>
         </tr>`), "No open positions.");
-
-      table(document.getElementById("position-risk"), ["Market", "State", "Return", "Relative", "Underwater", "Shadow Action", "Evidence", "Updated"],
-        (data.position_risk || []).map(r => `<tr>
-          <td data-label="Market"><strong>${esc(r.coin)}</strong> <span class="pill">${esc(r.side)}</span></td>
-          <td data-label="State" class="${riskClass(r.state)}">${esc(String(r.state || "PENDING").replaceAll("_", " "))}</td>
-          <td data-label="Return" class="${clsNum(r.return_pct)}">${fmtPct(r.return_pct)}</td>
-          <td data-label="Relative" class="${clsNum(r.relative_return_pct)}">${fmtPct(r.relative_return_pct)}</td>
-          <td data-label="Underwater" class="muted">${Number(r.minutes_below_10 || 0).toFixed(0)}m below -10%</td>
-          <td data-label="Shadow Action" class="${riskClass(r.state)}">${esc(String(r.shadow_action || "NONE").replaceAll("_", " "))}</td>
-          <td data-label="Evidence" class="muted">${esc((r.reasons || []).join("; ") || "none")}</td>
-          <td data-label="Updated" class="muted">${esc(fmtTradeTime(r.observed_at))}</td>
-        </tr>`), "Collecting the first five-minute position-risk snapshots.");
 
       table(document.getElementById("closes"), ["Closed", "Market", "Margin", "Result", "Source", "Tier"],
         data.recent_closes.map(s => `<tr>

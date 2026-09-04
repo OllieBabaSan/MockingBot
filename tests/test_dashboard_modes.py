@@ -204,7 +204,7 @@ class DashboardModeTests(unittest.TestCase):
         self.assertEqual(data["recent_closes"][0]["coin"], "KAITO")
         self.assertEqual(len(data["recent_closes"]), 10)
 
-    def test_dashboard_exposes_latest_position_risk_shadow_state(self) -> None:
+    def test_dashboard_omits_position_risk_shadow_state(self) -> None:
         configured = settings(self.root / "position-risk")
         store = core.Store(configured.db_path)
         try:
@@ -239,16 +239,16 @@ class DashboardModeTests(unittest.TestCase):
         ), patch.object(dashboard, "live_prices", return_value=({"RISK": 88.0}, "live")):
             data = dashboard.dashboard_data()
 
-        self.assertEqual(data["positions"][0]["risk_state"], "ADD_FROZEN")
-        self.assertEqual(data["position_risk"][0]["shadow_action"], "WOULD_FREEZE_ADDS")
-        self.assertEqual(data["position_risk"][0]["reasons"], ["addition_freeze_threshold"])
+        self.assertNotIn("risk_state", data["positions"][0])
+        self.assertNotIn("risk_action", data["positions"][0])
+        self.assertNotIn("position_risk", data)
 
     def test_html_has_unambiguous_mode_and_safety_panels(self) -> None:
         self.assertIn('id="mode-badge"', dashboard.HTML)
         self.assertIn('id="quarantine-section"', dashboard.HTML)
         self.assertIn('id="executions"', dashboard.HTML)
-        self.assertIn('id="position-risk"', dashboard.HTML)
-        self.assertIn('Position Risk Shadow', dashboard.HTML)
+        self.assertNotIn('id="position-risk"', dashboard.HTML)
+        self.assertNotIn('Position Risk Shadow', dashboard.HTML)
         self.assertIn('Token Risk Alerts (last 24 hours)', dashboard.HTML)
         self.assertIn('id="timezone"', dashboard.HTML)
         self.assertIn('hour12: true', dashboard.HTML)

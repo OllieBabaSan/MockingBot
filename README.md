@@ -194,8 +194,8 @@ unlevered return, time below 5%/10%/15% loss, BTC/ETH/SOL-relative return,
 funding, open interest, and volume in `position_risk_snapshots`. The states are
 `HEALTHY`, `WATCH`, `ADD_FROZEN`, `THESIS_IMPAIRED`, and `EXIT_CANDIDATE`.
 Shadow actions such as `WOULD_FREEZE_ADDS` and `WOULD_EXIT` are evidence only:
-they do not suppress signals or submit orders. The dashboards display the
-latest lifecycle state and evidence under **Position Risk Shadow**. Defaults
+they do not suppress signals or submit orders. Snapshots remain available in
+the database for offline analysis but are not displayed on the dashboards. Defaults
 watch at 7% loss, flag an addition freeze at 10%, require at least four hours
 below 10% plus a 15% loss for thesis impairment, and require six hours,
 benchmark-relative weakness, and price/funding confirmation for an exit
